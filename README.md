@@ -704,7 +704,7 @@ The verdict is used twice on purpose: it is rendered into the planner prompt as 
 
 **This gates speaking only.** Research, memory writes, goal work, and reflection are never blocked by it — the point is to constrain timing, not initiative. Restraint that can be computed lives in code; the prompt is left free.
 
-The same gate honours an open sleep window. The live reply path has always refused to answer while `,sleep` is set, telling people "max is sleeping, back in Xm" — but nothing checked it on the autonomy side, so the tick would post into a channel or DM someone while that notice was still standing. It is speech-only there too: asleep, he still thinks, remembers and plans.
+The same gate honours an open sleep window. The live reply path has always refused to answer while `,sleep` is set, telling people "the dame is sleeping, back in Xm" — but nothing checked it on the autonomy side, so the tick would post into a channel or DM someone while that notice was still standing. It is speech-only there too: asleep, he still thinks, remembers and plans.
 
 | Control | Default | Meaning |
 | --- | --- | --- |

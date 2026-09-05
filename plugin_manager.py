@@ -151,7 +151,7 @@ class PluginContext:
         return (getattr(self.bot, "tools", None) or {}).get(str(name))
 
     def is_admin(self, user_id: Any) -> bool:
-        """Whether this user is a Maxwell admin. Fails closed."""
+        """Whether this user is a Dame Curie admin. Fails closed."""
         checker = getattr(self.bot, "_is_admin", None)
         if not callable(checker):
             return False
@@ -162,7 +162,7 @@ class PluginContext:
 
 
 class PluginManager:
-    """Manages dynamic modular plugins for Maxwell."""
+    """Manages dynamic modular plugins for Dame Curie."""
 
     def __init__(
         self,
@@ -688,7 +688,7 @@ class PluginManager:
                 logger.error(f"Invalid plugin.json in {plugin_dir}: {e}")
         return {
             "name": plugin_name,
-            "description": f"Maxwell plugin: {plugin_name}",
+            "description": f"Dame Curie plugin: {plugin_name}",
             "version": "1.0.0",
             "enabled_globally": False,
             "allowed_users": [],

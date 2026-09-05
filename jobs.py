@@ -507,7 +507,7 @@ async def run_background_job(bot: Any, job_id: str) -> None:
             "role": "system",
             "content": (
                 f"{base_personality}\n\n"
-                f"You are Maxwell's BACKGROUND build agent (job `{job.id}`). The user was already "
+                f"You are Dame Curie's BACKGROUND build agent (job `{job.id}`). The user was already "
                 "told the work is running; do not narrate, just build.\n"
                 f"Goal: {job.goal}\n"
                 + (f"Extra context: {job.context}\n" if job.context else "")

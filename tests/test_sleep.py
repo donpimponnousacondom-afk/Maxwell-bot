@@ -1,7 +1,7 @@
 """Tests for the sleep gate / SleepTool / ClearSleepTool.
 
 The 2026-07-19 user request: add a sleep feature (max 1 hour) so
-pings during the window get a 'max is sleeping, back in Xm' notice
+pings during the window get a 'the dame is sleeping, back in Xm' notice
 in the triggering channel (never a DM).
 These tests pin the contract:
 
@@ -302,7 +302,7 @@ def test_sleep_gate_is_silent_for_lines_nobody_sent_him():
     """Typing in a room he was in is not a ping — he stays asleep, and quiet.
 
     The watch keeps a whole room live after he speaks, so an ordinary line in
-    that room used to reach the gate and get answered with "max is sleeping":
+    that room used to reach the gate and get answered with "the dame is sleeping":
     a bot talking in his sleep to someone who never asked him anything.
     """
 

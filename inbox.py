@@ -32,8 +32,8 @@ ACTIONABLE_STATES = frozenset({"unread", "read"})
 # request does not answer it. Everything else is a *notice*: something to be
 # told once. Mail is the common case, and it used to have no way out of the
 # tail short of an explicit dismiss, so the same message was announced on
-# every turn, reworded each time ("update from z3ki…", "z3ki already
-# replied…", "update: z3ki just replied…").
+# every turn, reworded each time ("update from .normal.man…", ".normal.man already
+# replied…", "update: .normal.man just replied…").
 DECISION_ACTIONS = frozenset({"accept", "decline"})
 
 

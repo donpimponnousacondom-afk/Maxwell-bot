@@ -142,6 +142,112 @@ class FakeSequenceSession(FakeSession):
         return self.responses.pop(0)
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        "inclusionai/ling-3.0-flash",
+        "inclusionai/ling-3.0-flash-fin:free",
+        "inclusionai/ling-3.0-flash-sante:free",
+    ],
+)
+def test_openrouter_native_reasoning_and_sampling_defaults(model):
+    provider = OllamaProvider("https://openrouter.ai/api/v1", model, 8192, 0.6)
+    messages = [{"role": "user", "content": "hi"}]
+
+    payload = provider._request_payload(provider._endpoints[0], messages)
+
+    assert payload == {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_tokens": 8192,
+        "stream": True,
+    }
+
+
+def test_openrouter_aux_override_does_not_mutate_main(caplog):
+    provider = OllamaProvider(
+        "https://openrouter.ai/api/v1", "inclusionai/ling-3.0-flash-fin:free",
+        8192, 0.6, top_p=0.9, top_k=30,
+    )
+    provider.available = True
+    session = FakeSession()
+    provider._session = session
+
+    async def run():
+        messages = [{"role": "user", "content": "hi"}]
+        await provider.generate_response(
+            messages, temperature=0.2, disable_reasoning=True,
+        )
+        await provider.generate_chat_completion(messages)
+
+    with caplog.at_level("INFO", logger="providers"):
+        asyncio.run(run())
+
+    aux, main = session.payloads
+    assert aux["reasoning"] == {"enabled": False}
+    assert aux["temperature"] == 0.2
+    assert main["temperature"] == 0.6
+    assert "reasoning" not in main
+    for payload in session.payloads:
+        assert payload["top_p"] == 0.9
+        assert payload["top_k"] == 30
+        assert "reasoning_effort" not in payload
+        assert "thinking" not in payload
+    assert "reasoning_disabled=True" in caplog.text
+    assert "reasoning_disabled=False" in caplog.text
+
+
+def test_openrouter_reasoning_override_restores_native_default():
+    provider = OllamaProvider(
+        "https://openrouter.ai/api/v1", "inclusionai/ling-3.0-flash-fin:free",
+        8192, 0.6, disable_reasoning=True,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    endpoint = provider._endpoints[0]
+
+    disabled = provider._request_payload(endpoint, messages)
+    native = provider._request_payload(endpoint, messages, disable_reasoning=False)
+
+    assert disabled["reasoning"] == {"enabled": False}
+    assert not {"reasoning", "reasoning_effort", "thinking"}.intersection(native)
+    assert endpoint.disable_reasoning is True
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://localhost:11434/v1", "https://openrouter.ai.example.test/v1"],
+)
+def test_non_openrouter_reasoning_disable_protocol_is_preserved(base_url):
+    provider = OllamaProvider(base_url, "model", 8192, 0.6, disable_reasoning=True)
+    payload = provider._request_payload(provider._endpoints[0], [])
+
+    assert payload["reasoning_effort"] == "none"
+    assert payload["reasoning"] == {"effort": "none"}
+    assert payload["thinking"] == {"type": "disabled", "budget_tokens": 0}
+
+
+def test_reasoning_protocol_uses_selected_endpoint():
+    provider = OllamaProvider(
+        "http://localhost:11434/v1", "local-model", 8192, 0.6,
+        disable_reasoning=True,
+        fallback_base_url="https://openrouter.ai/api/v1",
+        fallback_model="inclusionai/ling-3.0-flash-fin:free",
+        fallback_disable_reasoning=True,
+    )
+    primary, fallback = provider._endpoints
+
+    local = provider._request_payload(primary, [])
+    routed = provider._request_payload(fallback, [])
+
+    assert local["reasoning_effort"] == "none"
+    assert routed["reasoning"] == {"enabled": False}
+    assert "reasoning_effort" not in routed
+    assert "thinking" not in routed
+
+
 def test_generate_chat_completion_model_override():
     provider = OllamaProvider("http://example.test", "base-model", 10, 0.5)
     provider.available = True

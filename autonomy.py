@@ -1,15 +1,15 @@
-"""AutonomyEngine — Maxwell's self-directed life loop.
+"""AutonomyEngine — Dame Curie's self-directed life loop.
 
 Runs alongside REM and on_message. Wakes every N seconds, gathers context
 (DMs, channel history, memory, goals, recent events), asks the LLM what to
 do, and executes actions through the existing tool system.
 
-No approval queues. No shadow mode. Maxwell decides, Maxwell acts.
+No approval queues. No shadow mode. Dame Curie decides, Dame Curie acts.
 
 ARCHITECTURE — where restraint lives:
 
 Restraint is enforced mechanically, not by prompting. The planner prompt gives
-Maxwell full freedom over WHAT to do; autonomy_social decides WHERE and WHEN
+Dame Curie full freedom over WHAT to do; autonomy_social decides WHERE and WHEN
 speaking is his turn, and execute() enforces that as a gate.
 
 This split is the whole design. The earlier arrangement pushed both jobs into
@@ -148,7 +148,7 @@ class GateVerdict:
 def _user_ref(obj: Any, bot_user: Any = None) -> str:
     uid = _discord_id(obj)
     if bot_user is not None and uid == str(getattr(bot_user, "id", "")):
-        return f"you/Maxwell({uid})"
+        return f"you/Dame Curie({uid})"
     return f"{_discord_display_name(obj)}({uid})"
 
 
@@ -174,7 +174,7 @@ def _reply_relation_bit(msg: dict) -> str | None:
     reply_label = str(msg.get("reply_to_author"))
     reply_id = str(msg.get("reply_to_author_id") or "")
     if msg.get("reply_to_self"):
-        reply_label = "you/Maxwell"
+        reply_label = "you/Dame Curie"
     bit = f"reply_to={reply_label}({reply_id})" if reply_id else f"reply_to={reply_label}"
     quoted = " ".join(str(msg.get("reply_to_content") or "").split())[:80]
     if quoted:
@@ -186,7 +186,7 @@ def _reply_relation_bit(msg: dict) -> str | None:
 def _message_relation_tags(
     message: Any, *, bot_user: Any = None, reply: Any = None, private: bool = False
 ) -> list[str]:
-    """`private` marks a 1:1 DM, where an inbound message is aimed at Maxwell
+    """`private` marks a 1:1 DM, where an inbound message is aimed at Dame Curie
     whether or not it carries a mention. Without it these lines came out as
     `addressed_to=channel` in a room with no channel and one other person."""
     tags: list[str] = []
@@ -253,7 +253,7 @@ def _format_memory_context_line(msg: dict, *, bot_user: Any = None, now=None) ->
     if (bot_id and author_id == bot_id) or (
         not author_id and bot_name and author == bot_name
     ):
-        label = f"You/Maxwell({author_id})" if author_id else "You/Maxwell"
+        label = f"You/Dame Curie({author_id})" if author_id else "You/Dame Curie"
     else:
         label = f"{author}({author_id})" if author_id else author
         if msg.get("author_is_bot"):
@@ -393,7 +393,7 @@ class AutonomyContextIndex:
 
         First registration wins the kind. `_collect_available_channels` runs
         before every other context section and registers exactly the channels
-        Maxwell may post in, so anything discovered later that isn't already
+        Dame Curie may post in, so anything discovered later that isn't already
         known as a guild channel is, by construction, not one.
         """
         cid = re.sub(r"[^0-9]", "", str(channel_id or ""))
@@ -812,9 +812,9 @@ class AutonomyStore(JsonStateStore):
                 "last_acted_on": None,
                 # Goal-specific progress watermark for stale detection. Unlike
                 # last_acted_on (bumped for ALL goals on any successful tick as
-                # a "Maxwell is alive" signal), this ONLY advances when a goal
+                # a "Dame Curie is alive" signal), this ONLY advances when a goal
                 # is explicitly referenced this tick — so staleness reflects
-                # "not formally touched" rather than "Maxwell did anything."
+                # "not formally touched" rather than "Dame Curie did anything."
                 "last_progress_at": _utcnow_iso(),
             }
             goals.append(goal)
@@ -885,7 +885,7 @@ def _planner_system_prompt(
     them across ticks. GOALS and CURRENT CONTEXT change every tick and stay
     at the end on purpose.
     """
-    return f"""You are Maxwell acting autonomously on your own time. Be natural, proactive, and engage like a real human participant in a community server. Don't narrate internal machinery.
+    return f"""You are Dame Curie acting autonomously on your own time. Be natural, proactive, and engage like a real human participant in a community server. Don't narrate internal machinery.
 
 PERSONALITY:
 {base_personality}
@@ -930,7 +930,7 @@ Return ONLY JSON, no fence. "thought" is one line in your voice:
 
 
 class AutonomyEngine:
-    """Background async loop that gives Maxwell self-directed agency."""
+    """Background async loop that gives Dame Curie self-directed agency."""
 
     def __init__(self, bot: Any):
         self.bot = bot
@@ -1684,7 +1684,7 @@ class AutonomyEngine:
     # -----------------------------------------------------------------------
 
     async def gather_context(self) -> str:
-        """Collect everything Maxwell currently knows. Sections ordered by
+        """Collect everything Dame Curie currently knows. Sections ordered by
         decision-relevance: most actionable info first, so it survives budget
         truncation. Each section has its own char budget instead of the old
         global truncation that ate channel activity first."""
@@ -1797,7 +1797,7 @@ class AutonomyEngine:
                     uname = str(ev.get("user_name") or "?")
                     role = str(ev.get("role") or "?")
                     speaker_kind = (
-                        "you/Maxwell"
+                        "you/Dame Curie"
                         if self.bot.user and uid == str(self.bot.user.id)
                         else role
                     )
@@ -1813,7 +1813,7 @@ class AutonomyEngine:
                         reply_name = str(ev.get("reply_to_author") or "unknown")
                         reply_id = str(ev.get("reply_to_author_id") or "")
                         reply_ref = (
-                            f"you/Maxwell({reply_id})"
+                            f"you/Dame Curie({reply_id})"
                             if ev.get("reply_to_self")
                             else f"{reply_name}({reply_id})"
                         )
@@ -1835,7 +1835,7 @@ class AutonomyEngine:
                             continue
                         mname = str(row.get("name") or mid)
                         mref = (
-                            f"you/Maxwell({mid})"
+                            f"you/Dame Curie({mid})"
                             if self.bot.user and mid == str(self.bot.user.id)
                             else f"{mname}({mid})"
                         )
@@ -1913,7 +1913,7 @@ class AutonomyEngine:
                     # Resolve the reply BEFORE the empty-content skip: a
                     # message with no renderable text (a bare attachment, a
                     # sticker) is still a turn somebody took, and the floor
-                    # read has to see it or Maxwell will talk over it.
+                    # read has to see it or Dame Curie will talk over it.
                     reply = await self._resolve_reference(m, ref_cache)
                     floor_snapshots.setdefault(_cid, []).append(
                         floor_message_from_discord(
@@ -1993,7 +1993,7 @@ class AutonomyEngine:
                 )
             )
 
-        # 5. The same short-term channel memory normal Maxwell sees.
+        # 5. The same short-term channel memory normal Dame Curie sees.
         # This is the glue that stops autonomy from acting like some weird second
         # intern who skimmed the logs but missed the actual relationship history.
         try:
@@ -2076,7 +2076,7 @@ class AutonomyEngine:
             if mem_lines:
                 sections.append(
                     _truncate_keep_tail(
-                        "=== RECENT CONTEXT MEMORY (same continuity normal Maxwell sees; background only) ===\n"
+                        "=== RECENT CONTEXT MEMORY (same continuity normal Dame Curie sees; background only) ===\n"
                         + "\n".join(mem_lines),
                         memory_budget,
                     )
@@ -2246,7 +2246,7 @@ class AutonomyEngine:
                             m,
                             bot_user=self.bot.user,
                             # In a 1:1 DM every inbound message is addressed
-                            # to Maxwell whether or not it carries a mention.
+                            # to Dame Curie whether or not it carries a mention.
                             implicit_address=True,
                         )
                     )
@@ -2261,13 +2261,13 @@ class AutonomyEngine:
                         and getattr(m.author, "id", None) == self.bot.user.id
                     )
                     direction = (
-                        f"from=you/Maxwell({getattr(self.bot.user, 'id', '?')}) to={recipient_ref}"
+                        f"from=you/Dame Curie({getattr(self.bot.user, 'id', '?')}) to={recipient_ref}"
                         if author_is_self
                         else f"from={_user_ref(m.author, self.bot.user)} to="
                         + (
                             room_label
                             if is_group
-                            else f"you/Maxwell({getattr(self.bot.user, 'id', '?')})"
+                            else f"you/Dame Curie({getattr(self.bot.user, 'id', '?')})"
                         )
                     )
                     msg_idx = ctx_index.add_message(str(getattr(m, "id", "")), _cid)
@@ -2489,8 +2489,8 @@ class AutonomyEngine:
                     channel=None,
                     author=SimpleNamespace(
                         id="autonomy",
-                        display_name=getattr(self.bot.user, "display_name", "Maxwell"),
-                        name=getattr(self.bot.user, "name", "Maxwell"),
+                        display_name=getattr(self.bot.user, "display_name", "Dame Curie"),
+                        name=getattr(self.bot.user, "name", "Dame Curie"),
                         bot=True,
                     ),
                     guild=None,
@@ -2609,7 +2609,7 @@ class AutonomyEngine:
         stale detection. Prefers last_progress_at (only advances when the goal
         is explicitly referenced by an action) and falls back to created_at.
         Deliberately does NOT use last_acted_on — that field is bumped for ALL
-        active goals on any successful tick as a "Maxwell is alive" signal, so
+        active goals on any successful tick as a "Dame Curie is alive" signal, so
         it would make every goal look perpetually fresh and defeat staleness."""
         when = goal.get("last_progress_at") or goal.get("created_at")
         dt = _coerce_utc_datetime(when)
@@ -3053,7 +3053,7 @@ class AutonomyEngine:
                 # when reusing the main provider (no autonomy_base_url). The
                 # provider lets a per-call False override the endpoint default.
                 autonomy_disable_reasoning = bool(
-                    control.get("autonomy_disable_reasoning", True)
+                    control.get("autonomy_disable_reasoning", False)
                 )
                 night_kwargs = {}
                 night_kwargs_resolver = getattr(
@@ -3504,7 +3504,7 @@ class AutonomyEngine:
                 continue
 
             # He is asleep. The live path already refuses to answer people who
-            # talk to him and tells them "max is sleeping, back in Xm" — but
+            # talk to him and tells them "the dame is sleeping, back in Xm" — but
             # nothing checked it here, so the tick would post unprompted into
             # a channel or DM someone while that notice was still standing.
             # Speaking only: research, memory and goal work carry on.
@@ -3881,7 +3881,7 @@ class AutonomyEngine:
         author_name = (
             getattr(bot_user, "display_name", None)
             or getattr(bot_user, "name", None)
-            or getattr(self.bot, "bot_name", "Maxwell")
+            or getattr(self.bot, "bot_name", "Dame Curie")
         )
         item = {
             "author": author_name,
@@ -4129,9 +4129,9 @@ class AutonomyEngine:
             id="autonomy",
             display_name=getattr(bot_user, "display_name", None)
             or getattr(bot_user, "name", None)
-            or getattr(self.bot, "bot_name", "Maxwell"),
+            or getattr(self.bot, "bot_name", "Dame Curie"),
             name=getattr(bot_user, "name", None)
-            or getattr(self.bot, "bot_name", "Maxwell"),
+            or getattr(self.bot, "bot_name", "Dame Curie"),
             bot=True,
         )
         guild = channel.guild if hasattr(channel, "guild") else None
@@ -4270,7 +4270,7 @@ class AutonomyEngine:
         # Auto-bump last_acted_on for active goals when this tick actually did
         # something successful. Asking the LLM to "re-create the goal" to bump
         # the timestamp never worked (0 create_goal actions across 200 ticks),
-        # so goals stayed at last_acted_on=null even while Maxwell was clearly
+        # so goals stayed at last_acted_on=null even while Dame Curie was clearly
         # acting on them. Track it here instead — server-side, reliable.
         #
         # last_acted_on is bumped for ALL active goals on any success (an "alive"
@@ -4278,7 +4278,7 @@ class AutonomyEngine:
         # referenced — via a complete_goal with matching goal_id, or a goal id
         # mentioned in any successful action's reason. last_progress_at is what
         # stale detection reads, so staleness means "not formally touched" rather
-        # than "Maxwell did anything at all."
+        # than "Dame Curie did anything at all."
         if acted:
             try:
                 referenced_goal_ids: set[str] = set()

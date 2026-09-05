@@ -3,7 +3,7 @@
 Most COMMUNITY servers gate their content behind Discord's onboarding
 prompts ("What kind of roles do you want?", "Which channels interest
 you?"). Until the account answers them it holds none of the opt-in roles
-and sees only the server's default channels, which is why Maxwell can
+and sees only the server's default channels, which is why Dame Curie can
 land in a server and still not be able to do anything in it.
 
 There is no ``/members/@me/onboarding`` route — that path 404s as an
@@ -14,7 +14,7 @@ anything. The real client flow is:
                                                      member's answers
     POST /guilds/{guild_id}/onboarding-responses  -> submit answers
 
-The picking itself is Maxwell's call: the prompt titles/descriptions go
+The picking itself is Dame Curie's call: the prompt titles/descriptions go
 to the model, which answers with option ids. Everything here is pure and
 side-effect free except :func:`fetch_onboarding` and
 :func:`submit_responses`, both of which take an injected ``request``
@@ -295,7 +295,7 @@ def build_picker_messages(
     personality: str = "",
     preferences: str = "",
 ) -> list[dict]:
-    """Chat messages asking Maxwell which roles/channels he wants."""
+    """Chat messages asking Dame Curie which roles/channels he wants."""
     persona = (personality or "").strip()
     if persona:
         persona = f"Your personality:\n{persona[:1200]}\n\n"
@@ -305,7 +305,7 @@ def build_picker_messages(
         else ""
     )
     system = (
-        "You are Maxwell, choosing your own roles and channels in a Discord "
+        "You are Dame Curie, choosing your own roles and channels in a Discord "
         "server you just joined. Pick what genuinely fits you — the topics "
         "you'd actually read, the pings you'd actually want. Skip options "
         "that don't interest you; you do not have to pick from every prompt. "
@@ -350,7 +350,7 @@ async def run_onboarding(
     include_post_join: bool = INCLUDE_POST_JOIN_PROMPTS,
     dry_run: bool = False,
 ) -> dict:
-    """Fetch prompts, let Maxwell choose, submit, and report what happened.
+    """Fetch prompts, let Dame Curie choose, submit, and report what happened.
 
     Returns a dict with ``summary`` (one line for logs/tool output) and the
     detail fields a caller may want to render. Never raises: transport and

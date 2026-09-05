@@ -222,7 +222,7 @@ def _msg(author, *, mentions=None, channel_id="c1", members=None):
 def test_chess_bot_name_uses_live_persona():
     import bot_tools
 
-    assert bot_tools._chess_bot_name(None) == "Maxwell"
+    assert bot_tools._chess_bot_name(None) == "Dame Curie"
     assert bot_tools._chess_bot_name(SimpleNamespace(bot_name="Uni")) == "Uni"
     assert (
         bot_tools._chess_bot_name(

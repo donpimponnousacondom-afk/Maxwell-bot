@@ -47,7 +47,9 @@ def _make_bot(monkeypatch, *, control=None, aux_env=None, auto_env=None):
         "AUTONOMY_DISABLE_REASONING": (auto_env or {}).get("disable_reasoning", False),
         "OLLAMA_MODEL": "main-model",
         "OLLAMA_MAX_TOKENS": 8192,
-        "OLLAMA_TEMPERATURE": 1.0,
+        "OLLAMA_TEMPERATURE": 0.6,
+        "OLLAMA_TOP_P": 0.95,
+        "OLLAMA_TOP_K": 20,
         "OLLAMA_FALLBACK_BASE_URL": "",
         "OLLAMA_FALLBACK_MODEL": "",
         "OLLAMA_FALLBACK_API_KEY": "",
@@ -152,9 +154,30 @@ def test_get_aux_provider_builds_dedicated_when_aux_base_url_set(monkeypatch):
     assert len(bot._built) == 1
     assert bot._built[0].kwargs["base_url"] == "https://aux.example"
     assert bot._built[0].kwargs["model"] == "aux-m"
+    assert bot._built[0].kwargs["temperature"] == 0.2
+    assert bot._built[0].kwargs["top_p"] == 0.95
+    assert bot._built[0].kwargs["top_k"] == 20
+    assert bot._built[0].kwargs["disable_reasoning"] is True
     assert prov is bot._built[0]
     assert bot.aux_provider is prov
     assert "https://aux.example" in bot._aux_provider_sig
+
+
+def test_get_autonomy_provider_forwards_main_sampling(monkeypatch):
+    bot = _make_bot(
+        monkeypatch,
+        control={"autonomy_base_url": "https://auto.example", "autonomy_model": "auto-m"},
+    )
+
+    prov = asyncio.run(bot._get_autonomy_provider())
+
+    assert prov is bot._built[0]
+    assert prov.kwargs["base_url"] == "https://auto.example"
+    assert prov.kwargs["model"] == "auto-m"
+    assert prov.kwargs["temperature"] == 0.6
+    assert prov.kwargs["top_p"] == 0.95
+    assert prov.kwargs["top_k"] == 20
+    assert prov.kwargs["disable_reasoning"] is False
 
 
 def test_get_aux_provider_caches(monkeypatch):

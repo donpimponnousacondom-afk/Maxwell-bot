@@ -1,4 +1,4 @@
-"""Tools for Maxwell Bot
+"""Tools for Dame Curie Bot
 
 All tools return a result string for the LLM. They do NOT send errors
 to the Discord channel — errors are returned as strings so the LLM can
@@ -796,7 +796,7 @@ def _missing_cap(guild, cap: str) -> str:
 
 
 def _mod_reason(message) -> str:
-    return f"Maxwell admin tool requested by {getattr(message, 'author', '?')}"
+    return f"Dame Curie admin tool requested by {getattr(message, 'author', '?')}"
 
 
 def _parse_snowflake(value) -> int | None:
@@ -1454,7 +1454,7 @@ class HDImageGeneratorTool(Tool):
             except Exception as e:
                 return None, f"could not fetch {ref[:80]}: {e}"
 
-        # Local path — only from the dirs Maxwell itself writes images to.
+        # Local path — only from the dirs Dame Curie itself writes images to.
         try:
             img_dir, _ = _public_image_target(self.bot)
             allowed = [os.path.abspath(img_dir), os.path.abspath("temp")]
@@ -2000,7 +2000,7 @@ class SetActivityTool(Tool):
 
 class SleepTool(Tool):
     """Take a sleep window. While sleeping the bot won't dispatch
-    LLM turns — the triggering channel gets a 'max is sleeping,
+    LLM turns — the triggering channel gets a 'the dame is sleeping,
     back in Xm' notice (deduped per user, never a DM). The 2026-07-19
     user directive: the bot kept spamming goodnight/goodbye in chat;
     a real sleep window is the structural fix. Use this when the
@@ -2013,7 +2013,7 @@ class SleepTool(Tool):
     def get_description(self):
         return (
             "Sleep 1-60 minutes (default 30). While asleep, LLM turns are skipped "
-            "and the triggering channel gets one 'max is sleeping' notice. Use only "
+            "and the triggering channel gets one 'the dame is sleeping' notice. Use only "
             "at a real end-of-conversation, not as a goodbye. Calling again resets "
             "the window. Params: duration_minutes."
         )
@@ -3060,7 +3060,7 @@ class ListServersTool(Tool):
 
 
 class ListAdminServersTool(Tool):
-    """List servers where Maxwell has useful admin permissions."""
+    """List servers where Dame Curie has useful admin permissions."""
 
     def get_description(self):
         return (
@@ -3142,13 +3142,13 @@ class CreateCategoryTool(Tool):
             return f"Error: I do not have manage_channels/admin in {guild.name}. Run list_admin_servers first."
         try:
             category = await guild.create_category(
-                clean, reason=f"Maxwell admin tool requested by {message.author}"
+                clean, reason=f"Dame Curie admin tool requested by {message.author}"
             )
             if position is not None:
                 try:
                     await category.edit(
                         position=max(0, int(position)),
-                        reason="Maxwell admin tool position update",
+                        reason="Dame Curie admin tool position update",
                     )
                 except (TypeError, ValueError):
                     return f"Created category {category.name} ({category.id}), but position was invalid"
@@ -3237,7 +3237,7 @@ class CreateChannelTool(Tool):
                 channel = await guild.create_voice_channel(
                     clean,
                     category=category,
-                    reason=f"Maxwell admin tool requested by {message.author}",
+                    reason=f"Dame Curie admin tool requested by {message.author}",
                 )
             elif channel_kind in {"text", "chat"}:
                 try:
@@ -3250,7 +3250,7 @@ class CreateChannelTool(Tool):
                     topic=str(topic or "")[:1024],
                     nsfw=str(nsfw).lower() in {"1", "true", "yes", "on"},
                     slowmode_delay=slowmode,
-                    reason=f"Maxwell admin tool requested by {message.author}",
+                    reason=f"Dame Curie admin tool requested by {message.author}",
                 )
             else:
                 return "Error: kind/type must be text or voice"
@@ -3340,7 +3340,7 @@ class EditChannelTool(Tool):
             return "Error: provide at least one edit field"
         try:
             await channel.edit(
-                **updates, reason=f"Maxwell admin tool requested by {message.author}"
+                **updates, reason=f"Dame Curie admin tool requested by {message.author}"
             )
             return f"Edited {_channel_label(channel)} in {guild.name}: {', '.join(sorted(updates))}"
         except discord.Forbidden:
@@ -3386,7 +3386,7 @@ class DeleteChannelTool(Tool):
         try:
             label = _channel_label(channel)
             await channel.delete(
-                reason=f"Maxwell admin tool requested by {message.author}"
+                reason=f"Dame Curie admin tool requested by {message.author}"
             )
             return f"Deleted {label} from {guild.name}"
         except discord.Forbidden:
@@ -4471,7 +4471,7 @@ def format_site_file_read(rel: str, text: str, *, start_line: int = 1) -> str:
 
     Small files come back whole. Larger ones get a numbered window; pass
     ``start_line`` to page. A minified one-liner is paged by character so it
-    cannot dump 40k into the tool loop (that is what hung Maxwell).
+    cannot dump 40k into the tool loop (that is what hung Dame Curie).
     """
     start_line = _site_start_line(start_line)
     raw = text or ""
@@ -8333,7 +8333,7 @@ class FetchUrlTool(Tool):
         if mime.startswith("audio/") or url_ext in SeeVideoTool.AUDIO_EXTS:
             return (
                 "Error: URL contains audio media, not readable text. "
-                "Attach or post the audio URL so Maxwell can hear it."
+                "Attach or post the audio URL so Dame Curie can hear it."
             )
 
         try:
@@ -10089,7 +10089,7 @@ class JoinVcTool(Tool):
 
 
 class VcStatusTool(Tool):
-    """Show Maxwell's current voice channel and who else is there."""
+    """Show Dame Curie's current voice channel and who else is there."""
 
     def get_description(self):
         return (
@@ -10255,7 +10255,7 @@ def _email_cfg(bot) -> dict:
         "user": getattr(cfg, "MAXWELL_EMAIL_USER", "maxwell@z3ki.dev"),
         "password": getattr(cfg, "MAXWELL_EMAIL_PASSWORD", ""),
         "from_addr": getattr(cfg, "MAXWELL_EMAIL_FROM", "maxwell@z3ki.dev"),
-        "from_name": getattr(cfg, "MAXWELL_EMAIL_FROM_NAME", "Maxwell"),
+        "from_name": getattr(cfg, "MAXWELL_EMAIL_FROM_NAME", "Dame Curie"),
     }
 
 
@@ -11241,7 +11241,7 @@ class XPostTool(Tool):
 
 
 # ---------------------------------------------------------------------------
-# Self-modification tools. These let Maxwell rewrite its own base
+# Self-modification tools. These let Dame Curie rewrite its own base
 # personality + per-server prompts at runtime. The runtime load is hot —
 # _load_control() reads mtime, so a write to bot_control.json is picked up
 # on the next prompt assembly without a restart. server prompts are read
@@ -11316,7 +11316,7 @@ class UpdateServerPromptTool(Tool):
     """Rewrite the per-server custom prompt (same as `,prompt <text>`).
 
     Same effect as the `,prompt <text>` command but invokable from
-    inside an LLM turn — Maxwell can edit its own per-server instructions
+    inside an LLM turn — Dame Curie can edit its own per-server instructions
     when it has a reason. Pass server_id (numeric snowflake) or pass 'DM'
     for the DM default. Pass empty text to clear the per-server prompt.
     """
@@ -11383,16 +11383,16 @@ _CHESS_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 
 def _chess_bot_name(bot=None) -> str:
-    """Live people-facing name for this process (Maxwell, Uni, a nick, …)."""
+    """Live people-facing name for this process (Dame Curie, Uni, a nick, …)."""
     user = getattr(bot, "user", None) if bot is not None else None
     name = getattr(bot, "bot_name", None) if bot is not None else None
     name = str(
         name
         or getattr(user, "display_name", None)
         or getattr(user, "name", None)
-        or "Maxwell"
+        or "Dame Curie"
     ).strip()
-    return name or "Maxwell"
+    return name or "Dame Curie"
 
 
 def _chess_user_label(user) -> str:
@@ -11590,13 +11590,13 @@ def _chess_render_safe(game) -> bytes | None:
 def _chess_state_text(game, bot_name: str | None = None) -> str:
     """The board + metadata the model needs to play, as plain text.
 
-    When it is Maxwell's turn this is his entire view of the position, because
+    When it is Dame Curie's turn this is his entire view of the position, because
     he now picks the move himself instead of delegating to the search. A bare
     SAN list is not enough for that: the annotations say what each move
     captures, whether it checks or mates, and whether the piece lands on a
     square where it is simply taken.
     """
-    name = str(bot_name or "").strip() or "Maxwell"
+    name = str(bot_name or "").strip() or "Dame Curie"
     lines: list[str] = []
     lines.append("CHESS BOARD (text — see attached image for the real board):")
     lines.append(_chess_board_ascii(game.board))
@@ -11618,7 +11618,7 @@ def _chess_state_text(game, bot_name: str | None = None) -> str:
     lines.append(f"It is {who}'s move.")
 
     if game.bot_turn:
-        # Maxwell's own turn: give him the annotated position, all of it. The
+        # Dame Curie's own turn: give him the annotated position, all of it. The
         # legal list is not truncated here — a move he cannot see is a move he
         # cannot play, and in a sharp position the cut-off 49th move is
         # sometimes the only one that does not lose.
@@ -11721,7 +11721,7 @@ async def _chess_record(bot, message, text: str) -> None:
         logger.debug("Failed to record tool output in channel memory: %s", e)
 
 
-# game_id -> consecutive illegal/absent moves on Maxwell's own turn. Maxwell
+# game_id -> consecutive illegal/absent moves on Dame Curie's own turn. Dame Curie
 # picks his own moves now, so the failure mode to protect against is a game
 # wedged forever because he keeps naming a move that is not legal. After
 # _CHESS_MAX_MISSES tries the local search plays one move so the game advances;
@@ -11833,7 +11833,7 @@ class ChessStartTool(Tool):
             return "Error: bot_side must be 'white', 'black', or 'auto'."
 
         # depth/jitter only ever reach the local search, which is now just the
-        # wedge-breaker for when Maxwell repeatedly fails to name a legal move.
+        # wedge-breaker for when Dame Curie repeatedly fails to name a legal move.
         # Kept accepted-but-clamped so an old caller passing depth= is not an
         # error, and stored on the game so the fallback still has settings.
         max_depth = int(depth or 3)
@@ -11851,7 +11851,7 @@ class ChessStartTool(Tool):
             jitter=0.35,
         )
 
-        # Maxwell plays his own chess. If he has the white side he does NOT get
+        # Dame Curie plays his own chess. If he has the white side he does NOT get
         # an engine move dropped in here — the tool returns the annotated
         # position and he names his own opening move on the follow-up turn
         # (chess_start is in RESULT_TOOL_NAMES, so that turn always happens).
@@ -11963,7 +11963,7 @@ class ChessMoveTool(Tool):
         engine_fallback = False
         try:
             if game.bot_turn:
-                # Maxwell's own turn. He names the move; the local search is
+                # Dame Curie's own turn. He names the move; the local search is
                 # only reached after repeated failures to name a legal one, so
                 # a game can never wedge on his turn.
                 if move:
@@ -12012,7 +12012,7 @@ class ChessMoveTool(Tool):
 
         if error_text:
             if game.bot_turn:
-                # An illegal move from Maxwell himself: hand back the position
+                # An illegal move from Dame Curie himself: hand back the position
                 # so the next attempt is informed, and count it toward the
                 # fallback so a stubborn loop still ends in a played move.
                 misses = _chess_note_miss(game.game_id)
@@ -12024,7 +12024,7 @@ class ChessMoveTool(Tool):
                 )
             return f"Error: {error_text}"
 
-        # The human just moved and it is now Maxwell's turn. Do not pick his
+        # The human just moved and it is now Dame Curie's turn. Do not pick his
         # move here — chess_move returns its result to the model, so he plays
         # it himself on the follow-up turn with the annotated position in hand.
         bot_to_move = respond and game.bot_turn and not game.is_over
@@ -12302,11 +12302,11 @@ class UsageTool(Tool):
 
 
 class ManagePluginTool(Tool):
-    """Manage Maxwell modular plugins (enable, disable, list, status)."""
+    """Manage Dame Curie modular plugins (enable, disable, list, status)."""
 
     def get_description(self):
         return (
-            "Manage Maxwell modular plugins. Params: action (required: 'list', 'enable', 'disable', 'status'), "
+            "Manage Dame Curie modular plugins. Params: action (required: 'list', 'enable', 'disable', 'status'), "
             "plugin (optional, plugin name), user_id (optional, user ID or @mention), "
             "is_global (optional boolean, enable/disable plugin globally - requires admin)."
         )
@@ -12333,7 +12333,7 @@ class ManagePluginTool(Tool):
             plugins = pm.list_plugins(user_id=author_id)
             if not plugins:
                 return "No plugins currently installed in plugins/."
-            lines = ["**Installed Maxwell Plugins:**"]
+            lines = ["**Installed Dame Curie Plugins:**"]
             for p in plugins:
                 glob = "🌐 GLOBAL" if p["enabled_globally"] else "🔒 PER-USER"
                 status = (
@@ -12362,7 +12362,7 @@ class ManagePluginTool(Tool):
         # Admin gate check for global modifications
         if is_global:
             if not is_admin:
-                return "Error: Modifying global plugin status requires Maxwell admin permissions."
+                return "Error: Modifying global plugin status requires Dame Curie admin permissions."
 
         target_user = user_id
         if target_user:

@@ -9,6 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import random as _random
 
@@ -1204,7 +1205,7 @@ def _is_usage_exhausted_error(status: int, error_text: str) -> bool:
 def _is_policy_block_text(text: str) -> bool:
     """True when a 200-OK *reply body* is actually Gemini's prompt-block notice.
 
-    z3ki (and Google's OpenAI-compat surface) do not return an HTTP error for a
+    .normal.man's gateway (and Google's OpenAI-compat surface) do not return an HTTP error for a
     blocked prompt — they hand back a normal 200 whose message content is:
 
         The prompt could not be submitted. The prompt contains sensitive words
@@ -1401,7 +1402,7 @@ class OllamaProvider:
         max_tokens: int,
         temperature: float,
         api_key: str = "",
-        disable_reasoning: bool = True,
+        disable_reasoning: bool = False,
         fallback_base_url: str = "",
         fallback_model: str = "",
         fallback_api_key: str = "",
@@ -1413,11 +1414,15 @@ class OllamaProvider:
         vision_api_key: str = "",
         vision_disable_reasoning: bool = True,
         empty_response_retries: int | None = None,
+        top_p: float = 0.95,
+        top_k: int = 20,
     ):
         self.base_url = normalize_base_url(base_url)
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
         self.api_key = api_key.strip()
         self.retry_attempts = max(1, retry_attempts)
         if empty_response_retries is None:
@@ -1667,6 +1672,8 @@ class OllamaProvider:
             else endpoint.model,
             "messages": chat_messages,
             "temperature": effective_temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
             "stream": True,
         }
         # Always include max_tokens from config or override
@@ -1686,20 +1693,15 @@ class OllamaProvider:
             if disable_reasoning is not None
             else endpoint.disable_reasoning
         )
+        is_openrouter = urlsplit(endpoint.base_url).hostname == "openrouter.ai"
         if use_disable_reasoning:
-            # Ollama's OpenAI-compatible endpoint accepts both shapes from its
-            # /v1/chat/completions docs: top-level `reasoning_effort: "none"`
-            # OR nested `reasoning: {"effort": "none"}`. The literal string
-            # "none" is what the docs list as a valid value (alongside "low",
-            # "medium", "high", "max") — sending boolean false or
-            # {"exclude": true} (OpenRouter-style) was a no-op against Ollama,
-            # which is why reasoning kept streaming even with
-            # disable_reasoning=True. Emit both shapes so the same payload
-            # works across Ollama and OpenRouter without branching.
-            data["reasoning_effort"] = "none"
-            data["reasoning"] = {"effort": "none"}
-            data["thinking"] = {"type": "disabled", "budget_tokens": 0}
-        elif "kimi-k2.7" in str(data.get("model") or "").lower():
+            if is_openrouter:
+                data["reasoning"] = {"enabled": False}
+            else:
+                data["reasoning_effort"] = "none"
+                data["reasoning"] = {"effort": "none"}
+                data["thinking"] = {"type": "disabled", "budget_tokens": 0}
+        elif not is_openrouter and "kimi-k2.7" in str(data.get("model") or "").lower():
             # OpenCode Go's kimi-k2.7-code rejects reasoning_effort=none
             # ("invalid thinking: only type=enabled is allowed") and, if we
             # omit the thinking field, streams reasoning until max_tokens
@@ -2064,6 +2066,7 @@ class OllamaProvider:
                 timeout,
                 data.get("max_tokens"),
                 data.get("reasoning_effort") == "none"
+                or data.get("reasoning", {}).get("enabled") is False
                 or (
                     isinstance(data.get("thinking"), dict)
                     and data["thinking"].get("type") == "disabled"

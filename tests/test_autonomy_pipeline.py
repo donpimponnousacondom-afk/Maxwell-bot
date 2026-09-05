@@ -265,7 +265,7 @@ def test_a_sleeping_bot_does_not_post_unprompted(tmp_path):
     """He tells people he is asleep, then posts anyway — he did, until now.
 
     The live reply path refuses to answer while a sleep window is open and
-    says "max is sleeping, back in Xm". Nothing checked that here, so the tick
+    says "the dame is sleeping, back in Xm". Nothing checked that here, so the tick
     would post into a channel or DM someone while that notice was still
     standing.
     """

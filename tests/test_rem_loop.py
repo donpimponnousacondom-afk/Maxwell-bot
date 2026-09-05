@@ -1,7 +1,9 @@
 import asyncio
 
+import pytest
+
 from rag_memory import RemEventLog
-from rem import RemStore, run_rem_once
+from rem import RemStore, _provider_message, run_rem_once
 
 
 class FakeMemory:
@@ -28,13 +30,22 @@ class FakeProvider:
     def __init__(self, messages):
         self.messages = list(messages)
         self.calls = 0
+        self.generation = {}
 
-    async def generate_chat_completion(self, messages, tools=None, model=None, timeout=60, max_tokens=None):
+    async def generate_chat_completion(
+        self, messages, tools=None, model=None, timeout=60, max_tokens=None,
+        temperature=None, disable_reasoning=None,
+    ):
         self.calls += 1
+        self.generation = {
+            "temperature": temperature,
+            "disable_reasoning": disable_reasoning,
+        }
         return self.messages.pop(0)
 
 
-def test_rem_loop_bypasses_tool_calls_and_records_run(tmp_path):
+@pytest.mark.parametrize("disable_reasoning", [True, False])
+def test_rem_loop_bypasses_tool_calls_and_records_run(tmp_path, disable_reasoning):
     async def run():
         log = RemEventLog(str(tmp_path), max_events=10)
         await log.record({"role": "user", "channel_id": "c", "user_id": "u", "user_name": "u", "content": "remember cats", "auto_mode": False})
