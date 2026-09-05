@@ -42,6 +42,21 @@ State recorded on 2026-09-06 before this guide's documentation commit:
 - The baseline commit spans 30 files and roughly `+1334/-205`: bot/autonomy/provider/config/tooling/tests/docs plus `axon-bodycam/index.html` and `hello-world/index.html`.
 - Before preparing an upstream PR, review whether the standalone HTML assets belong with runtime changes and split future work by subsystem.
 
+### Baseline commit audit
+
+The initial branch commit is not ready to send upstream as one PR. Its actual directions and unresolved edges are:
+
+- Identity/persona: deploy Dame Curie/.normal.man while retaining Maxwell code/upstream names. One `bot.py` fallback still restores the old Maxwell account ID, default voice wake words still contain only `maxwell`, and several prompt/transcript labels bypass configurable `BOT_NAME`.
+- Invite text: the new Discord invite literal is joined directly to the following em dash without whitespace, likely breaking autolinking/copying.
+- Provider policy: primary reasoning now defaults on, temperature is 0.6, and top-p/top-k are forwarded. `top_k` is sent unconditionally although strict OpenAI Chat Completions endpoints may reject it. OpenRouter-specific reasoning handling uses exact hostname detection, so proxies may receive the wrong payload shape.
+- Cost/latency: enabling reasoning by default is a behavioral and budget change. Verify against every configured primary/fallback/vision endpoint rather than treating it as cosmetic tuning.
+- REM tests: the new True/False reasoning parametrization does not actually pass or assert the parameter, so the intended forwarding behavior is not covered.
+- Installer: optional-extras installation now force-reinstalls unpinned `discord.py-self>=2.0.0 --no-deps`; this is unrelated to persona/provider work and needs separate justification or removal.
+- `axon-bodycam/index.html`: generated prototype with duplicate `updateRain` definitions causing recursion, nonfunctional scene/rain/recording controls, expensive frame processing, and no matching dedicated backend route.
+- `hello-world/index.html`: standalone generated smoke artifact with no runtime integration.
+
+Before PR work, separate identity/fork policy, provider behavior, REM/context wiring, installer changes, and generated assets. Fix or deliberately reject each issue above and give every resulting commit a reviewable subject/body.
+
 ## Architecture map
 
 - `bot.py`: Discord self-bot entry point, Telegram adapter, message ingestion, prompt construction, tool loop, background loops, command queue, and shutdown.
@@ -201,5 +216,6 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 - Mapped current architecture and marked historical docs as stale.
 - Audited shell container modes, authorization, persistence, networking, capabilities, Docker access, and file-export escape paths.
 - Audited embedding configuration, failure degradation, database population, backfill behavior, backend switching hazards, and service-manager conflict.
+- Reviewed every file in root's baseline commit and recorded the unresolved identity, provider, REM-test, installer, and generated-asset issues that must be split before an upstream PR.
 - Confirmed the full test suite passed before this guide was created; one Chromium-dependent test was skipped.
 - No runtime/security fixes have been applied yet. The priority repair plan above is the handoff state.
