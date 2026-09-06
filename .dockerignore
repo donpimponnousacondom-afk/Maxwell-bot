@@ -18,3 +18,14 @@ temp/
 dump.pm2
 .kilo/
 tests/
+data_*/
+shelldocker/
+instances/
+backups/
+*.db
+*.db-*
+*.sqlite*
+*.pem
+*.key
+*cookies*
+*credentials*

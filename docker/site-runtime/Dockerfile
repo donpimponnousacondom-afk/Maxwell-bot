@@ -7,7 +7,7 @@
 #
 # A site that needs something not in this list passes `packages` to
 # site_server, which builds a per-site image FROM this one.
-FROM python:3.12-slim
+FROM python:3.14.4-slim-trixie
 
 RUN pip install --no-cache-dir \
     # request/response
