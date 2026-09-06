@@ -210,6 +210,14 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### Portable tool-budget audit and repair handoff
+
+- Added doc/html/maxwell-tool-budgets.html, matching the portable instance guide's visual style. Self-contained team handoff with current configuration semantics, confirmed findings, cross-platform execution inventory, proposed budget/outcome contract, illustrative profiles, rollout slices, acceptance tests and source references at 57d5b8c. No runtime fix is included.
+- Confirmed foreground limits count batches (default 50, cap 100), not calls; Discord's deadline is soft and Telegram ignores that loop-time control. Isolated production-loop reproductions showed two rounds executing eight calls and discarding a subsequent tool-only response; a synthetic expired Discord deadline still allowed another generation. Background terminal-only send_message also reproduced repeated delivery across two rounds.
+- Expanded source-only audit to X/email/voice/REM/extraction/embeddings/autonomy/plugins/manual/API paths, including child-policy propagation, HTML-salvage global-disable gap, X/SMTP ambiguous-write retries and cancellation settlement. Findings are development-source claims, not inspected production behavior. Runtime and secret files were not read; no live endpoints were contacted.
+- Static validation and Playwright passed on a renamed HTML copy alone in a temporary directory, offline at 1280px and 390px: all internal links resolve, no external assets/sidecar requests/page errors or horizontal overflow, chapter/navigation controls work, no-JavaScript reading works, and print/PDF generation succeeds. The audit's narrow Python 3.14 reproductions ran without project imports; the full application suite was not run for this documentation-only slice.
+- Next step: agree the shared operation-budget, inherited-policy, finalization and side-effect settlement contract, then add regression tests and implement small verified runtime slices. Do not treat lower iteration settings as a complete repair.
+
 ### Portable single-file deployment guide
 
 - Added doc/html/maxwell-instances.html as the shareable edition: complete screenshot tour plus all docs/DOCKER.md setup/reference chapters, sanitized deployment/bot templates, first-start instructions and troubleshooting.
