@@ -1065,12 +1065,7 @@ async def status(data_dir, slug: str) -> str:
 
 
 async def reconcile(data_dir) -> None:
-    """On boot: drop registry rows whose container is gone for good.
-
-    Containers carry --restart unless-stopped, so docker brings them back by
-    itself. This only fixes the registry when one was removed out from under
-    us (docker prune, manual rm, a site deleted while the bot was down).
-    """
+    """Restore desired container services; retain legacy missing-container cleanup."""
     for slug, entry in list(_read_registry(data_dir).items()):
         if entry.get("running") is not True:
             continue
@@ -1081,7 +1076,7 @@ async def reconcile(data_dir) -> None:
         alive = code == 0 and out.strip() == "true"
         if alive:
             continue
-        if code != 0:
+        if code != 0 and not runtime.container_mode():
             logger.info("Site backend %s has no container any more; clearing it", slug)
             _write_entry(data_dir, slug, None)
         else:

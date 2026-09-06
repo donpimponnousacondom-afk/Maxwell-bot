@@ -548,6 +548,25 @@ def test_container_registry_requires_explicit_legacy_migration(container_site):
         site_server.target_for(container_site, "demo")
 
 
+def test_container_reconcile_recreates_only_desired_services(container_site, monkeypatch):
+    site_server._write_entry(container_site, "active", {"running": True})
+    site_server._write_entry(container_site, "stopped", {"running": False})
+    restarted = []
+
+    async def missing(*args, **kwargs):
+        return 1, "", "No such container"
+
+    async def start(data_dir, slug):
+        restarted.append(slug)
+
+    monkeypatch.setattr(site_server, "_docker", missing)
+    monkeypatch.setattr(site_server, "start", start)
+    run(site_server.reconcile(container_site))
+    assert restarted == ["active"]
+    assert site_server.get_entry(container_site, "active") == {"running": True}
+    assert site_server.get_entry(container_site, "stopped") == {"running": False}
+
+
 def test_legacy_target_keeps_loopback(data_dir):
     site_server._write_entry(data_dir, "demo", {"port": 8801, "running": True, "url": "http://evil"})
     assert site_server.target_for(data_dir, "demo") == ("127.0.0.1", 8801)
