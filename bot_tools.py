@@ -6949,6 +6949,50 @@ class MoreToolsTool(Tool):
         )
 
 
+import docker_runtime as shell_runtime
+
+
+def _shell_workspace() -> Path:
+    if shell_runtime.container_mode():
+        return shell_runtime.confined_path(
+            os.environ.get("MAXWELL_SHELL_DIR", "/state/shell"), roots=("shell",)
+        )
+    return Path(__file__).parent / "shelldocker"
+
+
+def _read_shell_export(path: str, limit: int) -> bytes:
+    clean = str(path).strip()
+    if clean.startswith("/home/maxwell/"):
+        clean = clean[len("/home/maxwell/"):]
+    elif clean.startswith("home/maxwell/"):
+        clean = clean[len("home/maxwell/"):]
+    relative = Path(clean)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError("shell exports must be under /home/maxwell without traversal")
+    root = _shell_workspace()
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise ValueError("shell export escapes /home/maxwell")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as source:
+            import stat
+
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("shell export must be a regular file")
+            blob = source.read(limit + 1)
+        if len(blob) > limit:
+            raise ValueError("shell export is too large")
+        return blob
+    finally:
+        os.close(directory)
+
+
 class SendFileTool(Tool):
     """Create and send an arbitrary file attachment, or send an existing file from disk."""
 
@@ -6971,48 +7015,28 @@ class SendFileTool(Tool):
         path: str | None = None,
         **kwargs,
     ) -> str:
-        # Intentionally NOT admin-gated. send_file is an output channel —
-        # the model already has shell + every other tool to produce content,
-        # and gating the return path on `_is_admin` was just a barrier that
-        # blocked non-admin users from receiving files. The path-mode
-        # allowlist (_allowed_send_file_bases) is the real safety boundary.
-        # Path mode: send a file that already exists on disk (or in the shell
-        # container — we docker-cp it out as a fallback for container paths).
         if path:
-            # Normalize container paths (/home/maxwell/...) to the host bind
-            # mount so the allowlist and resolver see a real host path.
-            resolved_input = self._resolve_send_file_path(path)
-            # First, the fast path: a regular host file the model knows about.
-            host_path, host_error = await self._try_read_host_file(resolved_input)
-            if host_path is not None:
-                target = host_path
-                tmp_to_clean = None
-            else:
-                # Fallback: the model passed a container-only path (anything
-                # inside the maxwell-shell container). Try docker cp it out.
-                # Allowed for any path inside the container — the model
-                # already has shell access, and refusing "any file" creates
-                # an artificial one-step barrier that breaks the round-trip.
-                target, cp_error = await self._docker_cp_from_shell(path)
-                if target is None:
-                    return (
-                        f"Error: could not read file at '{path}'. "
-                        f"Host: {host_error or 'not found'}. "
-                        f"Container: {cp_error or 'not found or not readable'}."
-                    )
-                tmp_to_clean = target
-
             try:
-                blob = await asyncio.to_thread(target.read_bytes)
-            except Exception as e:
+                resolved_input = self._resolve_send_file_path(path)
+                workspace = _shell_workspace()
+                candidate = Path(os.path.abspath(resolved_input))
+                if candidate.is_relative_to(workspace) or candidate.resolve().is_relative_to(workspace.resolve()):
+                    shell_tool = getattr(self.bot, "tools", {}).get("shell")
+                    if shell_tool is None or not getattr(getattr(self.bot, "config", None), "ENABLE_SHELL", False):
+                        return "Error: shell file export requires a registered enabled shell tool"
+                    relative = candidate.relative_to(workspace)
+                    async with shell_tool._lifecycle_lock:
+                        await shell_tool._verify_export_container()
+                        blob = await asyncio.to_thread(_read_shell_export, str(relative), self.MAX_SIZE)
+                    target = candidate
+                else:
+                    target, host_error = await self._try_read_host_file(resolved_input)
+                    if target is None:
+                        return f"Error: could not read file at '{path}': {host_error}"
+                    blob = await asyncio.to_thread(target.read_bytes)
+            except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as e:
                 return f"Error reading file from disk: {e}"
-            finally:
-                if tmp_to_clean is not None:
-                    with contextlib.suppress(Exception):
-                        shutil.rmtree(tmp_to_clean.parent, ignore_errors=True)
-            safe_name = _safe_attachment_filename(
-                filename or target.name, default="file"
-            )
+            safe_name = _safe_attachment_filename(filename or target.name, default="file")
             return await self._send_blob(message, blob, safe_name)
 
         # Inline-content mode (original behavior).
@@ -7057,9 +7081,6 @@ class SendFileTool(Tool):
             site_path = getattr(site_dir, "MAXWELL_SITE_DIR", "")
             if site_path:
                 bases.append(os.path.abspath(site_path))
-        # Shell tool working dir (volume mounted into container as /home/maxwell).
-        shell_host = os.path.join(os.path.dirname(__file__), "shelldocker")
-        bases.append(os.path.abspath(shell_host))
         return bases
 
     def _resolve_send_file_path(self, raw_path: str) -> str:
@@ -7075,15 +7096,14 @@ class SendFileTool(Tool):
         cleaned = str(raw_path or "").strip()
         if not cleaned:
             return cleaned
-        # Normalize container-side /home/maxwell/<x> to the host bind mount.
-        # Match /home/maxwell, /home/maxwell/, or just home/maxwell (defensive).
-        m = re.match(r"^/?home/maxwell/?(.*)$", cleaned)
+        m = re.fullmatch(r"/?home/maxwell(?:/(.*))?", cleaned)
+        if ".." in Path(cleaned).parts:
+            raise ValueError("path traversal not allowed")
         if m:
-            shell_host = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "shelldocker")
-            )
-            rel = m.group(1).lstrip("/")
-            return os.path.join(shell_host, rel) if rel else shell_host
+            rel = m.group(1) or ""
+            if Path(rel).is_absolute():
+                raise ValueError("shell exports must be under /home/maxwell")
+            return str(_shell_workspace() / rel)
         return cleaned
 
     async def _try_read_host_file(
@@ -7103,88 +7123,6 @@ class SendFileTool(Tool):
                 except OSError:
                     continue
         return None, "not in an allowed host directory or not found"
-
-    async def _docker_cp_from_shell(
-        self, container_path: str
-    ) -> tuple[Path | None, str | None]:
-        """docker-cp a file out of the maxwell-shell container to a local temp
-        path, then return that local Path. Used as a fallback when the model
-        passes a path that only exists inside the container.
-
-        Path safety: we only allow reads from inside the running
-        maxwell-shell container. The container's root is bounded by the
-        sandbox flags (no host FS mount by default; even in MAXWELL_SHELL_FULL_HOST
-        mode, /host is a separate root).
-        """
-        if not container_path or not isinstance(container_path, str):
-            return None, "empty path"
-        clean = container_path.strip()
-        if not clean.startswith("/"):
-            clean = "/" + clean  # require absolute inside container
-        # No traversal escapes from the container root; this is read-only.
-        if ".." in clean.split("/"):
-            return None, "path traversal not allowed"
-
-        # Confirm the container is running.
-        try:
-            shell_tool = self.bot.tools.get("shell") if self.bot else None
-            container_name = (
-                getattr(shell_tool, "CONTAINER_NAME", "maxwell-shell")
-                if shell_tool
-                else "maxwell-shell"
-            )
-        except Exception:
-            container_name = "maxwell-shell"
-
-        tmp_dir = tempfile.mkdtemp(prefix="maxwell_sendfile_")
-        local_path = os.path.join(tmp_dir, os.path.basename(clean) or "file")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker",
-                "cp",
-                f"{container_name}:{clean}",
-                local_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, "docker cp timed out"
-            except asyncio.CancelledError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise
-            if proc.returncode != 0:
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, (
-                    stderr.decode(errors="replace").strip()
-                    or f"docker cp exit {proc.returncode}"
-                )
-            if not os.path.isfile(local_path):
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, "docker cp reported success but file is missing"
-            return Path(local_path), None
-        except FileNotFoundError:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            return None, "docker is not installed or not on PATH"
-        except Exception as e:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            return None, f"docker cp failed: {e}"
 
     async def _send_blob(self, message: Message, blob: bytes, safe_name: str) -> str:
         if len(blob) > self.MAX_SIZE:
@@ -7319,10 +7257,24 @@ SANDBOX_IMAGE_NAME = "maxwell-shell"
 SANDBOX_DOCKERFILE_DIR = os.path.join(os.path.dirname(__file__), "docker")
 
 
+def _sandbox_source_hash() -> str:
+    import hashlib
+
+    return hashlib.sha256((Path(SANDBOX_DOCKERFILE_DIR) / "Dockerfile").read_bytes()).hexdigest()
+
+
 async def _ensure_sandbox_image(image: str = SANDBOX_IMAGE_NAME) -> None:
-    """Build the sandbox image if it is not present. Idempotent."""
+    labels = []
+    if shell_runtime.container_mode():
+        expected = shell_runtime.resource_name("shell-image")
+        if image not in {SANDBOX_IMAGE_NAME, expected}:
+            raise ValueError("shell image must use this instance namespace")
+        image = expected
+        labels = shell_runtime.label_args("shell-image") + [
+            "--label", f"maxwell.shell.source={_sandbox_source_hash()}"
+        ]
     try:
-        (_stdout, _stderr), code = await _run_docker_cmd(
+        (stdout, stderr), code = await _run_docker_cmd(
             "image", "inspect", image, timeout=15
         )
     except FileNotFoundError as exc:
@@ -7330,14 +7282,22 @@ async def _ensure_sandbox_image(image: str = SANDBOX_IMAGE_NAME) -> None:
     except asyncio.TimeoutError as exc:
         raise RuntimeError("docker did not respond") from exc
     if code == 0:
-        return
+        if not shell_runtime.container_mode():
+            return
+        info = json.loads(stdout)[0]
+        image_labels = info["Config"].get("Labels") or {}
+        shell_runtime.require_ownership(image_labels, "shell-image")
+        if image_labels.get("maxwell.shell.source") == _sandbox_source_hash():
+            return
+    elif b"No such" not in stderr:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or "shell image inspect failed")
     (_stdout, stderr), build_code = await _run_docker_cmd(
-        "build", "-t", image, SANDBOX_DOCKERFILE_DIR, timeout=900
+        "build", "-t", image, *labels, "-f",
+        str(Path(SANDBOX_DOCKERFILE_DIR) / "Dockerfile"),
+        SANDBOX_DOCKERFILE_DIR, timeout=900
     )
     if build_code != 0:
-        raise RuntimeError(
-            stderr.decode(errors="replace").strip() or "docker build failed"
-        )
+        raise RuntimeError(stderr.decode(errors="replace").strip() or "docker build failed")
 
 
 def _taint_gate_blocks(tool: Any, message: Any, kwargs: dict) -> bool:
@@ -7366,8 +7326,14 @@ class ShellTool(Tool):
     # tool we expose, so it gets the taint-check / user-confirmation gate.
     is_destructive = True
 
-    CONTAINER_NAME = "maxwell-shell"
-    IMAGE_NAME = "maxwell-shell"
+    @property
+    def CONTAINER_NAME(self):
+        return shell_runtime.resource_name("shell") if shell_runtime.container_mode() else "maxwell-shell"
+
+    @property
+    def IMAGE_NAME(self):
+        return shell_runtime.resource_name("shell-image") if shell_runtime.container_mode() else SANDBOX_IMAGE_NAME
+
     DOCKERFILE_DIR = os.path.join(os.path.dirname(__file__), "docker")
 
     # Output / command-length caps. Read from env so the operator can tune
@@ -7453,12 +7419,12 @@ class ShellTool(Tool):
     @staticmethod
     def _full_host_access() -> bool:
         """Opt-in host RCE mode. Default is isolated (no /host, no host net)."""
-        return os.environ.get("MAXWELL_SHELL_FULL_HOST", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
+        full = os.environ.get("MAXWELL_SHELL_FULL_HOST", "").strip().lower() in {
+            "1", "true", "yes", "on",
         }
+        if full and shell_runtime.container_mode():
+            raise ValueError("MAXWELL_SHELL_FULL_HOST is forbidden in container mode")
+        return full
 
     def get_description(self):
         # Surface live limits so the model doesn't have to guess. Pulled at
@@ -7498,76 +7464,87 @@ class ShellTool(Tool):
     async def _run_docker(self, *args: str, timeout: int = 30):
         return await _run_docker_cmd(*args, timeout=timeout)
 
+    async def _verify_daemon(self):
+        if shell_runtime.container_mode():
+            (stdout, stderr), code = await self._run_docker("info", "--format", "{{json .SecurityOptions}}", timeout=10)
+            if code or stderr.strip() or "name=rootless" not in json.loads(stdout or b"[]"):
+                raise RuntimeError("container shell requires a rootless Docker daemon")
+
+    async def _inspect_container(self):
+        (stdout, stderr), code = await self._run_docker(
+            "inspect", "--type", "container", self.CONTAINER_NAME, timeout=10
+        )
+        if code:
+            if b"No such" not in stderr:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "sandbox inspect failed")
+            return None
+        info = json.loads(stdout)[0]
+        labels = info["Config"].get("Labels") or {}
+        if shell_runtime.container_mode():
+            shell_runtime.require_ownership(labels, "shell")
+        elif labels.get("maxwell.shell.mode") not in {"full", "isolated"} or labels.get("maxwell.shell.init") != "1":
+            raise ValueError("existing container is not an owned Maxwell shell")
+        return info
+
+    async def _verify_container(self, info):
+        full = self._full_host_access()
+        labels = info["Config"].get("Labels") or {}
+        if labels.get("maxwell.shell.mode") != ("full" if full else "isolated") or labels.get("maxwell.shell.init") != "1":
+            raise ValueError("shell container mode does not match configuration")
+        host = info["HostConfig"]
+        workspace = _shell_workspace()
+        source = shell_runtime.host_path(workspace, roots=("shell",)) if shell_runtime.container_mode() else workspace
+        expected_mounts = {(str(source), "/home/maxwell", True)}
+        if full:
+            expected_mounts.add(("/", "/host", True))
+        mounts = {(m["Source"], m["Destination"], m["RW"]) for m in info["Mounts"] if m["Type"] == "bind"}
+        if mounts != expected_mounts or any(m["Type"] not in {"bind", "tmpfs"} for m in info["Mounts"]):
+            raise ValueError("shell container has unexpected mounts")
+        if host.get("Privileged") or host.get("PidMode") == "host" or host.get("IpcMode") == "host" or host.get("Devices") or host.get("VolumesFrom"):
+            raise ValueError("shell container has unsafe host access")
+        if host.get("NetworkMode") != ("host" if full else "bridge") or host.get("Init") is not True:
+            raise ValueError("shell container network/init does not match configuration")
+        if not full and (set(host.get("CapDrop") or []) != {"ALL"} or set(host.get("CapAdd") or []) != {"CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "NET_RAW", "NET_BIND_SERVICE"} or "no-new-privileges:true" not in (host.get("SecurityOpt") or [])):
+            raise ValueError("shell container security options do not match configuration")
+        if shell_runtime.container_mode():
+            (stdout, stderr), code = await self._run_docker("image", "inspect", self.IMAGE_NAME, timeout=15)
+            if code:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "shell image missing")
+            image = json.loads(stdout)[0]
+            image_labels = image["Config"].get("Labels") or {}
+            shell_runtime.require_ownership(image_labels, "shell-image")
+            if image_labels.get("maxwell.shell.source") != _sandbox_source_hash() or info["Image"] != image["Id"]:
+                raise ValueError("shell container image identity/source mismatch")
+        return info["Id"]
+
+    async def _verify_export_container(self):
+        self._full_host_access()
+        await self._verify_daemon()
+        info = await self._inspect_container()
+        if info is None or not info["State"]["Running"]:
+            raise ValueError("shell container is not running")
+        return await self._verify_container(info)
+
     async def _ensure_container(self):
-        # Reuse a running container when present and access mode matches.
-        # Recreate when missing/stopped or when full-host mode flag changed.
         desired_mode = "full" if self._full_host_access() else "isolated"
-        try:
-            (stdout, _stderr), code = await self._run_docker(
-                "inspect",
-                "--type",
-                "container",
-                "-f",
-                '{{.State.Running}} {{index .Config.Labels "maxwell.shell.mode"}} '
-                '{{index .Config.Labels "maxwell.shell.init"}}',
-                self.CONTAINER_NAME,
-                timeout=10,
-            )
-            if code == 0:
-                parts = stdout.decode(errors="replace").strip().split(None, 2)
-                running = (parts[0] if parts else "").lower() == "true"
-                mode = parts[1] if len(parts) > 1 else ""
-                init = parts[2] if len(parts) > 2 else ""
-                if running and mode == desired_mode and init == "1":
-                    return
-                if not running and mode == desired_mode and init == "1":
-                    (_stdout, stderr), start_code = await self._run_docker(
-                        "start", self.CONTAINER_NAME, timeout=15
-                    )
-                    if start_code == 0:
-                        return
-                # Wrong mode or start failed — require a successful rm, then recreate.
-                (_stdout, _stderr), rm_code = await self._run_docker(
-                    "rm", "-f", self.CONTAINER_NAME, timeout=10
-                )
-                if rm_code != 0:
-                    raise RuntimeError(
-                        "could not remove the existing sandbox container"
-                    )
-                # `docker rm -f` may return before the name is reusable.
-                # Confirm disappearance before building/running the
-                # replacement, otherwise the next run can hit a stale-name
-                # race and leave the sandbox unavailable.
-                for _ in range(100):
-                    (_stdout, _stderr), inspect_code = await self._run_docker(
-                        "inspect",
-                        "--type",
-                        "container",
-                        "-f",
-                        "{{.Id}}",
-                        self.CONTAINER_NAME,
-                        timeout=10,
-                    )
-                    if inspect_code != 0:
-                        break
-                    await asyncio.sleep(0.1)
-                else:
-                    raise RuntimeError(
-                        "sandbox container did not disappear after removal"
-                    )
-        except FileNotFoundError as exc:
-            raise RuntimeError("docker is not installed or not on PATH") from exc
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("docker did not respond while checking sandbox") from exc
-
-        try:
-            await _ensure_sandbox_image(self.IMAGE_NAME)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"could not prepare sandbox image: {exc}") from exc
-
-        shell_host = os.path.join(os.path.dirname(__file__), "shelldocker")
+        await self._verify_daemon()
+        info = await self._inspect_container()
+        if info is not None:
+            labels = info["Config"].get("Labels") or {}
+            if labels.get("maxwell.shell.mode") == desired_mode and labels.get("maxwell.shell.init") == "1":
+                container_id = await self._verify_container(info)
+                if not info["State"]["Running"]:
+                    (_stdout, stderr), code = await self._run_docker("start", container_id, timeout=15)
+                    if code:
+                        raise RuntimeError(stderr.decode(errors="replace").strip() or "shell start failed")
+                return await self._verify_export_container()
+            (_stdout, stderr), code = await self._run_docker("rm", "-f", info["Id"], timeout=10)
+            if code:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "could not remove sandbox")
+        await _ensure_sandbox_image(self.IMAGE_NAME)
+        workspace = _shell_workspace()
+        workspace.mkdir(parents=True, exist_ok=True)
+        shell_host = shell_runtime.host_path(workspace, roots=("shell",)) if shell_runtime.container_mode() else workspace
         run_args = [
             "run",
             "-d",
@@ -7625,12 +7602,15 @@ class ShellTool(Tool):
                     "NET_BIND_SERVICE",
                 ]
             )
+        if shell_runtime.container_mode():
+            run_args.extend(shell_runtime.label_args("shell"))
         run_args.append(self.IMAGE_NAME)
         (_stdout, stderr), run_code = await self._run_docker(*run_args, timeout=30)
         if run_code != 0:
             raise RuntimeError(
                 stderr.decode(errors="replace").strip() or "docker run failed"
             )
+        return await self._verify_export_container()
 
     @staticmethod
     def _command_arg(command: str | None = None, **kwargs) -> str | None:
@@ -7705,7 +7685,7 @@ class ShellTool(Tool):
         if not sanitized:
             raise RuntimeError("empty command")
         async with self._lifecycle_lock:
-            await self._ensure_container()
+            container_id = await self._ensure_container()
             exec_token = f"maxwell-exec-{uuid.uuid4().hex}"
             pid_file = f"/tmp/{exec_token}.pid"
             # Run the user's shell in its own session/process group and leave
@@ -7724,7 +7704,7 @@ class ShellTool(Tool):
                 "/home/maxwell",
                 "--user",
                 "root",
-                self.CONTAINER_NAME,
+                container_id,
                 "setsid",
                 "--wait",
                 "bash",
@@ -7802,14 +7782,14 @@ class ShellTool(Tool):
                     timeout=self._timeout_seconds(),
                 )
             except asyncio.TimeoutError:
-                await self._kill_container_exec(pid_file)
+                await self._kill_container_exec(pid_file, container_id)
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 await proc.wait()
                 raise
             except asyncio.CancelledError:
                 # Outer autonomy wait_for or other cancel can hit here; always kill child.
-                await self._kill_container_exec(pid_file)
+                await self._kill_container_exec(pid_file, container_id)
                 if proc.returncode is None:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
@@ -7822,7 +7802,7 @@ class ShellTool(Tool):
                 # Belt-and-suspenders: ensure no zombie if communicate didn't finish.
                 if proc.returncode is None:
                     try:
-                        await self._kill_container_exec(pid_file)
+                        await self._kill_container_exec(pid_file, container_id)
                         proc.kill()
                         await proc.wait()
                     except Exception as e:
@@ -7832,7 +7812,7 @@ class ShellTool(Tool):
                 stderr_buf.extend(b"\n[output truncated at MAXWELL_SHELL_MAX_OUTPUT]")
             return bytes(stdout_buf), bytes(stderr_buf), proc.returncode
 
-    async def _kill_container_exec(self, pid_file: str) -> None:
+    async def _kill_container_exec(self, pid_file: str, container_id: str) -> None:
         """Terminate the timed-out command, not just its docker client."""
         quoted = shlex.quote(pid_file)
         cleanup = (
@@ -7844,11 +7824,13 @@ class ShellTool(Tool):
             "esac"
         )
         with contextlib.suppress(Exception):
+            if await self._verify_export_container() != container_id:
+                return
             await self._run_docker(
                 "exec",
                 "--user",
                 "root",
-                self.CONTAINER_NAME,
+                container_id,
                 "bash",
                 "-lc",
                 cleanup,
@@ -8095,80 +8077,18 @@ class ShellTool(Tool):
         return [f.strip() for f in raw.split(",") if f.strip()]
 
     async def _send_container_file(self, message: Message, rel_path: str) -> str | None:
-        """Copy a file out of the container, stage it in data/exports/, and
-        send it to Discord. Returns filename on success.
-
-        Staging into data/exports/ (which send_file already allowlists) means a
-        follow-up `send_file path=.../exports/<name>` can re-attach the same
-        artifact without another docker cp — the round-trip is one-shot.
-        """
-        # Sanitize — no path traversal escapes from /home/maxwell
-        clean = rel_path.strip().lstrip("/")
-        # The model usually passes a full container path like
-        # /home/maxwell/img/foo.png (the system prompt tells it to). lstrip
-        # only killed the leading slash, so strip the home/maxwell prefix
-        # too — otherwise we re-prepend it and docker cp looks for
-        # /home/maxwell/home/maxwell/img/foo.png (which is the bug we're fixing).
-        clean = re.sub(r"^home/maxwell/?", "", clean)
-        if ".." in clean:
-            logger.warning(f"Shell file send blocked — path traversal: {rel_path}")
+        if getattr(self.bot, "tools", {}).get("shell") is not self or not getattr(getattr(self.bot, "config", None), "ENABLE_SHELL", False):
             return None
-
-        container_path = f"/home/maxwell/{clean}"
-        tmp_dir = tempfile.mkdtemp(prefix="maxwell_shell_")
-        local_path = os.path.join(tmp_dir, os.path.basename(clean))
-
         try:
-            (_stdout, stderr), code = await self._run_docker(
-                "cp", f"{self.CONTAINER_NAME}:{container_path}", local_path, timeout=15
-            )
-            if code != 0:
-                logger.warning(
-                    f"docker cp failed for {container_path}: {stderr.decode(errors='replace')}"
-                )
-                return None
-
-            if not os.path.isfile(local_path):
-                logger.warning(f"File not found after docker cp: {local_path}")
-                return None
-
-            file_size = os.path.getsize(local_path)
-            if file_size > 10 * 1024 * 1024:
-                logger.warning(f"Shell file too large to send: {file_size} bytes")
-                return None
-
-            filename = os.path.basename(clean)
-            # Step aside for the live progress message before posting
-            # the file artifact.
+            async with self._lifecycle_lock:
+                await self._verify_export_container()
+                blob = await asyncio.to_thread(_read_shell_export, rel_path, 10 * 1024 * 1024)
+            filename = Path(rel_path).name
             self._signal_streaming(message)
-            await message.channel.send(file=File(local_path, filename=filename))
-            logger.info(f"Sent shell file: {filename} ({file_size} bytes)")
-
-            # Stage a copy into the canonical exports dir for later re-attach.
-            try:
-                exports_dir = _shell_exports_dir()
-                os.makedirs(exports_dir, exist_ok=True)
-                staged = os.path.join(exports_dir, filename)
-                # Avoid clobbering an existing export with the same name.
-                if os.path.exists(staged):
-                    base, ext = os.path.splitext(filename)
-                    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                    staged = os.path.join(exports_dir, f"{base}_{stamp}{ext}")
-                shutil.copy2(local_path, staged)
-                logger.info(f"Staged shell file to exports: {staged}")
-            except Exception as e:
-                logger.warning(f"Failed to stage shell file to exports: {e}")
-
+            await message.channel.send(file=File(BytesIO(blob), filename=filename))
             return filename
-        except asyncio.TimeoutError:
-            logger.warning(f"docker cp timed out for {container_path}")
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, discord.HTTPException):
             return None
-        except Exception as e:
-            logger.warning(f"Failed to send shell file {rel_path}: {e}")
-            return None
-        finally:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _shorten(text, n: int) -> str:
