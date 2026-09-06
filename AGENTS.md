@@ -210,6 +210,12 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### Portable single-file deployment guide
+
+- Added doc/html/maxwell-instances.html as the shareable edition: complete screenshot tour plus all docs/DOCKER.md setup/reference chapters, sanitized deployment/bot templates, first-start instructions and troubleshooting.
+- All three PNG screenshots are embedded as base64; styles, image zoom and chapter navigation are inline, with internal-anchor links only. No credentials, runtime data or external assets are included. Existing source docs remain unchanged.
+- Playwright verified a renamed copy placed alone in a temporary directory with networking disabled at 1280px/390px: three decoded image hashes match the reviewed demo screenshots, all eight setup code blocks and both templates present, internal links resolve, zoom/close and chapter expansion work, no horizontal overflow, page errors or network/sidecar requests.
+
 ### Visual instance tour
 
 - Added docs/instance-tour.html with three Playwright screenshots of the actual dashboard against intercepted synthetic responses; no real credentials or runtime data were used.
