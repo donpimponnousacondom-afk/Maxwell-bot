@@ -11291,22 +11291,17 @@ class UpdateBasePersonalityTool(Tool):
             )
 
         try:
-            control = dict(self.bot._control)
-            control["base_personality"] = text
-            self.bot._control = control
-            import asyncio
-            from pathlib import Path
+            from prompt_storage import get_prompt_store
 
-            await asyncio.to_thread(
-                _atomic_json_write_sync,
-                Path(self.bot.config.DATA_DIR) / "bot_control.json",
-                control,
-            )
+            store = get_prompt_store(self.bot.config.DATA_DIR)
+            await asyncio.to_thread(store.set_personality, text)
+            if not store.external:
+                self.bot._control["base_personality"] = text
         except Exception as e:
             return f"Error: failed to persist base_personality: {e}"
         return (
             f"base_personality updated. {len(text)} chars written to "
-            "bot_control.json. The change is live on the next turn — no "
+            f"{store.personality_path}. The change is live on the next turn — no "
             "restart needed. MAXWELL_BASE_KNOWLEDGE (in code) was NOT "
             "touched; only the per-runtime personality paragraph was rewritten."
         )

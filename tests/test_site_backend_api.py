@@ -181,7 +181,7 @@ def test_unknown_and_malformed_slugs_are_refused(data_dir):
 
 
 def test_proxy_requires_live_server_metadata(data_dir, monkeypatch):
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: 8801)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: ("127.0.0.1", 8801))
     sites_path = data_dir / "sites.json"
     sites = json.loads(sites_path.read_text(encoding="utf-8"))
     sites["guest"]["server"] = False
@@ -277,7 +277,7 @@ def test_value_caps_count_utf8_bytes(data_dir, monkeypatch):
 
 # ── the proxy in front of a site's own backend server ─────────────────────
 def test_proxy_refuses_when_no_backend_is_running(data_dir, monkeypatch):
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: None)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: None)
     resp = run(api.site_proxy(FakeRequest(match={"slug": "guest", "path": "notes"})))
     assert resp.status == 404
     assert "no backend server" in _payload(resp)["error"]
@@ -288,10 +288,11 @@ def test_proxy_refuses_a_malformed_slug(data_dir):
     assert resp.status == 404
 
 
-def test_proxy_only_ever_targets_loopback(data_dir, monkeypatch):
-    """The registry picks the destination — a slug can't steer it elsewhere."""
+@pytest.mark.parametrize("host,port", [("127.0.0.1", 8801), ("maxwell-curie-site-guest", 8000)])
+def test_proxy_uses_verified_target(data_dir, monkeypatch, host, port):
+    """The resolver picks the destination — a request cannot supply a host."""
     seen = {}
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: 8801)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: (host, port))
 
     class FakeContent:
         async def iter_chunked(self, n):
@@ -329,7 +330,7 @@ def test_proxy_only_ever_targets_loopback(data_dir, monkeypatch):
         )
     )
     assert resp.status == 200
-    assert seen["url"] == "http://127.0.0.1:8801/notes/5?q=x"
+    assert seen["url"] == f"http://{host}:{port}/notes/5?q=x"
     # The backend is told where it really lives and who is really calling.
     assert seen["headers"]["X-Site-Slug"] == "guest"
     assert seen["headers"]["X-Forwarded-Prefix"] == "/bot/guest/api"
@@ -343,7 +344,7 @@ def test_proxy_only_ever_targets_loopback(data_dir, monkeypatch):
 
 def test_proxy_streams_instead_of_buffering(data_dir, monkeypatch):
     """SSE and long polling only work if chunks go out as they arrive."""
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: 8801)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: ("127.0.0.1", 8801))
     order = []
 
     class FakeContent:
@@ -380,9 +381,10 @@ def test_proxy_streams_instead_of_buffering(data_dir, monkeypatch):
     assert order == ["upstream0", "client", "upstream1", "client", "upstream2", "client"]
 
 
-def test_websocket_upgrade_takes_the_socket_path(data_dir, monkeypatch):
+@pytest.mark.parametrize("host,port", [("127.0.0.1", 8801), ("maxwell-curie-site-guest", 8000)])
+def test_websocket_upgrade_takes_the_socket_path(data_dir, monkeypatch, host, port):
     """Multiplayer depends on this branch being reached, not the HTTP one."""
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: 8801)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: (host, port))
     called = {}
 
     async def fake_ws(request, slug, target):
@@ -394,11 +396,11 @@ def test_websocket_upgrade_takes_the_socket_path(data_dir, monkeypatch):
     req.headers["Upgrade"] = "websocket"
     assert run(api.site_proxy(req)) == "ws-response"
     assert called["slug"] == "guest"
-    assert called["target"] == "http://127.0.0.1:8801/ws"
+    assert called["target"] == f"http://{host}:{port}/ws"
 
 
 def test_websocket_on_a_site_with_no_backend_is_still_refused(data_dir, monkeypatch):
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: None)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: None)
     req = FakeRequest(match={"slug": "guest", "path": "ws"}, method="GET")
     req.headers["Upgrade"] = "websocket"
     resp = run(api.site_proxy(req))
@@ -407,7 +409,7 @@ def test_websocket_on_a_site_with_no_backend_is_still_refused(data_dir, monkeypa
 
 def test_oversize_upload_is_refused_before_streaming(data_dir, monkeypatch):
     """Content-Length says no, so 40MB is never pulled through this process."""
-    monkeypatch.setattr(api.site_server, "port_for", lambda dd, slug: 8801)
+    monkeypatch.setattr(api.site_server, "target_for", lambda dd, slug: ("127.0.0.1", 8801))
     req = FakeRequest(match={"slug": "guest", "path": "upload"}, method="POST")
     req.content_length = api.SITE_UPLOAD_MAX + 1
     resp = run(api.site_proxy(req))

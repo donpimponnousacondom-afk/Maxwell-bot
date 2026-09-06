@@ -312,6 +312,7 @@ from captcha_solver import (  # noqa: E402
     build_solver,
 )
 from config import Config  # noqa: E402
+from prompt_storage import PromptStorageError, get_prompt_store  # noqa: E402
 from context_budget import (  # noqa: E402
     BudgetPlan,
     allocate,
@@ -2888,7 +2889,7 @@ class MaxwellBot(commands.Bot):
                 Config.DISCORD_TOKEN = gf_tok
                 os.environ["DISCORD_TOKEN"] = gf_tok
             # Data dir isolation for GF
-            gf_data = "data_gf"
+            gf_data = self.config.DATA_DIR
             self.config.DATA_DIR = gf_data
             Config.DATA_DIR = gf_data
             os.environ["DATA_DIR"] = gf_data
@@ -2903,6 +2904,10 @@ class MaxwellBot(commands.Bot):
                 # validate() below fails loudly if the dir is truly unusable.
                 logger.warning("Could not pre-create %s: %s", gf_data, e)
         self.config.validate()
+        if self.config.MAXWELL_PROMPTS_DIR:
+            get_prompt_store(
+                self.config.DATA_DIR, self.config.MAXWELL_PROMPTS_DIR
+            ).read_personality()
         # Display name is source of truth - GF account is Uni per Discord, so initial matches that
         self.bot_name = partner_name if is_gf else bot_name
         self._human_captcha_server: HumanCaptchaServer | None = None
@@ -3110,6 +3115,8 @@ class MaxwellBot(commands.Bot):
         # dispatcher so the model can no longer self-confirm.
         self._destructive_confirm: dict[str, float] = {}
         self._control = dict(DEFAULT_CONTROL)
+        if self.config.MAXWELL_PROMPTS_DIR:
+            self._control.pop("base_personality", None)
         # 2026-07-22: progress messages are now per-server (see
         # self._progress_servers + _progress_enabled). The old global
         # self._control["progress_messages"] flag is gone — keeping a stale
@@ -4036,9 +4043,9 @@ class MaxwellBot(commands.Bot):
 
     def _get_personality(self) -> str:
         """Get base personality with age injected dynamically."""
-        base = str(
-            self._control.get("base_personality", DEFAULT_CONTROL["base_personality"])
-        )
+        base = get_prompt_store(
+            self.config.DATA_DIR, self.config.MAXWELL_PROMPTS_DIR
+        ).read_personality(retain_valid=True)
         age_days = (datetime.now(timezone.utc) - self._BIRTHDAY).days
         age_line = f"\nYou are currently {age_days} days old. You were born on May 21, 2026. You KNOW your age — never say you don't have one."
         if "You are currently" not in base:
@@ -7888,6 +7895,9 @@ class MaxwellBot(commands.Bot):
                     await message.channel.send(f"Unblacklisted {label}")
         except discord.Forbidden as _exc:
             pass
+        except PromptStorageError as exc:
+            logger.error("Prompt command failed: %s", exc)
+            await message.channel.send(f"Prompt update failed: {exc}")
         except Exception as e:
             logger.error(
                 f"Command handling error for ,{cmd}: {e}\n{traceback.format_exc()}"
@@ -10257,6 +10267,8 @@ class MaxwellBot(commands.Bot):
             if control["ai_concurrency"] != self._ai_concurrency:
                 self._ai_concurrency = control["ai_concurrency"]
                 self._notify_ai_waiters()
+            if self.config.MAXWELL_PROMPTS_DIR:
+                control.pop("base_personality", None)
             self._control = control
             self._apply_x_control(control)
             poller = getattr(self, "mail_poller", None)

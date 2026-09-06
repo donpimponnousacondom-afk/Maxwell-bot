@@ -497,7 +497,12 @@ class Config:
     )
     REM_RUN_HISTORY = _int_env("REM_RUN_HISTORY", 50, min_value=1, max_value=1000)
 
-    DATA_DIR = os.getenv("DATA_DIR", "data")
+    DATA_DIR = os.getenv(
+        "DATA_DIR",
+        "data_gf" if os.getenv("BOT_PERSONA_TYPE", "").strip().lower()
+        in {"gf", "mommy", "mommy_gf", "luna", "mommygf"} else "data",
+    )
+    MAXWELL_PROMPTS_DIR = os.getenv("MAXWELL_PROMPTS_DIR", "").strip()
     LOGS_DIR = os.getenv("LOGS_DIR", os.getenv("LOGS", "logs"))
     LOG_LEVEL = os.getenv("LOG_LEVEL", "info")
 

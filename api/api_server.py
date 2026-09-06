@@ -16,6 +16,7 @@ import hashlib
 import time
 import uuid as _uuid
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 from aiohttp import web
@@ -42,6 +43,8 @@ import sys as _sys  # noqa: E402
 
 _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import docker_runtime  # noqa: E402
+
 from api.storage import (  # noqa: E402
     APP_ROOT,
     _autonomy_goals_path,
@@ -53,6 +56,7 @@ from api.storage import (  # noqa: E402
     _llm_traces_path,
     _load,
     _load_for_write,
+    _prompt_store,
     _rem_runs_path,
     _safe_int,
     _safe_list,
@@ -182,6 +186,7 @@ from api.state import (  # noqa: E402
     _normalize_memory_line,
     _save_rem_control,
     _sanitize_control,
+    save_control,
 )
 
 
@@ -201,6 +206,12 @@ async def data_file(request):
     }
     if file not in ALLOWED_FILES:
         return _json_response({"error": "not allowed"}, 403)
+    if file in {"prompts.json", "bot_control.json"}:
+        try:
+            data = _prompt_store().read_servers() if file == "prompts.json" else _load_control()
+        except ValueError as exc:
+            return _json_response({"error": str(exc)}, 409)
+        return _json_response(data)
     path = DATA_DIR / file
     if not path.exists():
         return _json_response([])
@@ -584,17 +595,14 @@ async def prompt_save(request):
     text = str(body.get("text", "")).strip()[:MAX_PROMPT_CHARS]
     if not pid:
         return _json_response({"error": "no id"}, 400)
-    path = DATA_DIR / "prompts.json"
-    async with _file_lock:
-        try:
-            p = _load_for_write(path, dict, {})
-        except ValueError as exc:
-            return _json_response({"error": str(exc)}, 409)
-        if not text:
-            p.pop(pid, None)
+    try:
+        store = _prompt_store()
+        if text:
+            await asyncio.to_thread(store.set_server, pid, text)
         else:
-            p[pid] = text
-        await atomic_json_write(path, p)
+            await asyncio.to_thread(store.delete_server, pid)
+    except ValueError as exc:
+        return _json_response({"error": str(exc)}, 409)
     return _json_response({"ok": True})
 
 
@@ -602,16 +610,12 @@ async def prompt_delete(request):
     pid = _clean_id(request.query.get("id", ""))
     if not pid:
         return _json_response({"error": "no id"}, 400)
-    path = DATA_DIR / "prompts.json"
-    async with _file_lock:
-        try:
-            p = _load_for_write(path, dict, {})
-        except ValueError as exc:
-            return _json_response({"error": str(exc)}, 409)
-        if pid not in p:
-            return _json_response({"error": "not found"}, 404)
-        p.pop(pid, None)
-        await atomic_json_write(path, p)
+    try:
+        existed = await asyncio.to_thread(_prompt_store().delete_server, pid)
+    except ValueError as exc:
+        return _json_response({"error": str(exc)}, 409)
+    if not existed:
+        return _json_response({"error": "not found"}, 404)
     return _json_response({"ok": True})
 
 
@@ -999,12 +1003,12 @@ async def site_items_delete(request):
 
 # ---------- Site backend servers (proxy to the per-site container) ----------
 # /bot/<slug>/api/<path> is the public face of a site's own server (see
-# site_server.py). Caddy sends that path here; we look the slug's loopback port
-# up in the registry and pass the request through with the prefix stripped, so
-# a route the site defines as /notes is reached at /bot/<slug>/api/notes.
+# site_server.py). Caddy sends that path here; we resolve the slug's verified
+# endpoint and pass the request through with the prefix stripped, so a route
+# defined as /notes is reached at /bot/<slug>/api/notes.
 #
-# Only the registry can name a destination, and only ever 127.0.0.1 on a port
-# this process assigned — a slug cannot steer the proxy anywhere else.
+# Destinations are bounded legacy loopback ports or instance-derived container
+# DNS names on port 8000, never arbitrary registry or request URLs.
 _SITE_PROXY_RATE = site_backend.RateLimiter(rate=20.0, burst=200)
 _SITE_PROXY_HOP_HEADERS = {
     "connection",
@@ -1129,11 +1133,12 @@ async def site_proxy(request):
         return _site_json({"error": "slow down"}, 429)
     if not await asyncio.to_thread(_site_server_enabled, slug):
         return _site_json({"error": "this site has no backend server running"}, 404)
-    port = await asyncio.to_thread(site_server.port_for, DATA_DIR, slug)
-    if not port:
+    endpoint = await asyncio.to_thread(site_server.target_for, DATA_DIR, slug)
+    if not endpoint:
         return _site_json({"error": "this site has no backend server running"}, 404)
+    host, port = endpoint
     tail = request.match_info.get("path", "") or ""
-    target = f"http://127.0.0.1:{port}/{tail.lstrip('/')}"
+    target = f"http://{host}:{port}/{tail.lstrip('/')}"
     if request.query_string:
         target += "?" + request.query_string
 
@@ -1223,7 +1228,11 @@ async def control_get(request):
     undefined, so its input rendered blank instead of showing the default the
     bot is actually running with.
     """
-    return _json_response({"ok": True, "control": _load_control()})
+    try:
+        control = _load_control()
+    except ValueError as exc:
+        return _json_response({"error": str(exc)}, 409)
+    return _json_response({"ok": True, "control": control})
 
 
 async def control_put(request):
@@ -1235,20 +1244,16 @@ async def control_put(request):
         return _json_response({"error": "invalid control"}, 400)
     async with _file_lock:
         try:
-            current = dict(DEFAULT_CONTROL)
-            current.update(_load_for_write(_control_path(), dict, {}))
+            control = await asyncio.to_thread(save_control, body)
         except ValueError as exc:
             return _json_response({"error": str(exc)}, 409)
-        current.update({k: v for k, v in body.items() if k in DEFAULT_CONTROL})
-        control = _sanitize_control(current)
-        await atomic_json_write(_control_path(), control)
     return _json_response({"ok": True, "control": control})
 
 
 async def control_reset(request):
     async with _file_lock:
-        await atomic_json_write(_control_path(), DEFAULT_CONTROL)
-    return _json_response({"ok": True, "control": dict(DEFAULT_CONTROL)})
+        control = await asyncio.to_thread(save_control, {}, reset=True)
+    return _json_response({"ok": True, "control": control})
 
 
 # ---------- REM ----------
@@ -1809,6 +1814,8 @@ _pm2_cache_time = 0.0
 
 async def _pm2_json():
     global _pm2_cache, _pm2_cache_time
+    if docker_runtime.container_mode():
+        return []
     now = time.time()
     if _pm2_cache is not None and (now - _pm2_cache_time) < 10.0:
         return _pm2_cache
@@ -1878,6 +1885,8 @@ async def pm2_status(request):
 async def pm2_logs(request):
     if not _has_admin_auth(request):
         return _json_response({"error": "unauthorized"}, 401)
+    if docker_runtime.container_mode():
+        return _json_response({"error": "Use instance.sh <id> logs on the host"}, 501)
     process = request.query.get("process", "maxwell-bot")
     lines = request.query.get("lines", "30")
     try:
@@ -1939,6 +1948,8 @@ async def pm2_logs(request):
 async def pm2_restart(request):
     if not _has_admin_auth(request):
         return _json_response({"error": "unauthorized"}, 401)
+    if docker_runtime.container_mode():
+        return _json_response({"error": "Use instance.sh <id> restart on the host"}, 501)
     target = request.query.get("target", "maxwell-bot")
     if target not in {"maxwell-bot", "maxwell-api", "all"}:
         return _json_response({"error": "bad target"}, 400)
@@ -2080,11 +2091,19 @@ async def bot_status(request):
             "pending_embeddings": 0,
             "embed_model": RAG_EMBED_MODEL,
         }
+    online = bool(bot_proc and bot_proc.get("pm2_env", {}).get("status") == "online")
+    snapshot = {}
+    if docker_runtime.container_mode():
+        snapshot = _safe_object(_load(DATA_DIR / "discord_state.json"))
+        updated = str(snapshot.get("updated_at") or "")
+        now = datetime.now(timezone.utc)
+        online = (now - timedelta(seconds=180)).isoformat() <= updated <= now.isoformat()
     return _json_response(
         {
-            "online": bool(
-                bot_proc and bot_proc.get("pm2_env", {}).get("status") == "online"
-            ),
+            "online": online,
+            "supervisor": "compose" if docker_runtime.container_mode() else "pm2",
+            "status_source": "discord_snapshot" if docker_runtime.container_mode() else "pm2",
+            "snapshot_updated_at": snapshot.get("updated_at"),
             "control": {
                 k: control.get(k)
                 for k in [
