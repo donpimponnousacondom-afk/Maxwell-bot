@@ -210,6 +210,12 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### Visual instance tour
+
+- Added docs/instance-tour.html with three Playwright screenshots of the actual dashboard against intercepted synthetic responses; no real credentials or runtime data were used.
+- Clarifies per-instance Discord/provider credentials in host bot.env, live personality edits, server-specific prompt files, and lifecycle/backup commands. Deployment prerequisites remain explicit.
+- Verified local HTML at 1280px and 390px: all three images load, local links resolve, no horizontal overflow or page errors. Mock login and personality Save section interactions pass; these are UI demonstrations, not live backend acceptance tests.
+
 ### Multi-instance deployment — implementation in progress
 
 - Approved direction: disposable Python 3.14 application images, one Compose project and rootless engine per Linux service user/identity, private host config/data/sites/shell directories, writable external prompt files.
