@@ -210,6 +210,15 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### Multi-instance deployment — implementation in progress
+
+- Approved direction: disposable Python 3.14 application images, one Compose project and rootless engine per Linux service user/identity, private host config/data/sites/shell directories, writable external prompt files.
+- Added instance-scoped Docker resource ownership and confined daemon-host bind translation; generated backends use an explicit private network and derived DNS targets in container mode. Legacy loopback mode remains supported.
+- Container site registries use a version-2 instance envelope. Nonempty legacy registries require explicit migration; copying them into container mode is not sufficient.
+- Focused Docker-runtime/site tests pass (88 offline mocked cases). No live daemon verification: the current rootful socket denied access, Compose/rootless setup tools are not installed, and no approval escalation is available. Rootless UID10001 ACL provisioning remains required.
+- Packaging, shared prompts, shell confinement, API/proxy integration, operational tooling, migration/restore tests, and full-suite review are still being integrated. No production cutover or credential/runtime-data reads were performed.
+- Audit correction: `DEFAULT_CONTROL` already contains `base_personality`; the initial deployment audit's missing-key claim was incorrect. Prompt cache coherence is a real issue and is being addressed separately.
+
 ### 2026-09-06 — architecture and operations audit
 
 - Confirmed branch baseline and clean state after root's `Initial dev commit`.

@@ -9,9 +9,10 @@ The shape:
 
 * Code lives in ``DATA_DIR/site_servers/<slug>/`` — **outside** the web root, so
   the source and any secrets are never served as static files.
-* Each site gets a container from the ``maxwell-site-runtime`` image: code
-  read-only at ``/app``, a private writable ``/data`` for its database, no
-  capabilities, half a core, 256MB, and a port published on 127.0.0.1 only.
+* Each site gets a runtime container: code read-only at ``/app``, private
+  writable ``/data``, no capabilities, half a core, and 256MB. Legacy mode
+  publishes loopback ports; container mode uses instance-scoped DNS on the
+  explicit backend network, without published ports.
 * Requests reach it at ``/bot/<slug>/api/...``, which the API server proxies to
   that port (see ``site_proxy`` in api/api_server.py). Nothing else on the box
   can be reached through that path, and the container's port is not exposed
@@ -38,6 +39,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import docker_runtime as runtime
 from utils import FileLock, _atomic_json_write_sync
 
 logger = logging.getLogger(__name__)
@@ -91,20 +93,43 @@ def _check_slug(slug: str) -> str:
 
 
 def container_name(slug: str) -> str:
-    return CONTAINER_PREFIX + _check_slug(slug)
+    slug = _check_slug(slug)
+    return runtime.resource_name("site", slug) if runtime.container_mode() else CONTAINER_PREFIX + slug
+
+
+def image_name(slug: str = "") -> str:
+    if runtime.container_mode():
+        return runtime.resource_name("siteimg", _check_slug(slug)) if slug else runtime.resource_name("site-runtime")
+    return IMAGE_PREFIX + _check_slug(slug) if slug else IMAGE
+
+
+def site_path(data_dir, slug: str = "", suffix: str = "") -> Path:
+    base = Path(data_dir) / "site_servers"
+    path = base / _check_slug(slug) if slug else base
+    if suffix:
+        path /= suffix
+    if runtime.container_mode():
+        runtime.confined_path(path, ("data",))
+        if Path(data_dir) != runtime.STATE_ROOT / "data":
+            raise SiteServerError("container site data must use /state/data")
+    return path
 
 
 def code_dir(data_dir, slug: str) -> Path:
-    return Path(data_dir) / "site_servers" / _check_slug(slug)
+    return site_path(data_dir, _check_slug(slug))
 
 
 def state_dir(data_dir, slug: str) -> Path:
     """The container's writable /data — its database lives here."""
-    return Path(data_dir) / "site_servers" / _check_slug(slug) / "_data"
+    return site_path(data_dir, _check_slug(slug), "_data")
 
 
 def registry_path(data_dir) -> Path:
-    return Path(data_dir) / "site_servers.json"
+    path = Path(data_dir) / "site_servers.json"
+    if runtime.container_mode():
+        site_path(data_dir)
+        runtime.confined_path(path, ("data",))
+    return path
 
 
 # ── registry ──────────────────────────────────────────────────────────────
@@ -119,6 +144,12 @@ def _read_registry(data_dir) -> dict[str, dict]:
         ValueError,
     ):
         return {}
+    if isinstance(raw, dict) and raw.get("version") == 2:
+        if runtime.container_mode() and raw.get("instance") != runtime.instance_id():
+            raise SiteServerError("site registry belongs to another instance")
+        raw = raw.get("sites", {})
+    elif runtime.container_mode() and raw:
+        raise SiteServerError("legacy site registry requires explicit migration")
     return (
         {
             str(k): v
@@ -143,7 +174,8 @@ def _write_entry(data_dir, slug: str, entry: dict | None) -> None:
             reg.pop(slug, None)
         else:
             reg[slug] = entry
-        _atomic_json_write_sync(path, reg)
+        payload = {"version": 2, "instance": runtime.instance_id(), "sites": reg} if runtime.container_mode() else reg
+        _atomic_json_write_sync(path, payload)
 
 
 def port_for(data_dir, slug: str) -> int | None:
@@ -156,6 +188,26 @@ def port_for(data_dir, slug: str) -> int | None:
     except (TypeError, ValueError):
         return None
     return port if port in PORT_RANGE else None
+
+
+def target_for(data_dir, slug: str) -> tuple[str, int] | None:
+    """Resolve only instance-derived DNS or a bounded legacy loopback port."""
+    slug = _check_slug(slug)
+    entry = get_entry(data_dir, slug)
+    if not entry or entry.get("running") is not True:
+        return None
+    if runtime.container_mode():
+        expected = container_name(slug)
+        if (entry.get("version") != 2 or entry.get("instance") != runtime.instance_id()
+                or entry.get("container") != expected
+                or entry.get("network") != runtime.backend_network()
+                or entry.get("port") != CONTAINER_PORT):
+            return None
+        endpoint = expected, CONTAINER_PORT
+    else:
+        port = port_for(data_dir, slug)
+        endpoint = ("127.0.0.1", port) if port is not None else None
+    return endpoint
 
 
 def _registry_port(value: Any) -> int | None:
@@ -200,7 +252,38 @@ def _port_is_free(port: int) -> bool:
 
 
 # ── docker ────────────────────────────────────────────────────────────────
+async def owned_resource(name: str, kind: str, slug: str, resource_type: str) -> bool:
+    code, out, err = await _docker_raw(
+        resource_type, "inspect", "--format", "{{json .Config.Labels}}", name, timeout=20
+    )
+    if code != 0:
+        if "no such" in err.lower():
+            return False
+        raise SiteServerError("could not verify Docker resource ownership")
+    runtime.require_ownership(json.loads(out), kind, slug)
+    return True
+
+
 async def _docker(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
+    if runtime.container_mode():
+        if args[0] in {"inspect", "logs", "rm", "exec"}:
+            name = args[-1]
+            prefix = runtime.resource_name("site") + "-"
+            if not name.startswith(prefix):
+                raise SiteServerError("unexpected site container name")
+            await owned_resource(name, "site", _check_slug(name[len(prefix):]), "container")
+        elif args[:2] in {("image", "inspect"), ("image", "rm")} or args[0] == "build":
+            name = args[args.index("-t") + 1] if args[0] == "build" else args[-1]
+            prefix = runtime.resource_name("siteimg") + "-"
+            slug = _check_slug(name[len(prefix):]) if name.startswith(prefix) else ""
+            kind = "siteimg" if slug else "site-runtime"
+            if name != image_name(slug):
+                raise SiteServerError("unexpected site image name")
+            await owned_resource(name, kind, slug, "image")
+    return await _docker_raw(*args, timeout=timeout)
+
+
+async def _docker_raw(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
             "docker", *args,
@@ -227,11 +310,13 @@ async def _docker(*args: str, timeout: float = 30.0) -> tuple[int, str, str]:
 
 
 async def _ensure_image() -> None:
-    code, _out, _err = await _docker("image", "inspect", IMAGE, timeout=20)
+    image = image_name()
+    code, _out, _err = await _docker("image", "inspect", image, timeout=20)
     if code == 0:
         return
-    logger.info("Building %s (first site backend on this host)", IMAGE)
-    code, _out, err = await _docker("build", "-t", IMAGE, DOCKERFILE_DIR, timeout=600)
+    logger.info("Building %s (first site backend on this host)", image)
+    labels = runtime.label_args("site-runtime") if runtime.container_mode() else []
+    code, _out, err = await _docker("build", *labels, "-t", image, DOCKERFILE_DIR, timeout=600)
     if code != 0:
         raise SiteServerError(f"could not build the site runtime image: {err.strip()[:300]}")
 
@@ -385,19 +470,23 @@ async def build_site_image(data_dir, slug: str, packages: list[str]) -> str:
     slug = _check_slug(slug)
     packages = parse_packages(packages)
     if not packages:
-        return IMAGE
+        return image_name()
     await _ensure_image()
-    tag = IMAGE_PREFIX + slug
-    build_dir = Path(data_dir) / "site_servers" / slug / "_build"
+    tag = image_name(slug)
+    build_dir = site_path(data_dir, slug, "_build")
     build_dir.mkdir(parents=True, exist_ok=True)
     # Package names are validated above, so this cannot inject flags.
-    (build_dir / "Dockerfile").write_text(
-        f"FROM {IMAGE}\nUSER root\n"
+    dockerfile = build_dir / "Dockerfile"
+    if runtime.container_mode():
+        runtime.confined_path(dockerfile, ("data",))
+    dockerfile.write_text(
+        f"FROM {image_name()}\nUSER root\n"
         f"RUN pip install --no-cache-dir {' '.join(packages)}\n"
         "USER site\n",
         encoding="utf-8",
     )
-    code, _out, err = await _docker("build", "-t", tag, str(build_dir), timeout=600)
+    labels = runtime.label_args("siteimg", slug) if runtime.container_mode() else []
+    code, _out, err = await _docker("build", *labels, "-t", tag, str(build_dir), timeout=600)
     if code != 0:
         raise SiteServerError(
             "could not install those packages:\n" + (err.strip()[-600:] or "pip failed")
@@ -406,7 +495,7 @@ async def build_site_image(data_dir, slug: str, packages: list[str]) -> str:
 
 
 async def _remove_site_image(slug: str) -> None:
-    await _docker("image", "rm", "-f", IMAGE_PREFIX + _check_slug(slug), timeout=60)
+    await _docker("image", "rm", "-f", image_name(_check_slug(slug)), timeout=60)
 
 
 def parse_env(env: Any) -> dict[str, str]:
@@ -522,8 +611,9 @@ def write_code(data_dir, slug: str, files: dict[str, str]) -> list[str]:
 
     written = sorted(checked)
     # /data is written by uid 10001 inside the container.
-    with contextlib.suppress(OSError):
-        os.chown(state_dir(data_dir, slug), 10001, 10001)
+    if not runtime.container_mode():
+        with contextlib.suppress(OSError):
+            os.chown(state_dir(data_dir, slug), 10001, 10001)
     return sorted(written)
 
 
@@ -569,11 +659,15 @@ def merge_code(data_dir, slug: str, files: dict[str, str]) -> list[str]:
         )
 
     for rel, content in checked.items():
+        if runtime.container_mode():
+            runtime.confined_path(target / rel, ("data",))
         dest = (target / rel).resolve()
         if target.resolve() not in dest.parents:
             raise SiteServerError(f"{rel}: path escapes the server directory")
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".tmp")
+        if runtime.container_mode():
+            runtime.confined_path(tmp, ("data",))
         try:
             tmp.write_text(content, encoding="utf-8")
             os.replace(tmp, dest)
@@ -581,8 +675,9 @@ def merge_code(data_dir, slug: str, files: dict[str, str]) -> list[str]:
             with contextlib.suppress(OSError):
                 tmp.unlink()
             raise SiteServerError(f"could not write {rel}: {exc}") from exc
-    with contextlib.suppress(OSError):
-        os.chown(state_dir(data_dir, slug), 10001, 10001)
+    if not runtime.container_mode():
+        with contextlib.suppress(OSError):
+            os.chown(state_dir(data_dir, slug), 10001, 10001)
     return sorted(checked)
 
 
@@ -627,7 +722,10 @@ def delete_code_file(data_dir, slug: str, rel: str) -> str:
     if safe == "app.py":
         raise SiteServerError("refusing to delete app.py — write a new one instead")
     base = code_dir(data_dir, slug).resolve()
-    path = (base / safe).resolve()
+    candidate = base / safe
+    if runtime.container_mode():
+        runtime.confined_path(candidate, ("data",))
+    path = candidate.resolve()
     if base not in path.parents:
         raise SiteServerError(f"{safe} is not in this site's server")
     if not path.is_file():
@@ -641,7 +739,10 @@ def read_code(data_dir, slug: str, rel: str) -> str:
     if not safe:
         raise SiteServerError(f"bad path {rel!r}")
     base = code_dir(data_dir, slug).resolve()
-    path = (base / safe).resolve()
+    candidate = base / safe
+    if runtime.container_mode():
+        runtime.confined_path(candidate, ("data",))
+    path = candidate.resolve()
     if base not in path.parents:
         raise SiteServerError(f"{safe} is not in this site's server")
     if not path.is_file():
@@ -668,7 +769,7 @@ def list_code(data_dir, slug: str) -> list[tuple[str, int]]:
 
 
 # ── lifecycle ─────────────────────────────────────────────────────────────
-async def _http_ping(port: int) -> str:
+async def _http_ping(port: int, host: str = "127.0.0.1") -> str:
     """'ok' when something upstream actually speaks HTTP on this port.
 
     A plain TCP connect proves nothing: with ``-p`` published, docker-proxy
@@ -679,7 +780,7 @@ async def _http_ping(port: int) -> str:
     writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", port), timeout=3
+            asyncio.open_connection(host, port), timeout=3
         )
         writer.write(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         await asyncio.wait_for(writer.drain(), timeout=3)
@@ -720,7 +821,7 @@ async def _wait_healthy(port: int, slug: str) -> str:
         exit_code = parts[3] if len(parts) > 3 else "?"
         now = asyncio.get_running_loop().time()
         if running:
-            last = await _http_ping(port)
+            last = await _http_ping(CONTAINER_PORT, container_name(slug)) if runtime.container_mode() else await _http_ping(port)
             if last == "ok":
                 # RestartCount is sticky. A container that died once and then
                 # came up serving HTTP is healthy.
@@ -770,20 +871,23 @@ async def _start_unlocked(
     image = await build_site_image(data_dir, slug, packages)
 
     await _remove_container(slug)
-    previous_port = _registry_port(previous.get("port"))
-    port = previous_port if previous_port is not None else _free_port(data_dir, slug)
-    # The port is reused across restarts, so wait for the old listener to
-    # actually stop answering. Without this the first health ping can be
-    # served by the container we just removed, and a broken replacement
-    # reports itself healthy.
-    for _ in range(20):
-        if await _http_ping(port) != "ok":
-            break
-        await asyncio.sleep(0.25)
-    if not _port_is_free(port):
-        # The old container may have vanished while another local service
-        # claimed its port. Never publish a site backend onto that service.
-        port = _free_port(data_dir, slug)
+    if runtime.container_mode():
+        port = CONTAINER_PORT
+        network_args = ["--network", runtime.backend_network(), *runtime.label_args("site", slug)]
+        source_bind = runtime.host_path(source, ("data",))
+        state_bind = runtime.host_path(state_dir(data_dir, slug), ("data",))
+    else:
+        previous_port = _registry_port(previous.get("port"))
+        port = previous_port if previous_port is not None else _free_port(data_dir, slug)
+        for _ in range(20):
+            if await _http_ping(port) != "ok":
+                break
+            await asyncio.sleep(0.25)
+        if not _port_is_free(port):
+            port = _free_port(data_dir, slug)
+        network_args = ["-p", f"127.0.0.1:{port}:{CONTAINER_PORT}"]
+        source_bind = source.resolve()
+        state_bind = state_dir(data_dir, slug).resolve()
     args = [
         "run", "-d",
         "--name", container_name(slug),
@@ -796,9 +900,9 @@ async def _start_unlocked(
         "--cap-drop", "ALL",
         "--read-only",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m",
-        "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}",
-        "-v", f"{source.resolve()}:/app:ro",
-        "-v", f"{state_dir(data_dir, slug).resolve()}:/data:rw",
+        *network_args,
+        "-v", f"{source_bind}:/app:ro",
+        "-v", f"{state_bind}:/data:rw",
         "-e", f"PORT={CONTAINER_PORT}",
         "-e", f"SITE_SLUG={slug}",
         "-e", f"SITE_BASE_PATH=/bot/{slug}/api",
@@ -835,6 +939,8 @@ async def _start_unlocked(
         "container": container_name(slug),
         "image": image,
     }
+    if runtime.container_mode():
+        entry.update(version=2, instance=runtime.instance_id(), network=runtime.backend_network())
     _write_entry(data_dir, slug, entry)
     if health != "ok":
         # Grab the logs BEFORE tearing it down — they are the only thing that
@@ -895,6 +1001,14 @@ async def stop(data_dir, slug: str) -> bool:
 async def _destroy_unlocked(data_dir, slug: str) -> None:
     """Site is gone: container, code, database, secrets, registry row."""
     slug = _check_slug(slug)
+    if runtime.container_mode():
+        await owned_resource(container_name(slug), "site", slug, "container")
+        await owned_resource(image_name(slug), "siteimg", slug, "image")
+        await _remove_container(slug)
+        await _remove_site_image(slug)
+        shutil.rmtree(code_dir(data_dir, slug), ignore_errors=True)
+        _write_entry(data_dir, slug, None)
+        return
     with contextlib.suppress(SiteServerError, Exception):
         await _remove_container(slug)
     with contextlib.suppress(Exception):
@@ -944,7 +1058,7 @@ async def status(data_dir, slug: str) -> str:
         else ""
     ) or "none (baked-in toolkit only)"
     return (
-        f"container {live} on 127.0.0.1:{entry.get('port')} "
+        f"container {live} on {container_name(slug) if runtime.container_mode() else '127.0.0.1'}:{entry.get('port')} "
         f"(public path /bot/{slug}/api/...)\nfiles: {files}\nenv: {secrets}\n"
         f"extra packages: {extra}"
     )
