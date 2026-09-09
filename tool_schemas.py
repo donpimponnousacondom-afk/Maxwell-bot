@@ -1,4 +1,4 @@
-"""OpenAI-compatible tool schemas for Maxwell native function calling.
+"""OpenAI-compatible tool schemas for Dame Curie native function calling.
 
 Each entry maps a tool name to a JSON Schema ``parameters`` object. Descriptions
 come from the live tool instances at request time so they stay in sync with
@@ -60,7 +60,7 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
             "image": _str(
                 "Optional image to edit or use as reference: an http(s) URL "
                 "(Discord CDN, a permanent URL from a previous image, any public "
-                "link) or a local path Maxwell wrote. For several, pass a JSON "
+                "link) or a local path Dame Curie wrote. For several, pass a JSON "
                 "list or a comma-separated string (max 4). Omit to generate from "
                 "scratch; images attached to the user's message are used "
                 "automatically."
@@ -743,7 +743,7 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
         },
         ["action"],
     ),
-    # ---- Chess (Maxwell plays real chess himself against a chosen opponent) --
+    # ---- Chess (Dame Curie plays real chess himself against a chosen opponent) --
     "chess_start": _obj(
         {
             "opponent": _str(
@@ -1488,7 +1488,7 @@ def _paren_call_re(names: frozenset) -> re.Pattern:
 
 
 # ":)", ";-)", "=)" and friends. A smiley inside a value is not a closing
-# paren, and Maxwell's rooms are full of them — without this, "content=mira
+# paren, and Dame Curie's rooms are full of them — without this, "content=mira
 # esto :) jaja" gets cut to "mira esto :".
 _EMOTICON_CLOSE_RE = re.compile(r"[:;=xX8]-?\)$")
 

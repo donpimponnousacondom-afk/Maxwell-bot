@@ -226,6 +226,6 @@ def test_ping_replying_to_maxwell_does_not_walk_the_chain():
     parent.reference = SimpleNamespace(resolved=grand, message_id=grand.id)
     msg, _p = _self_reply(bot, parent=parent)
     blob = "\n".join(MaxwellBot._reply_parent_context_lines(bot, msg))
-    assert "you/Maxwell" in blob
+    assert "you/Dame Curie" in blob
     assert "alice buried ending" not in blob
     assert "was replying to" not in blob

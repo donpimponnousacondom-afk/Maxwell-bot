@@ -31,6 +31,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from tools import Tool
+from response_observability import prepare_delivery, record_delivery
 from utils import _safe_int, _spawn_background
 
 logger = logging.getLogger(__name__)
@@ -507,7 +508,7 @@ async def run_background_job(bot: Any, job_id: str) -> None:
             "role": "system",
             "content": (
                 f"{base_personality}\n\n"
-                f"You are Maxwell's BACKGROUND build agent (job `{job.id}`). The user was already "
+                f"You are Dame Curie's BACKGROUND build agent (job `{job.id}`). The user was already "
                 "told the work is running; do not narrate, just build.\n"
                 f"Goal: {job.goal}\n"
                 + (f"Extra context: {job.context}\n" if job.context else "")
@@ -540,6 +541,7 @@ async def run_background_job(bot: Any, job_id: str) -> None:
         provider_tools = openai_tools
 
     final_text = ""
+    final_metrics = None
     succeeded = False
     deadline = time.monotonic() + float(timeout)
     try:
@@ -569,6 +571,7 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                     tools=provider_tools,
                     disable_reasoning=False,
                 )
+                response_metrics = getattr(response, "metrics", None)
                 succeeded = True
             except Exception as exc:
                 logger.warning("background job %s generation failed at step %s: %s", job.id, step, exc)
@@ -587,18 +590,20 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                     calls = list(recovered or [])
                 except Exception:
                     calls = []
+            metrics_kwargs = {"response_metrics": response_metrics} if response_metrics is not None else {}
             if not calls:
                 try:
-                    cleaned = await bot._dispatch_tool_calls(orig_message, response or "")
+                    cleaned = await bot._dispatch_tool_calls(orig_message, response or "", **metrics_kwargs)
                     final_text = cleaned[0] if isinstance(cleaned, (list, tuple)) else str(cleaned or "")
                 except Exception:
                     final_text = str(response or "")
                 final_text = str(final_text or "").strip()
+                final_metrics = response_metrics if final_text else None
                 break
             names = [_call_name(c) for c in calls]
             try:
                 dispatched = await bot._dispatch_tool_calls(
-                    orig_message, response, native_tool_calls=calls
+                    orig_message, response, native_tool_calls=calls, **metrics_kwargs
                 )
                 if isinstance(dispatched, (list, tuple)):
                     resp_text = str(dispatched[0] or "")
@@ -623,6 +628,7 @@ async def run_background_job(bot: Any, job_id: str) -> None:
             named = {n for n in names if n}
             if named and named <= set(TURN_ENDING_TOOL_NAMES) and resp_text.strip():
                 final_text = resp_text.strip()
+                final_metrics = response_metrics if final_text else None
                 break
             try:
                 followups = list(getattr(bot, "_last_native_followup_messages", None) or [])
@@ -637,8 +643,10 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 )
             if not tool_results:
                 final_text = resp_text.strip()
+                final_metrics = response_metrics if final_text else None
                 break
             final_text = resp_text.strip()
+            final_metrics = response_metrics if final_text else None
     except asyncio.CancelledError:
         manager.mark(job.id, status="cancelled", progress="cancelled on request")
         await _post_thread(thread, f"Job `{job.id}` cancelled.")
@@ -673,13 +681,11 @@ async def run_background_job(bot: Any, job_id: str) -> None:
         delivery += f"\n{thread_ref}"
     try:
         splitter = getattr(bot, "_split_response", None)
-        if callable(splitter):
-            chunks = splitter(delivery, limit=1900)
-        else:
-            chunks = [delivery[i : i + 1900] for i in range(0, len(delivery), 1900)]
+        _, chunks = prepare_delivery(bot, delivery, final_metrics, splitter, platform=platform)
         for chunk in chunks:
             if chunk.strip():
-                await channel.send(chunk)
+                sent = await channel.send(chunk)
+                record_delivery(bot, channel, sent, final_metrics, platform=platform)
     except Exception as exc:
         logger.warning("background job %s delivery failed: %s", job.id, exc)
         await _post_thread(thread, f"Done, but I could not post to the channel ({exc}):\n{body[:1500]}")

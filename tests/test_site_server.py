@@ -436,3 +436,137 @@ def test_wait_healthy_reports_a_real_crash_loop(monkeypatch):
     out = run(site_server._wait_healthy(8800, "demo"))
     assert "crashing" in out
     assert "exit code 0" in out
+
+
+@pytest.fixture
+def container_site(monkeypatch, tmp_path):
+    monkeypatch.setenv("MAXWELL_CONTAINER_MODE", "true")
+    monkeypatch.setenv("MAXWELL_INSTANCE_ID", "curie")
+    monkeypatch.setenv("MAXWELL_HOST_INSTANCE_DIR", "/srv/maxwell/curie")
+    monkeypatch.setenv("MAXWELL_BACKEND_NETWORK", "maxwell-curie-backends")
+    monkeypatch.setattr(site_server.runtime, "STATE_ROOT", tmp_path)
+    return tmp_path / "data"
+
+
+def test_container_start_uses_private_dns_and_translated_binds(container_site, monkeypatch):
+    site_server.write_code(container_site, "demo", {"app.py": "print(1)"})
+    calls = []
+
+    async def fake_docker(*args, **kwargs):
+        calls.append(args)
+        return (1, "", "No such container") if args[0] == "inspect" else (0, "", "")
+
+    async def healthy(port, slug):
+        assert (port, slug) == (8000, "demo")
+        return "ok"
+
+    monkeypatch.setattr(site_server, "_docker", fake_docker)
+    monkeypatch.setattr(site_server, "_wait_healthy", healthy)
+    entry = run(site_server.start(container_site, "demo"))
+    args = next(args for args in calls if args[0] == "run")
+    assert "-p" not in args and "--publish" not in args
+    assert args[args.index("--network") + 1] == "maxwell-curie-backends"
+    assert "/srv/maxwell/curie/data/site_servers/demo:/app:ro" in args
+    assert "/srv/maxwell/curie/data/site_servers/demo/_data:/data:rw" in args
+    assert "maxwell.instance=curie" in args
+    assert entry["image"] == "maxwell-curie-site-runtime"
+    assert site_server.target_for(container_site, "demo") == ("maxwell-curie-site-demo", 8000)
+    raw = json.loads(site_server.registry_path(container_site).read_text())
+    assert raw["version"] == 2 and raw["instance"] == "curie"
+
+
+@pytest.mark.parametrize("change", [{"container": "169.254.169.254"}, {"network": "bridge"}, {"instance": "other"}, {"port": 80}, {"version": 1}])
+def test_container_target_rejects_registry_tampering(container_site, change):
+    container_site.mkdir()
+    entry = {
+        "version": 2, "instance": "curie", "network": "maxwell-curie-backends",
+        "container": "maxwell-curie-site-demo", "port": 8000, "running": True,
+    }
+    entry.update(change)
+    site_server._write_entry(container_site, "demo", entry)
+    assert site_server.target_for(container_site, "demo") is None
+
+
+@pytest.mark.parametrize("args", [("rm", "-f", "maxwell-curie-site-demo"),
+                                  ("logs", "maxwell-curie-site-demo"),
+                                  ("inspect", "maxwell-curie-site-demo"),
+                                  ("image", "rm", "maxwell-curie-siteimg-demo"),
+                                  ("build", "-t", "maxwell-curie-siteimg-demo", "/tmp/context")])
+def test_foreign_resources_are_not_touched(container_site, monkeypatch, args):
+    calls = []
+
+    async def raw(*command, **kwargs):
+        calls.append(command)
+        return 0, json.dumps({"maxwell.instance": "other"}), ""
+
+    monkeypatch.setattr(site_server, "_docker_raw", raw)
+    with pytest.raises(ValueError, match="owned"):
+        run(site_server._docker(*args))
+    assert len(calls) == 1 and calls[0][1] == "inspect"
+
+
+def test_container_site_rejects_symlink_root(container_site, tmp_path):
+    container_site.mkdir()
+    (container_site / "site_servers").symlink_to(tmp_path / "outside")
+    with pytest.raises(ValueError, match="symlink"):
+        site_server.write_code(container_site, "demo", {"app.py": "x"})
+
+
+def test_container_health_uses_derived_dns(container_site, monkeypatch):
+    calls = []
+
+    async def docker(*args, **kwargs):
+        return 0, "true false 0 0", ""
+
+    async def ping(port, host):
+        calls.append((host, port))
+        return "ok"
+
+    monkeypatch.setattr(site_server, "_docker", docker)
+    monkeypatch.setattr(site_server, "_http_ping", ping)
+    assert run(site_server._wait_healthy(8000, "demo")) == "ok"
+    assert calls == [("maxwell-curie-site-demo", 8000)]
+
+
+def test_ownership_probe_permission_error_fails_closed(container_site, monkeypatch):
+    calls = []
+
+    async def raw(*args, **kwargs):
+        calls.append(args)
+        return 1, "", "permission denied"
+
+    monkeypatch.setattr(site_server, "_docker_raw", raw)
+    with pytest.raises(site_server.SiteServerError, match="ownership"):
+        run(site_server._docker("rm", "-f", "maxwell-curie-site-demo"))
+    assert len(calls) == 1
+
+
+def test_container_registry_requires_explicit_legacy_migration(container_site):
+    container_site.mkdir()
+    site_server.registry_path(container_site).write_text(json.dumps({"demo": {"running": True, "port": 8800}}))
+    with pytest.raises(site_server.SiteServerError, match="migration"):
+        site_server.target_for(container_site, "demo")
+
+
+def test_container_reconcile_recreates_only_desired_services(container_site, monkeypatch):
+    site_server._write_entry(container_site, "active", {"running": True})
+    site_server._write_entry(container_site, "stopped", {"running": False})
+    restarted = []
+
+    async def missing(*args, **kwargs):
+        return 1, "", "No such container"
+
+    async def start(data_dir, slug):
+        restarted.append(slug)
+
+    monkeypatch.setattr(site_server, "_docker", missing)
+    monkeypatch.setattr(site_server, "start", start)
+    run(site_server.reconcile(container_site))
+    assert restarted == ["active"]
+    assert site_server.get_entry(container_site, "active") == {"running": True}
+    assert site_server.get_entry(container_site, "stopped") == {"running": False}
+
+
+def test_legacy_target_keeps_loopback(data_dir):
+    site_server._write_entry(data_dir, "demo", {"port": 8801, "running": True, "url": "http://evil"})
+    assert site_server.target_for(data_dir, "demo") == ("127.0.0.1", 8801)

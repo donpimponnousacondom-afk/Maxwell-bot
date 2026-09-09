@@ -1116,6 +1116,10 @@
           .join("");
       }
       function overview() {
+        if (S.status?.supervisor === "compose") {
+          $("overview").innerHTML = `<div class="card" style="margin-top:12px"><h3>Docker instance</h3><p>Lifecycle and logs are managed on the host with <code>instance.sh &lt;id&gt; restart</code> and <code>instance.sh &lt;id&gt; logs</code>.</p><p>${badge(S.status.online ? "recent Discord snapshot" : "no recent Discord snapshot", S.status.online ? "ok" : "warn")}</p><div class="muted">Last snapshot: ${esc(S.status.snapshot_updated_at || "not yet")}. Status can lag a disconnect or shutdown by up to three minutes.</div></div>`;
+          return;
+        }
         const bot = S.pm2.find((p) => p.name === "maxwell-bot") || {},
           ap = S.pm2.find((p) => p.name === "maxwell-api") || {};
         $("overview").innerHTML =
@@ -1124,7 +1128,7 @@
       }
       function commands() {
         $("commands").innerHTML =
-          `<div class="grid two" style="margin-top:12px"><div class="card"><h3>Send Server/Channel Message</h3><div class="stack"><input id="chan" class="field" placeholder="Channel ID"><textarea id="msg" class="field" placeholder="Message"></textarea><button id="send" class="btn primary">Queue send</button></div></div><div class="card"><h3>Send DM</h3><div class="stack"><input id="dmuser" class="field" placeholder="Discord user ID"><textarea id="dmmsg" class="field" placeholder="DM message"></textarea><button id="senddm" class="btn primary">Queue DM</button></div></div><div class="card"><h3>Safe Commands</h3><div class="row"><button class="btn small" onclick="queue('reload_controls')">Reload controls</button><button class="btn small" onclick="queue('rem_run')">Run REM</button></div><p class="muted">Shell commands are disabled via the web API for security. Use the bot's Discord shell tool or SSH. Forced client-close command removed — use PM2 restart in Overview if you need a restart.</p></div></div><div class="card" style="margin-top:12px"><h3>Command History</h3><div class="list">${
+          `<div class="grid two" style="margin-top:12px"><div class="card"><h3>Send Server/Channel Message</h3><div class="stack"><input id="chan" class="field" placeholder="Channel ID"><textarea id="msg" class="field" placeholder="Message"></textarea><button id="send" class="btn primary">Queue send</button></div></div><div class="card"><h3>Send DM</h3><div class="stack"><input id="dmuser" class="field" placeholder="Discord user ID"><textarea id="dmmsg" class="field" placeholder="DM message"></textarea><button id="senddm" class="btn primary">Queue DM</button></div></div><div class="card"><h3>Safe Commands</h3><div class="row"><button class="btn small" onclick="queue('reload_controls')">Reload controls</button><button class="btn small" onclick="queue('rem_run')">Run REM</button></div><p class="muted">Shell commands are disabled via the web API for security. Use the bot's Discord shell tool or SSH. ${S.status?.supervisor === "compose" ? "Restart this instance using instance.sh on the host." : "Forced client-close command removed — use PM2 restart in Overview if you need a restart."}</p></div></div><div class="card" style="margin-top:12px"><h3>Command History</h3><div class="list">${
             S.commands
               .slice(-40)
               .reverse()
@@ -1910,6 +1914,10 @@
       }
 
       function logs() {
+        if (S.status?.supervisor === "compose") {
+          $("logs").innerHTML = '<div class="card" style="margin-top:12px"><h3>Container logs</h3><p>Run <code>instance.sh &lt;id&gt; logs</code> on the host. PM2 controls are unavailable in Docker deployments.</p></div>';
+          return;
+        }
         $("logs").innerHTML =
           `<div class="card" style="margin-top:12px"><h3>PM2 Logs</h3><div class="row"><select id="logproc" class="field" style="max-width:220px"><option>maxwell-bot</option><option>maxwell-api</option></select><button id="loadlogs" class="btn primary">Load</button></div><pre>${esc(S.logs || "Pick a process and load logs.")}</pre></div>`;
         $("loadlogs").onclick = async () => {

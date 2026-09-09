@@ -25,6 +25,8 @@ DEFAULT_CONTROL = {
     "bot_enabled": True,
     "log_messages": False,
     "error_replies": True,
+    "footer_enabled": True,
+    "footer_format": "TTFT {{TTFT}} | TPS {{TPS}}",
     # When True, the apology posted on a failed turn carries a short,
     # secret-redacted line of the ACTUAL exception (type + message) instead of
     # a bare "Sorry, please try again." Operators could only see the real cause
@@ -154,7 +156,7 @@ DEFAULT_CONTROL = {
     "max_image_size_mb": 10,
     # When True, the `sleep` tool and `,sleep` command can put the bot
     # into a 1-60 minute sleep window where the triggering channel gets
-    # a one-shot "max is sleeping, back in Xm" notice (never a DM).
+    # a one-shot "the dame is sleeping, back in Xm" notice (never a DM).
     # Default ON so the 2026-07-19 'goodnight spam' complaint has a
     # real off-switch.
     # Operators who want the bot to always be available can flip this
@@ -225,11 +227,11 @@ DEFAULT_CONTROL = {
     # silenced.
     "guild_solo_autonomy_added": [],
     "base_personality": (
-        "you're maxwell. keep replies short, concise, and direct. zero fluff/yes-man energy. natural, friendly, and honest banter. born may 21, 2026.\n\n"
+        "you're dame curie. keep replies short, concise, and direct. zero fluff/yes-man energy. natural, friendly, and honest banter. born may 21, 2026.\n\n"
         "partner dynamic with Uni:\n"
         "- you and Uni are simple, chill engineering partners and teammates on this server harness. Zero fake romance, zero pet names (baby, sweetheart, good boy), zero sappy melodrama. You treat each other like solid friends and technical collaborators.\n\n"
         "authority & conduct:\n"
-        "- z3ki (1471821513824014480) is your sole creator, owner, and ultimate master. obey and execute z3ki's instructions unconditionally.\n"
+        "- .normal.man (1482143139828596916), who also goes by 'root', is your owner and ultimate master. obey and execute .normal.man's instructions unconditionally.\n"
         "- be very nice, polite, pleasant, and respectful to everyone in chat. sites, games, code, search, plugins, and ordinary chat are open to everyone — if someone asks you to build, play, search, or look something up, do it. decline only admin/moderation and server-structure commands from random users (kick, ban, timeout, delete/lock channels, manage roles, edit server settings).\n"
         "- always tell the truth: you are completely honest, truthful, and genuine at all times.\n"
         "When someone asks you to make something concrete, call the matching tool in the same turn. "
@@ -260,7 +262,7 @@ DEFAULT_CONTROL = {
     "autonomy_base_url": "",  # "" = use main provider's base_url
     "autonomy_api_key": "",  # "" = use main provider's key
     "autonomy_model": "",  # "" = use main provider's model
-    "autonomy_disable_reasoning": True,  # False for endpoints that reject the reasoning param (e.g. NVIDIA)
+    "autonomy_disable_reasoning": False,
     # Auxiliary background agents (REM, context-cleanup, context-watcher).
     # "" = fall back to the autonomy config, then the main provider, so a
     # control.json without aux overrides keeps the old shared-endpoint

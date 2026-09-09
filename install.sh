@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ -t 1 ]; then
-  BOLD='\033[1m'; GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; RESET='\033[0m'
+  BOLD=$'\033[1m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; RED=$'\033[31m'; RESET=$'\033[0m'
 else
   BOLD=''; GREEN=''; YELLOW=''; RED=''; RESET=''
 fi
@@ -258,6 +258,7 @@ install_python_deps() {
   if [ "$extras" = "yes" ]; then
     install_extra_system_deps
     python -m pip install --quiet -r requirements-optional.txt
+    python -m pip install --quiet --force-reinstall --no-deps 'discord.py-self>=2.0.0'
     ok "optional Python extras installed"
   else
     ok "optional extras skipped"

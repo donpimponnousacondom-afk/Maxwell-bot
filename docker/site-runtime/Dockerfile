@@ -7,7 +7,7 @@
 #
 # A site that needs something not in this list passes `packages` to
 # site_server, which builds a per-site image FROM this one.
-FROM python:3.12-slim
+FROM python:3.14.4-slim-trixie
 
 RUN pip install --no-cache-dir \
     # request/response
@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir \
     requests==2.32.3 \
     httpx==0.28.1 \
     jinja2==3.1.5 \
-    pillow==11.1.0
+    pillow==12.3.0
 
 # Unprivileged. The code mount is read-only; /data is the only writable path
 # that survives a restart.

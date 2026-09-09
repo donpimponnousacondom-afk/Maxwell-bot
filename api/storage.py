@@ -42,6 +42,12 @@ def _data_dir() -> Path:
     return api_server.DATA_DIR
 
 
+def _prompt_store():
+    from prompt_storage import get_prompt_store
+
+    return get_prompt_store(_data_dir())
+
+
 def _load_env_file(path: Path) -> None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()

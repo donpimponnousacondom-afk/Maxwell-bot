@@ -419,3 +419,126 @@ def test_send_file_works_for_non_admin_user():
         assert sent.fp.read() == b"hi from a non-admin"
 
     asyncio.run(run())
+
+
+def test_shell_export_requires_registered_enabled_tool(tmp_path, monkeypatch):
+    import bot_tools
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bot_tools, "_shell_workspace", lambda: tmp_path)
+    docker = AsyncMock(side_effect=AssertionError("Docker must not be called"))
+    monkeypatch.setattr(bot_tools, "_run_docker_cmd", docker)
+    (tmp_path / "generated.txt").write_text("generated")
+    for tools, enabled in [({}, True), ({"shell": ShellTool(bot=None)}, False)]:
+        bot = SimpleNamespace(tools=tools, config=SimpleNamespace(ENABLE_SHELL=enabled))
+        message = FakeMessage()
+        tool = SendFileTool(bot=bot)
+        for path in ["/home/maxwell/generated.txt", str(tmp_path / "generated.txt")]:
+            result = asyncio.run(tool.execute(message, path=path))
+            assert "registered enabled" in result
+        assert not message.files
+    docker.assert_not_called()
+
+
+def test_shell_export_generated_bound_file(tmp_path, monkeypatch):
+    import bot_tools
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bot_tools, "_shell_workspace", lambda: tmp_path)
+    (tmp_path / "generated.txt").write_text("generated")
+    bot = SimpleNamespace(tools={}, config=SimpleNamespace(ENABLE_SHELL=True))
+    shell = ShellTool(bot=bot)
+    bot.tools["shell"] = shell
+    shell._verify_export_container = AsyncMock(return_value="verified-container-id")
+    monkeypatch.setattr(bot_tools, "_run_docker_cmd", AsyncMock(side_effect=AssertionError("no Docker copy")))
+    message = FakeMessage()
+    result = asyncio.run(SendFileTool(bot=bot).execute(message, path="/home/maxwell/generated.txt"))
+    assert result == "__FILE_SENT__ Sent file: generated.txt (9 bytes)"
+    assert message.files[0].fp.read() == b"generated"
+    shell._verify_export_container.assert_awaited_once()
+    assert asyncio.run(shell._send_container_file(message, "/home/maxwell/generated.txt")) == "generated.txt"
+    assert message.files[1].fp.read() == b"generated"
+
+
+def test_shell_export_rejects_traversal_symlink_and_arbitrary_copy(tmp_path, monkeypatch):
+    import bot_tools
+    from unittest.mock import AsyncMock
+
+    workspace = tmp_path / "shell"
+    workspace.mkdir()
+    (tmp_path / "outside.txt").write_text("outside")
+    (workspace / "escape.txt").symlink_to(tmp_path / "outside.txt")
+    (workspace / "parent").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(bot_tools, "_shell_workspace", lambda: workspace)
+    bot = SimpleNamespace(tools={}, config=SimpleNamespace(ENABLE_SHELL=True, DATA_DIR=str(tmp_path / "unused")))
+    shell = ShellTool(bot=bot)
+    bot.tools["shell"] = shell
+    shell._verify_export_container = AsyncMock(return_value="verified-container-id")
+    docker = AsyncMock(side_effect=AssertionError("arbitrary docker cp forbidden"))
+    monkeypatch.setattr(bot_tools, "_run_docker_cmd", docker)
+    tool = SendFileTool(bot=bot)
+    for path in ["/host/etc/shadow", "/etc/passwd", "/tmp/generated.txt", "/home/maxwellish/outside.txt", "/home/maxwell/../outside.txt", "/home/maxwell//etc/passwd", "/home/maxwell/escape.txt", "/home/maxwell/parent/outside.txt"]:
+        message = FakeMessage()
+        assert asyncio.run(tool.execute(message, path=path)).startswith("Error")
+        assert asyncio.run(shell._send_container_file(message, path)) is None
+        assert not message.files
+    docker.assert_not_called()
+
+
+def test_shell_export_rejects_stale_wrong_mode(tmp_path, monkeypatch):
+    import bot_tools
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(bot_tools, "_shell_workspace", lambda: tmp_path)
+    (tmp_path / "generated.txt").write_text("generated")
+    bot = SimpleNamespace(tools={}, config=SimpleNamespace(ENABLE_SHELL=True))
+    shell = ShellTool(bot=bot)
+    bot.tools["shell"] = shell
+    shell._verify_export_container = AsyncMock(side_effect=ValueError("shell container mode does not match configuration"))
+    message = FakeMessage()
+    result = asyncio.run(SendFileTool(bot=bot).execute(message, path="/home/maxwell/generated.txt"))
+    assert "mode does not match" in result
+    assert not message.files
+
+
+def test_generated_host_exports_do_not_require_shell(tmp_path):
+    export = tmp_path / "exports"
+    export.mkdir()
+    (export / "report.txt").write_text("report")
+    bot = SimpleNamespace(tools={}, config=SimpleNamespace(ENABLE_SHELL=False, DATA_DIR=str(tmp_path)))
+    message = FakeMessage()
+    result = asyncio.run(SendFileTool(bot=bot).execute(message, path=str(export / "report.txt")))
+    assert result == "__FILE_SENT__ Sent file: report.txt (6 bytes)"
+
+
+def test_shell_export_rejects_symlink_swapped_after_resolve(tmp_path, monkeypatch):
+    import os
+    import bot_tools
+    from unittest.mock import AsyncMock
+
+    workspace = tmp_path / "shell"
+    workspace.mkdir()
+    nested = workspace / "nested"
+    nested.mkdir()
+    (nested / "file.txt").write_text("safe")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "file.txt").write_text("outside")
+    monkeypatch.setattr(bot_tools, "_shell_workspace", lambda: workspace)
+    bot = SimpleNamespace(tools={}, config=SimpleNamespace(ENABLE_SHELL=True))
+    shell = ShellTool(bot=bot)
+    bot.tools["shell"] = shell
+    shell._verify_export_container = AsyncMock(return_value="verified")
+    real_open = os.open
+
+    def swap_open(path, flags, *args, **kwargs):
+        if path == workspace and nested.is_dir() and not nested.is_symlink():
+            nested.rename(workspace / "original")
+            nested.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_open)
+    message = FakeMessage()
+    result = asyncio.run(SendFileTool(bot=bot).execute(message, path="/home/maxwell/nested/file.txt"))
+    assert result.startswith("Error")
+    assert not message.files

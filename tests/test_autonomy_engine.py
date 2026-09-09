@@ -770,8 +770,8 @@ def test_gather_context_includes_normal_channel_memory(tmp_path):
     context = asyncio.run(engine.gather_context())
 
     assert "RECENT CONTEXT MEMORY" in context
-    assert "You/Maxwell(42): i already said this like maxwell" in context
-    assert "You/Maxwell: old self row with missing id" in context
+    assert "You/Dame Curie(42): i already said this like maxwell" in context
+    assert "You/Dame Curie: old self row with missing id" in context
 
 
 # ---------------------------------------------------------------------------

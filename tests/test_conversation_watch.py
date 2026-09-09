@@ -610,7 +610,7 @@ def test_reply_relation_includes_quote():
             "reply_to_content": "hey",
         }
     )
-    assert self_bit == 'reply_to=you/Maxwell(1) "hey"'
+    assert self_bit == 'reply_to=you/Dame Curie(1) "hey"'
 
 
 def test_memory_lock_timeout_is_bounded():

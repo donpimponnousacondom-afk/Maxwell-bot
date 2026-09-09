@@ -7,7 +7,7 @@
 # every long call site in bot.py/bot_tools.py and bury real changes in
 # cosmetic churn.
 line-length = 88
-target-version = "py311"
+target-version = "py314"
 extend-exclude = [
     "bot.py.bak",
     ".pi-lens",
@@ -69,7 +69,7 @@ ignore = [
 extend-immutable-calls = ["discord.app_commands.describe"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.14"
 # The tree is large and largely unannotated; a strict gate would produce
 # thousands of errors and get ignored. This checks what is annotated and stays
 # quiet about what is not, so new annotations are actually worth adding.

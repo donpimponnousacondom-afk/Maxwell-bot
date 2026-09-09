@@ -4,7 +4,13 @@ Maxwell is a Discord self-bot backed by any OpenAI-compatible API. It reads text
 
 **This is a self-bot** (`discord.py-self`, `self_bot=True`). Self-bots may violate Discord ToS. Use at your own risk.
 
-## Quick start
+## Dame Curie deployment
+
+For this fork's compartmentalized deployment, start with [current verified status](docs/STATUS.md) and the [rootless Docker/Ollama/dashboard runbook](docs/DOCKER.md). Each identity owns its engine, state and embedder. The dashboard is served at `/admin/` on the instance's loopback web port; running the API alone is not the complete web deployment. The [shared Screen guide](docs/SCREEN_WORKFLOW.md) retains the stopped host-native deployment's rollback controls.
+
+The upstream host-native instructions below are a separate installation path, **not commands to run alongside an existing instance**. Never start the same Discord identity in both modes.
+
+## Quick start (upstream host-native)
 
 The newcomer path is one command:
 
@@ -21,6 +27,7 @@ Read these first if you are new to the project:
 - [High-level overview](docs/OVERVIEW.md)
 - [Complete installation guide](docs/INSTALL.md)
 - [Configuration quick reference](docs/CONFIGURATION.md)
+- [Dame Curie shared Screen workflow and agent handoff](docs/SCREEN_WORKFLOW.md)
 
 ### Manual path in brief
 
@@ -60,7 +67,7 @@ One thing is worth knowing up front: the `shell` tool runs inside a Docker conta
 - X (Twitter): `x_read` pulls the home timeline, any public account, a search, mentions, or one post; `x_post` posts, replies, quotes, likes, reposts and deletes. Reading needs no account at all; posting uses the session cookies of a logged-in browser. No paid API anywhere. See [X (Twitter)](#x-twitter).
 - Autonomy: periodic self-directed checks where Maxwell reviews context/goals and decides whether to act without running a decider on every few messages.
 - Per-server custom prompts, RAG vector memory, and scoped cross-context facts across DMs, servers, groups, and channels.
-- RAG vector memory: messages, long-term facts, and shared context entries are embedded through any OpenAI-compatible or Ollama embeddings endpoint and stored in a SQLite vector database. Semantic search retrieves the most relevant memories for each conversation — global across all channels and servers. With no embedder reachable the bot logs one line and falls back to recent-history context.
+- RAG vector memory: messages, long-term facts, and shared context entries are embedded through any OpenAI-compatible or Ollama embeddings endpoint and stored in a SQLite vector database. Semantic search retrieves the most relevant memories for each conversation — global across all channels and servers. When the embedder is unavailable, raw memories remain stored; endpoint warnings are rate-limited and semantic recall degrades until recovery.
 - Opt-in REM "dreaming" pass that periodically consolidates recent visible traffic into long-term memory.
 - Web dashboard/admin API protected by HTTP Basic auth.
 - Site building: `create_site` publishes a whole directory (index plus any CSS/JS/subpages/data files) byte-for-byte under a configurable public URL, `edit_site` patches a published site in place, `delete_site` takes it down. Pass `backend=true` and the page gets a real server side — named values and append-only lists at `/api/site/<slug>/`, same origin, no key — so a guestbook, counter, poll, or saved state is one `fetch()` away.
@@ -121,12 +128,14 @@ required values are the first thing in the file. The ones that matter:
 | `OLLAMA_REM_MODEL` | REM dreamer model (defaults to `OLLAMA_MODEL`) |
 | `OLLAMA_MAX_TOKENS` | Max output tokens per completion (default: `8192`) |
 | `OLLAMA_TEMPERATURE` | Sampling temperature (default: `0.7`) |
-| `OLLAMA_FALLBACK_*` | Optional secondary endpoint, rotates with primary |
+| `OLLAMA_FALLBACK_*` | Optional secondary endpoint; normally primary for attempts 1–2, fallback thereafter, subject to cooldown/routing |
 | `OLLAMA_VISION_*` | Optional vision/omni model for image/video turns (blank base/key inherit primary) |
-| `OLLAMA_RETRY_ATTEMPTS` | Total attempts per request (default: `3`) |
-| `OLLAMA_EMPTY_RESPONSE_RETRIES` | Extra recovery attempts after an HTTP 200 with no text/tool call; rotates endpoints and retries with non-streaming JSON (default: `2`) |
+| `OLLAMA_RETRY_ATTEMPTS` | Total attempts per request (default: `5`); transient retries wait 10, 20, 30, 40 seconds |
+| `OLLAMA_EMPTY_RESPONSE_RETRIES` | Up to `2` remaining attempts recover empty HTTP 200 content with non-streaming JSON; never extends the total attempt budget |
 | `AUTONOMY_BASE_URL` / `AUTONOMY_API_KEY` / `AUTONOMY_MODEL` | Override the autonomy engine endpoint; blank = use main |
 | `AUX_BASE_URL` / `AUX_API_KEY` / `AUX_MODEL` | Background context agents; blank = fall back to autonomy, then main |
+
+Explicit deployment values override these defaults and require a bot restart. Caller deadlines may stop retries earlier; see the [provider retry policy](docs/CONFIGURATION.md#provider-retries).
 
 ### Optional features
 
@@ -245,10 +254,15 @@ It is useful as a free temporary fallback, but check OpenRouter for current avai
 
 ## Commands
 
-All commands use the `,` prefix. Admin commands require the user to be in the admin list.
+Examples below use the normal `,` prefix. Commands follow the configured `COMMAND_PREFIX` (for example, `!footer` when it is `!`; GF mode defaults to `.`). Admin commands require the user to be in the admin list.
 
 | Command | Admin | Description |
 |---|---|---|
+| `,footer [status]` | No | Show the bot-wide response-footer setting and format |
+| `,footer on` / `off` / `enable` / `disable` | Yes | Enable or disable per-response Discord footers (on by default) |
+| `,footer format <text>` | Yes | Set the one-line format, at most 300 characters; see below |
+| `,debug` | Yes | Inspect this channel's latest measured bot message; reply to a message to select that exact message |
+| `,version` | No | Show this process's startup-frozen Git build and start time |
 | `,stop` | No | Cancel the active AI request in this channel (` ,stop job <id>` cancels a background job) |
 | `,bg <goal>` | No | Start a background sub-agent job: instant ack, channel stays free, pings you when done |
 | `,jobs` | No | List background jobs |
@@ -294,6 +308,34 @@ All commands use the `,` prefix. Admin commands require the user to be in the ad
 | `,vc say <text>` | No | Speak text in VC with TTS |
 
 Live VC replies require `discord-ext-voice-recv`, `PyNaCl`, `ffmpeg`, and an audio-capable OpenAI-compatible provider.
+
+### Response footers and diagnostics
+
+Default Discord subtext:
+
+```text
+-# TTFT 4839ms | TPS 108.3
+```
+
+These are **that response's producing-call measurements**, not a provider-global last call, daily total or average. TPS is output tokens including reasoning divided by the successful request's whole elapsed seconds, for both streaming and JSON. `~` marks locally estimated token throughput/input, or a non-streaming/otherwise unobserved first-token latency proxy. Provider-reported counts take precedence; missing counts use one fixed offline CL100K tokenizer. See [measurement details](docs/CONFIGURATION.md#per-call-provider-measurements).
+
+With `COMMAND_PREFIX=!`, for example:
+
+```text
+!footer on
+!footer format This bot model {{MODEL}} | Time! {{TTFT}} | Tokens per second! {{TPS}}
+!debug
+!version
+!footer off
+```
+
+Formats accept only `{{TTFT}}`, `{{TPS}}`, `{{PROVIDER}}`, `{{CONTEXT}}`, `{{MODEL}}`, and `{{BOT}}`. `CONTEXT` means **input tokens for this call**, not model capacity. `PROVIDER` is the used endpoint's hostname; `MODEL` is the model selected for that request, including fallback/override. Templates must be a nonempty single line of at most 300 characters; rendered footer lines are bounded to 300 characters too. Footer mentions are neutralized without disabling mentions in the actual reply body. Settings are bot-wide and persist in the existing runtime controls.
+
+A split reply gets one footer on its last chunk, while every delivered chunk can be selected with `debug`. `send_message` replies, progress-message final edits, background results and autonomous conversational text deliveries retain their own producing-call metadata. Body text and stored history exclude the footer: a reserved invisible suffix identifies this bot's footer even after a format change or restart, without stripping other users' subtext. An edit that cannot fit both its requested body and footer preserves the body, omits the footer, and still records its measurements. Telegram and non-text deliveries do not get Discord footers.
+
+`debug` labels the exact measured message and call. A reply selects only that message in the same channel; an unrecorded reply never falls back to another message. Records are bounded to 1,024 delivered messages in this process, so evicted/pre-restart measurements are unavailable. The new footer/debug/version commands make no model request; their own footer uses unavailable call fields (`—`), never the diagnostic target's measurements. Other static notices do not acquire a model sample.
+
+`version` reports commit, branch, commit date/subject, dirty-at-startup state, process start time and Python version captured once at startup. Both timestamps use UTC (`+00:00`). The entire report, including its enabled footer, is displayed in a code block for readability. Later commits do not change what the running process claims. A source tree without Git metadata reports unknown build fields rather than inventing a package version.
 
 ## Sites
 
@@ -704,7 +746,7 @@ The verdict is used twice on purpose: it is rendered into the planner prompt as 
 
 **This gates speaking only.** Research, memory writes, goal work, and reflection are never blocked by it — the point is to constrain timing, not initiative. Restraint that can be computed lives in code; the prompt is left free.
 
-The same gate honours an open sleep window. The live reply path has always refused to answer while `,sleep` is set, telling people "max is sleeping, back in Xm" — but nothing checked it on the autonomy side, so the tick would post into a channel or DM someone while that notice was still standing. It is speech-only there too: asleep, he still thinks, remembers and plans.
+The same gate honours an open sleep window. The live reply path has always refused to answer while `,sleep` is set, telling people "the dame is sleeping, back in Xm" — but nothing checked it on the autonomy side, so the tick would post into a channel or DM someone while that notice was still standing. It is speech-only there too: asleep, he still thinks, remembers and plans.
 
 | Control | Default | Meaning |
 | --- | --- | --- |

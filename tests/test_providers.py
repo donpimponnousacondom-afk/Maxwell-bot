@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -11,6 +12,11 @@ from providers import (
     _is_content_policy_block,
     _is_policy_block_text,
 )
+
+
+@pytest.fixture(autouse=True)
+def no_provider_retry_wait(monkeypatch):
+    monkeypatch.setattr("providers.asyncio.sleep", AsyncMock())
 
 
 class _FakeAsyncStream:
@@ -44,6 +50,7 @@ def _sse_chunks_for(body):
 
 class FakeResponse:
     status = 200
+    headers = {}
 
     def __init__(self):
         self.content = _FakeAsyncStream(_sse_chunks_for(self._json_body()))
@@ -57,7 +64,7 @@ class FakeResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def json(self):
+    async def json(self, *, content_type=None):
         return self._json_body()
 
     async def text(self):
@@ -140,6 +147,113 @@ class FakeSequenceSession(FakeSession):
         self.urls.append(url)
         self.payloads.append(copy.deepcopy(json))
         return self.responses.pop(0)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "inclusionai/ling-3.0-flash",
+        "inclusionai/ling-3.0-flash-fin:free",
+        "inclusionai/ling-3.0-flash-sante:free",
+    ],
+)
+def test_openrouter_native_reasoning_and_sampling_defaults(model):
+    provider = OllamaProvider("https://openrouter.ai/api/v1", model, 8192, 0.6)
+    messages = [{"role": "user", "content": "hi"}]
+
+    payload = provider._request_payload(provider._endpoints[0], messages)
+
+    assert payload == {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_tokens": 8192,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+
+def test_openrouter_aux_override_does_not_mutate_main(caplog):
+    provider = OllamaProvider(
+        "https://openrouter.ai/api/v1", "inclusionai/ling-3.0-flash-fin:free",
+        8192, 0.6, top_p=0.9, top_k=30,
+    )
+    provider.available = True
+    session = FakeSession()
+    provider._session = session
+
+    async def run():
+        messages = [{"role": "user", "content": "hi"}]
+        await provider.generate_response(
+            messages, temperature=0.2, disable_reasoning=True,
+        )
+        await provider.generate_chat_completion(messages)
+
+    with caplog.at_level("INFO", logger="providers"):
+        asyncio.run(run())
+
+    aux, main = session.payloads
+    assert aux["reasoning"] == {"enabled": False}
+    assert aux["temperature"] == 0.2
+    assert main["temperature"] == 0.6
+    assert "reasoning" not in main
+    for payload in session.payloads:
+        assert payload["top_p"] == 0.9
+        assert payload["top_k"] == 30
+        assert "reasoning_effort" not in payload
+        assert "thinking" not in payload
+    assert "reasoning_disabled=True" in caplog.text
+    assert "reasoning_disabled=False" in caplog.text
+
+
+def test_openrouter_reasoning_override_restores_native_default():
+    provider = OllamaProvider(
+        "https://openrouter.ai/api/v1", "inclusionai/ling-3.0-flash-fin:free",
+        8192, 0.6, disable_reasoning=True,
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    endpoint = provider._endpoints[0]
+
+    disabled = provider._request_payload(endpoint, messages)
+    native = provider._request_payload(endpoint, messages, disable_reasoning=False)
+
+    assert disabled["reasoning"] == {"enabled": False}
+    assert not {"reasoning", "reasoning_effort", "thinking"}.intersection(native)
+    assert endpoint.disable_reasoning is True
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://localhost:11434/v1", "https://openrouter.ai.example.test/v1"],
+)
+def test_non_openrouter_reasoning_disable_protocol_is_preserved(base_url):
+    provider = OllamaProvider(base_url, "model", 8192, 0.6, disable_reasoning=True)
+    payload = provider._request_payload(provider._endpoints[0], [])
+
+    assert payload["reasoning_effort"] == "none"
+    assert payload["reasoning"] == {"effort": "none"}
+    assert payload["thinking"] == {"type": "disabled", "budget_tokens": 0}
+
+
+def test_reasoning_protocol_uses_selected_endpoint():
+    provider = OllamaProvider(
+        "http://localhost:11434/v1", "local-model", 8192, 0.6,
+        disable_reasoning=True,
+        fallback_base_url="https://openrouter.ai/api/v1",
+        fallback_model="inclusionai/ling-3.0-flash-fin:free",
+        fallback_disable_reasoning=True,
+    )
+    primary, fallback = provider._endpoints
+
+    local = provider._request_payload(primary, [])
+    routed = provider._request_payload(fallback, [])
+
+    assert local["reasoning_effort"] == "none"
+    assert routed["reasoning"] == {"enabled": False}
+    assert "reasoning_effort" not in routed
+    assert "thinking" not in routed
 
 
 def test_generate_chat_completion_model_override():
@@ -268,8 +382,8 @@ def test_generate_chat_completion_retries_primary_before_fallback():
     assert session.payloads[1]["model"] == "primary-model"
 
 
-def test_empty_200_gets_a_rotating_non_streaming_recovery_round():
-    """A blank 200 after normal retries must not immediately reach the user."""
+def test_empty_200_gets_non_streaming_recovery_within_total_budget():
+    """Empty-content recovery uses remaining attempts, never extra requests."""
     provider = OllamaProvider(
         "http://primary.test/v1",
         "primary-model",
@@ -285,15 +399,11 @@ def test_empty_200_gets_a_rotating_non_streaming_recovery_round():
             FakeEmptyResponse(),
             FakeEmptyResponse(),
             FakeEmptyResponse(),
+            FakeEmptyResponse(),
             FakeResponse(),
         ]
     )
     provider._session = session
-
-    async def no_wait_retry(attempt, *args, **kwargs):
-        return attempt < 3
-
-    provider._retry_after_attempt = no_wait_retry
 
     async def run():
         return await provider.generate_chat_completion(
@@ -306,9 +416,10 @@ def test_empty_200_gets_a_rotating_non_streaming_recovery_round():
         "http://primary.test/v1/chat/completions",
         "http://primary.test/v1/chat/completions",
         "http://fallback.test/v1/chat/completions",
+        "http://fallback.test/v1/chat/completions",
         "http://primary.test/v1/chat/completions",
     ]
-    assert session.payloads[3]["stream"] is False
+    assert session.payloads[4]["stream"] is False
 
 
 def test_prefer_fallback_routes_first_request_to_fallback():
@@ -382,7 +493,7 @@ def test_429_rate_limit_skips_to_fallback_without_doomed_retry():
         fallback_api_key="fallback-key",
     )
     provider.available = True
-    # No backoff sleep on the single fallback step.
+    # A transient retry waits even when routing to a healthy fallback.
     provider._cooldown_seconds = 60
     session = FakeSequenceSession(
         [
@@ -402,8 +513,7 @@ def test_429_rate_limit_skips_to_fallback_without_doomed_retry():
         assert message["content"] == "ok"
 
     asyncio.run(run())
-    # Only ONE primary call (the 429) then immediate fallback — no second doomed
-    # primary retry, no 2s wait.
+    # Only one primary call (the 429), then fallback after transient backoff.
     assert session.urls == [
         "http://primary.test/v1/chat/completions",
         "http://fallback.test/v1/chat/completions",
@@ -1086,15 +1196,8 @@ def test_media_incapable_is_learned_from_a_404():
     assert "primary" in provider._media_incapable
 
 
-def test_failover_extension_survives_the_last_attempt():
-    """A deterministic 4xx on the FINAL attempt must still fail over.
-
-    The retry loop bumps ``max_attempts`` when it decides to hand the call to
-    another endpoint. That bump was written against a ``for attempt in
-    range(1, max_attempts + 1)`` loop, whose bounds are snapshotted at entry —
-    so the extension did nothing and the turn died with "Provider call failed
-    after retries" while a healthy fallback sat idle.
-    """
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_failover_respects_total_attempt_budget(attempts):
     provider = OllamaProvider(
         "http://primary.test/v1",
         "primary-model",
@@ -1102,7 +1205,7 @@ def test_failover_extension_survives_the_last_attempt():
         0.5,
         fallback_base_url="http://fallback.test/v1",
         fallback_model="fallback-model",
-        retry_attempts=1,  # the failure IS the last attempt
+        retry_attempts=attempts,
     )
     provider.available = True
     session = FakeSequenceSession(
@@ -1122,20 +1225,23 @@ def test_failover_extension_survives_the_last_attempt():
         )
         assert message["content"] == "ok"
 
-    asyncio.run(run())
-    assert len(session.urls) == 2
-    assert "fallback.test" in session.urls[1]
+    if attempts == 1:
+        with pytest.raises(RuntimeError, match="Provider API error: 404"):
+            asyncio.run(run())
+    else:
+        asyncio.run(run())
+        assert "fallback.test" in session.urls[1]
+    assert len(session.urls) == attempts
 
 
-def test_media_strip_retry_survives_the_last_attempt():
-    """When every endpoint refuses the attachments on the final attempt,
-    the text-only retry must actually run instead of dropping the turn."""
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_media_strip_retry_respects_total_attempt_budget(attempts):
     provider = OllamaProvider(
         "http://primary.test/v1",
         "primary-model",
         10,
         0.5,
-        retry_attempts=1,
+        retry_attempts=attempts,
     )
     provider.available = True
     session = FakeSequenceSession(
@@ -1156,12 +1262,15 @@ def test_media_strip_retry_survives_the_last_attempt():
         )
         assert message["content"] == "ok"
 
-    asyncio.run(run())
-    assert len(session.payloads) == 2
-    # Second attempt carries plain text, no image parts.
-    retried = session.payloads[1]["messages"][-1]["content"]
-    assert isinstance(retried, str)
-    assert "attachment(s) omitted" in retried
+    if attempts == 1:
+        with pytest.raises(RuntimeError, match="Provider API error: 400"):
+            asyncio.run(run())
+    else:
+        asyncio.run(run())
+        retried = session.payloads[1]["messages"][-1]["content"]
+        assert isinstance(retried, str)
+        assert "attachment(s) omitted" in retried
+    assert len(session.payloads) == attempts
 
 
 def test_retry_loop_cannot_spin_forever_on_endless_deterministic_400s():

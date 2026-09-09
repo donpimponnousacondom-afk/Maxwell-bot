@@ -1,4 +1,4 @@
-"""REM memory assimilation for Maxwell."""
+"""REM memory assimilation for Dame Curie."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def rem_system_prompt(turns_remaining: int, prompt_body: str | None = None) -> s
     # prompt advertised "N turns left" but the runner never looped, which
     # misled the model. Don't mention turns; just ask for one DONE audit.
     return (
-        "You are Maxwell REM — periodic memory assimilation, not live chat.\n"
+        "You are Dame Curie REM — periodic memory assimilation, not live chat.\n"
         "Keep the last slice useful, specific, deduplicated. Don't drop decisions, "
         "preferences, unresolved tasks, or identity facts.\n\n"
         f"## Task\n{body}\n\n"
@@ -308,13 +308,24 @@ async def _provider_message(
     model: str,
     timeout: int,
     max_tokens: int | None = None,
+    disable_reasoning: bool = True,
 ) -> dict:
     if hasattr(provider, "generate_chat_completion"):
         return await provider.generate_chat_completion(
-            messages, tools=tools, model=model, timeout=timeout, max_tokens=max_tokens
+            messages,
+            tools=tools,
+            model=model,
+            timeout=timeout,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            disable_reasoning=disable_reasoning,
         )
     content = await provider.generate_response(
-        messages, timeout=timeout, max_tokens=max_tokens
+        messages,
+        timeout=timeout,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        disable_reasoning=disable_reasoning,
     )
     return {"role": "assistant", "content": content}
 
@@ -332,6 +343,7 @@ async def run_rem_once(
     timeout: int = 60,
     max_tokens: int | None = None,
     apply_actions: bool = True,
+    disable_reasoning: bool = True,
 ) -> dict:
     store = RemStore(data_dir, run_history=run_history)
     state = await store.load_state()
@@ -376,7 +388,7 @@ async def run_rem_once(
     try:
         await store.patch_state({"running": True, "running_since": started})
         response = await _provider_message(
-            provider, messages, [], model, timeout, max_tokens
+            provider, messages, [], model, timeout, max_tokens, disable_reasoning
         )
         raw_audit = _message_content(response).strip() or "DONE"
         audit = raw_audit[:4000]

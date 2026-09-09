@@ -11,6 +11,8 @@ import json
 import os
 import time
 
+from utils import FileLock, _atomic_json_write_sync
+
 from api.config import (
     MAX_LTM_CHARS,
     MAX_LTM_LINES,
@@ -28,6 +30,7 @@ from api.storage import (
     _load,
     _load_for_write,
     _memory_text_path,
+    _prompt_store,
     _rem_control_path,
     _rem_events_path,
     _rem_runs_path,
@@ -127,7 +130,27 @@ def _load_control():
     control = dict(DEFAULT_CONTROL)
     loaded = _safe_object(_load(_control_path()))
     control.update(loaded)
+    control["base_personality"] = _prompt_store().read_personality()
     return _sanitize_control(control)
+
+
+def save_control(updates: dict, *, reset: bool = False) -> dict:
+    with FileLock(_control_path()):
+        current = dict(DEFAULT_CONTROL)
+        if not reset:
+            current.update(_load_for_write(_control_path(), dict, {}))
+            current.update({k: v for k, v in updates.items() if k in DEFAULT_CONTROL})
+        control = _sanitize_control(current)
+        store = _prompt_store()
+        if store.external:
+            if reset or "base_personality" in updates:
+                store.set_personality(control["base_personality"])
+            control["base_personality"] = store.read_personality()
+        persisted = dict(control)
+        if store.external:
+            persisted.pop("base_personality", None)
+        _atomic_json_write_sync(_control_path(), persisted)
+    return control
 
 
 def _sanitize_control(control):

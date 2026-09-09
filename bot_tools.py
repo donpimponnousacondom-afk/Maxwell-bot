@@ -1,4 +1,4 @@
-"""Tools for Maxwell Bot
+"""Tools for Dame Curie Bot
 
 All tools return a result string for the LLM. They do NOT send errors
 to the Discord channel — errors are returned as strings so the LLM can
@@ -36,6 +36,7 @@ import uuid
 import discord
 from discord import Activity, File, Message, Status
 from tools import Tool
+from response_observability import clean_message_content, prepare_delivery, record_delivery, strip_footer
 from captcha_solver import CaptchaSolveError
 from control_defaults import parse_bool
 import site_backend
@@ -796,7 +797,7 @@ def _missing_cap(guild, cap: str) -> str:
 
 
 def _mod_reason(message) -> str:
-    return f"Maxwell admin tool requested by {getattr(message, 'author', '?')}"
+    return f"Dame Curie admin tool requested by {getattr(message, 'author', '?')}"
 
 
 def _parse_snowflake(value) -> int | None:
@@ -1454,7 +1455,7 @@ class HDImageGeneratorTool(Tool):
             except Exception as e:
                 return None, f"could not fetch {ref[:80]}: {e}"
 
-        # Local path — only from the dirs Maxwell itself writes images to.
+        # Local path — only from the dirs Dame Curie itself writes images to.
         try:
             img_dir, _ = _public_image_target(self.bot)
             allowed = [os.path.abspath(img_dir), os.path.abspath("temp")]
@@ -1833,7 +1834,12 @@ class EditMessageTool(Tool):
             msg = await message.channel.fetch_message(int(message_id))
             if msg.author.id != self.bot.user.id:
                 return "Error: I can only edit my own messages"
-            await msg.edit(content=content)
+            metrics = kwargs.pop("_response_metrics", None)
+            content = strip_footer(content, self_authored=True)
+            platform = str(getattr(message, "tool_platform", "discord") or "discord")
+            _, chunks = prepare_delivery(self.bot, content, metrics, SendMessageTool._chunks, platform=platform, limit=2000)
+            await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
+            record_delivery(self.bot, message.channel, msg, metrics, platform=platform, replace=True)
             return f"Message {message_id} edited successfully"
         except discord.NotFound:
             return f"Error: Message {message_id} not found"
@@ -2000,7 +2006,7 @@ class SetActivityTool(Tool):
 
 class SleepTool(Tool):
     """Take a sleep window. While sleeping the bot won't dispatch
-    LLM turns — the triggering channel gets a 'max is sleeping,
+    LLM turns — the triggering channel gets a 'the dame is sleeping,
     back in Xm' notice (deduped per user, never a DM). The 2026-07-19
     user directive: the bot kept spamming goodnight/goodbye in chat;
     a real sleep window is the structural fix. Use this when the
@@ -2013,7 +2019,7 @@ class SleepTool(Tool):
     def get_description(self):
         return (
             "Sleep 1-60 minutes (default 30). While asleep, LLM turns are skipped "
-            "and the triggering channel gets one 'max is sleeping' notice. Use only "
+            "and the triggering channel gets one 'the dame is sleeping' notice. Use only "
             "at a real end-of-conversation, not as a goodbye. Calling again resets "
             "the window. Params: duration_minutes."
         )
@@ -2857,8 +2863,9 @@ class SearchMessagesTool(Tool):
             if not clean_query:
                 if chan and hasattr(chan, "history"):
                     async for msg in chan.history(limit=search_limit):
-                        snippet = msg.content[:150] + (
-                            "..." if len(msg.content) > 150 else ""
+                        content = clean_message_content(self.bot, msg)
+                        snippet = content[:150] + (
+                            "..." if len(content) > 150 else ""
                         )
                         results.append(
                             f"[{msg.id}] {msg.author.display_name}: {snippet}"
@@ -2872,9 +2879,10 @@ class SearchMessagesTool(Tool):
             if chan and hasattr(chan, "history"):
                 try:
                     async for msg in chan.history(limit=100):
-                        if clean_query in (msg.content or "").lower():
-                            snippet = msg.content[:150] + (
-                                "..." if len(msg.content) > 150 else ""
+                        content = clean_message_content(self.bot, msg)
+                        if clean_query in content.lower():
+                            snippet = content[:150] + (
+                                "..." if len(content) > 150 else ""
                             )
                             results.append(
                                 f"[#{getattr(chan, 'name', 'chat')} - {msg.id}] {msg.author.display_name}: {snippet}"
@@ -2902,9 +2910,10 @@ class SearchMessagesTool(Tool):
                         break
                     try:
                         async for msg in c.history(limit=50):
-                            if clean_query in (msg.content or "").lower():
-                                snippet = msg.content[:150] + (
-                                    "..." if len(msg.content) > 150 else ""
+                            content = clean_message_content(self.bot, msg)
+                            if clean_query in content.lower():
+                                snippet = content[:150] + (
+                                    "..." if len(content) > 150 else ""
                                 )
                                 results.append(
                                     f"[#{c.name} - {msg.id}] {msg.author.display_name}: {snippet}"
@@ -3060,7 +3069,7 @@ class ListServersTool(Tool):
 
 
 class ListAdminServersTool(Tool):
-    """List servers where Maxwell has useful admin permissions."""
+    """List servers where Dame Curie has useful admin permissions."""
 
     def get_description(self):
         return (
@@ -3142,13 +3151,13 @@ class CreateCategoryTool(Tool):
             return f"Error: I do not have manage_channels/admin in {guild.name}. Run list_admin_servers first."
         try:
             category = await guild.create_category(
-                clean, reason=f"Maxwell admin tool requested by {message.author}"
+                clean, reason=f"Dame Curie admin tool requested by {message.author}"
             )
             if position is not None:
                 try:
                     await category.edit(
                         position=max(0, int(position)),
-                        reason="Maxwell admin tool position update",
+                        reason="Dame Curie admin tool position update",
                     )
                 except (TypeError, ValueError):
                     return f"Created category {category.name} ({category.id}), but position was invalid"
@@ -3237,7 +3246,7 @@ class CreateChannelTool(Tool):
                 channel = await guild.create_voice_channel(
                     clean,
                     category=category,
-                    reason=f"Maxwell admin tool requested by {message.author}",
+                    reason=f"Dame Curie admin tool requested by {message.author}",
                 )
             elif channel_kind in {"text", "chat"}:
                 try:
@@ -3250,7 +3259,7 @@ class CreateChannelTool(Tool):
                     topic=str(topic or "")[:1024],
                     nsfw=str(nsfw).lower() in {"1", "true", "yes", "on"},
                     slowmode_delay=slowmode,
-                    reason=f"Maxwell admin tool requested by {message.author}",
+                    reason=f"Dame Curie admin tool requested by {message.author}",
                 )
             else:
                 return "Error: kind/type must be text or voice"
@@ -3340,7 +3349,7 @@ class EditChannelTool(Tool):
             return "Error: provide at least one edit field"
         try:
             await channel.edit(
-                **updates, reason=f"Maxwell admin tool requested by {message.author}"
+                **updates, reason=f"Dame Curie admin tool requested by {message.author}"
             )
             return f"Edited {_channel_label(channel)} in {guild.name}: {', '.join(sorted(updates))}"
         except discord.Forbidden:
@@ -3386,7 +3395,7 @@ class DeleteChannelTool(Tool):
         try:
             label = _channel_label(channel)
             await channel.delete(
-                reason=f"Maxwell admin tool requested by {message.author}"
+                reason=f"Dame Curie admin tool requested by {message.author}"
             )
             return f"Deleted {label} from {guild.name}"
         except discord.Forbidden:
@@ -4471,7 +4480,7 @@ def format_site_file_read(rel: str, text: str, *, start_line: int = 1) -> str:
 
     Small files come back whole. Larger ones get a numbered window; pass
     ``start_line`` to page. A minified one-liner is paged by character so it
-    cannot dump 40k into the tool loop (that is what hung Maxwell).
+    cannot dump 40k into the tool loop (that is what hung Dame Curie).
     """
     start_line = _site_start_line(start_line)
     raw = text or ""
@@ -6614,7 +6623,7 @@ async def resolve_send_reply_target(message, reply=True, reply_to=None, bot=None
         score = score_reply_candidate(
             hint_n,
             author=_message_author_label(msg),
-            content=str(getattr(msg, "content", "") or ""),
+            content=clean_message_content(bot, msg),
         )
         if score > best_score:
             best_score = score
@@ -6722,6 +6731,7 @@ class SendMessageTool(Tool):
         reply_to: str | None = None,
         channel_id: str | None = None,
         user_id: str | None = None,
+        _response_metrics=None,
         **kwargs,
     ) -> str:
         text = str(content or "").strip()
@@ -6772,9 +6782,10 @@ class SendMessageTool(Tool):
             if self.bot and hasattr(self.bot, "_extract_stickers_from_text"):
                 text, stickers = self.bot._extract_stickers_from_text(text, guild)
 
-            chunks = self._chunks(text)
+            platform = str(getattr(message, "tool_platform", "discord") or "discord")
+            clean_chunks, chunks = prepare_delivery(self.bot, text, _response_metrics, self._chunks, platform=platform)
             if not chunks and stickers:
-                chunks = [""]
+                clean_chunks, chunks = [""], [""]
             target = None
             if reply and target_channel == getattr(message, "channel", None):
                 target = await resolve_send_reply_target(
@@ -6817,7 +6828,7 @@ class SendMessageTool(Tool):
                                 return "Error: missing permissions to send message"
                         elif i == 0 and use_reply:
                             try:
-                                await reply_to_message.reply(chunk, **extra)
+                                sent = await reply_to_message.reply(chunk, **extra)
                             except (discord.NotFound, discord.HTTPException) as exc:
                                 code = getattr(exc, "code", None)
                                 parent_gone = isinstance(
@@ -6833,11 +6844,12 @@ class SendMessageTool(Tool):
                                     raise
                                 if not parent_gone:
                                     raise
-                                await target_channel.send(chunk, **extra)
+                                sent = await target_channel.send(chunk, **extra)
                         else:
-                            await target_channel.send(chunk, **extra)
+                            sent = await target_channel.send(chunk, **extra)
+                        record_delivery(self.bot, target_channel, sent, _response_metrics, platform=platform)
                         sent_any = True
-                        sent_chunks.append(chunk)
+                        sent_chunks.append(clean_chunks[i])
                     except Exception:
                         if sent_any:
                             return "__MESSAGE_SENT__\n" + "\n".join(sent_chunks)
@@ -6949,6 +6961,50 @@ class MoreToolsTool(Tool):
         )
 
 
+import docker_runtime as shell_runtime
+
+
+def _shell_workspace() -> Path:
+    if shell_runtime.container_mode():
+        return shell_runtime.confined_path(
+            os.environ.get("MAXWELL_SHELL_DIR", "/state/shell"), roots=("shell",)
+        )
+    return Path(__file__).parent / "shelldocker"
+
+
+def _read_shell_export(path: str, limit: int) -> bytes:
+    clean = str(path).strip()
+    if clean.startswith("/home/maxwell/"):
+        clean = clean[len("/home/maxwell/"):]
+    elif clean.startswith("home/maxwell/"):
+        clean = clean[len("home/maxwell/"):]
+    relative = Path(clean)
+    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+        raise ValueError("shell exports must be under /home/maxwell without traversal")
+    root = _shell_workspace()
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root.resolve()):
+        raise ValueError("shell export escapes /home/maxwell")
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as source:
+            import stat
+
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("shell export must be a regular file")
+            blob = source.read(limit + 1)
+        if len(blob) > limit:
+            raise ValueError("shell export is too large")
+        return blob
+    finally:
+        os.close(directory)
+
+
 class SendFileTool(Tool):
     """Create and send an arbitrary file attachment, or send an existing file from disk."""
 
@@ -6971,48 +7027,28 @@ class SendFileTool(Tool):
         path: str | None = None,
         **kwargs,
     ) -> str:
-        # Intentionally NOT admin-gated. send_file is an output channel —
-        # the model already has shell + every other tool to produce content,
-        # and gating the return path on `_is_admin` was just a barrier that
-        # blocked non-admin users from receiving files. The path-mode
-        # allowlist (_allowed_send_file_bases) is the real safety boundary.
-        # Path mode: send a file that already exists on disk (or in the shell
-        # container — we docker-cp it out as a fallback for container paths).
         if path:
-            # Normalize container paths (/home/maxwell/...) to the host bind
-            # mount so the allowlist and resolver see a real host path.
-            resolved_input = self._resolve_send_file_path(path)
-            # First, the fast path: a regular host file the model knows about.
-            host_path, host_error = await self._try_read_host_file(resolved_input)
-            if host_path is not None:
-                target = host_path
-                tmp_to_clean = None
-            else:
-                # Fallback: the model passed a container-only path (anything
-                # inside the maxwell-shell container). Try docker cp it out.
-                # Allowed for any path inside the container — the model
-                # already has shell access, and refusing "any file" creates
-                # an artificial one-step barrier that breaks the round-trip.
-                target, cp_error = await self._docker_cp_from_shell(path)
-                if target is None:
-                    return (
-                        f"Error: could not read file at '{path}'. "
-                        f"Host: {host_error or 'not found'}. "
-                        f"Container: {cp_error or 'not found or not readable'}."
-                    )
-                tmp_to_clean = target
-
             try:
-                blob = await asyncio.to_thread(target.read_bytes)
-            except Exception as e:
+                resolved_input = self._resolve_send_file_path(path)
+                workspace = _shell_workspace()
+                candidate = Path(os.path.abspath(resolved_input))
+                if candidate.is_relative_to(workspace) or candidate.resolve().is_relative_to(workspace.resolve()):
+                    shell_tool = getattr(self.bot, "tools", {}).get("shell")
+                    if shell_tool is None or not getattr(getattr(self.bot, "config", None), "ENABLE_SHELL", False):
+                        return "Error: shell file export requires a registered enabled shell tool"
+                    relative = candidate.relative_to(workspace)
+                    async with shell_tool._lifecycle_lock:
+                        await shell_tool._verify_export_container()
+                        blob = await asyncio.to_thread(_read_shell_export, str(relative), self.MAX_SIZE)
+                    target = candidate
+                else:
+                    target, host_error = await self._try_read_host_file(resolved_input)
+                    if target is None:
+                        return f"Error: could not read file at '{path}': {host_error}"
+                    blob = await asyncio.to_thread(target.read_bytes)
+            except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as e:
                 return f"Error reading file from disk: {e}"
-            finally:
-                if tmp_to_clean is not None:
-                    with contextlib.suppress(Exception):
-                        shutil.rmtree(tmp_to_clean.parent, ignore_errors=True)
-            safe_name = _safe_attachment_filename(
-                filename or target.name, default="file"
-            )
+            safe_name = _safe_attachment_filename(filename or target.name, default="file")
             return await self._send_blob(message, blob, safe_name)
 
         # Inline-content mode (original behavior).
@@ -7057,9 +7093,6 @@ class SendFileTool(Tool):
             site_path = getattr(site_dir, "MAXWELL_SITE_DIR", "")
             if site_path:
                 bases.append(os.path.abspath(site_path))
-        # Shell tool working dir (volume mounted into container as /home/maxwell).
-        shell_host = os.path.join(os.path.dirname(__file__), "shelldocker")
-        bases.append(os.path.abspath(shell_host))
         return bases
 
     def _resolve_send_file_path(self, raw_path: str) -> str:
@@ -7075,15 +7108,14 @@ class SendFileTool(Tool):
         cleaned = str(raw_path or "").strip()
         if not cleaned:
             return cleaned
-        # Normalize container-side /home/maxwell/<x> to the host bind mount.
-        # Match /home/maxwell, /home/maxwell/, or just home/maxwell (defensive).
-        m = re.match(r"^/?home/maxwell/?(.*)$", cleaned)
+        m = re.fullmatch(r"/?home/maxwell(?:/(.*))?", cleaned)
+        if ".." in Path(cleaned).parts:
+            raise ValueError("path traversal not allowed")
         if m:
-            shell_host = os.path.abspath(
-                os.path.join(os.path.dirname(__file__), "shelldocker")
-            )
-            rel = m.group(1).lstrip("/")
-            return os.path.join(shell_host, rel) if rel else shell_host
+            rel = m.group(1) or ""
+            if Path(rel).is_absolute():
+                raise ValueError("shell exports must be under /home/maxwell")
+            return str(_shell_workspace() / rel)
         return cleaned
 
     async def _try_read_host_file(
@@ -7103,88 +7135,6 @@ class SendFileTool(Tool):
                 except OSError:
                     continue
         return None, "not in an allowed host directory or not found"
-
-    async def _docker_cp_from_shell(
-        self, container_path: str
-    ) -> tuple[Path | None, str | None]:
-        """docker-cp a file out of the maxwell-shell container to a local temp
-        path, then return that local Path. Used as a fallback when the model
-        passes a path that only exists inside the container.
-
-        Path safety: we only allow reads from inside the running
-        maxwell-shell container. The container's root is bounded by the
-        sandbox flags (no host FS mount by default; even in MAXWELL_SHELL_FULL_HOST
-        mode, /host is a separate root).
-        """
-        if not container_path or not isinstance(container_path, str):
-            return None, "empty path"
-        clean = container_path.strip()
-        if not clean.startswith("/"):
-            clean = "/" + clean  # require absolute inside container
-        # No traversal escapes from the container root; this is read-only.
-        if ".." in clean.split("/"):
-            return None, "path traversal not allowed"
-
-        # Confirm the container is running.
-        try:
-            shell_tool = self.bot.tools.get("shell") if self.bot else None
-            container_name = (
-                getattr(shell_tool, "CONTAINER_NAME", "maxwell-shell")
-                if shell_tool
-                else "maxwell-shell"
-            )
-        except Exception:
-            container_name = "maxwell-shell"
-
-        tmp_dir = tempfile.mkdtemp(prefix="maxwell_sendfile_")
-        local_path = os.path.join(tmp_dir, os.path.basename(clean) or "file")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "docker",
-                "cp",
-                f"{container_name}:{clean}",
-                local_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, "docker cp timed out"
-            except asyncio.CancelledError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise
-            if proc.returncode != 0:
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, (
-                    stderr.decode(errors="replace").strip()
-                    or f"docker cp exit {proc.returncode}"
-                )
-            if not os.path.isfile(local_path):
-                with contextlib.suppress(Exception):
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return None, "docker cp reported success but file is missing"
-            return Path(local_path), None
-        except FileNotFoundError:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            return None, "docker is not installed or not on PATH"
-        except Exception as e:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            return None, f"docker cp failed: {e}"
 
     async def _send_blob(self, message: Message, blob: bytes, safe_name: str) -> str:
         if len(blob) > self.MAX_SIZE:
@@ -7319,10 +7269,24 @@ SANDBOX_IMAGE_NAME = "maxwell-shell"
 SANDBOX_DOCKERFILE_DIR = os.path.join(os.path.dirname(__file__), "docker")
 
 
+def _sandbox_source_hash() -> str:
+    import hashlib
+
+    return hashlib.sha256((Path(SANDBOX_DOCKERFILE_DIR) / "Dockerfile").read_bytes()).hexdigest()
+
+
 async def _ensure_sandbox_image(image: str = SANDBOX_IMAGE_NAME) -> None:
-    """Build the sandbox image if it is not present. Idempotent."""
+    labels = []
+    if shell_runtime.container_mode():
+        expected = shell_runtime.resource_name("shell-image")
+        if image not in {SANDBOX_IMAGE_NAME, expected}:
+            raise ValueError("shell image must use this instance namespace")
+        image = expected
+        labels = shell_runtime.label_args("shell-image") + [
+            "--label", f"maxwell.shell.source={_sandbox_source_hash()}"
+        ]
     try:
-        (_stdout, _stderr), code = await _run_docker_cmd(
+        (stdout, stderr), code = await _run_docker_cmd(
             "image", "inspect", image, timeout=15
         )
     except FileNotFoundError as exc:
@@ -7330,14 +7294,22 @@ async def _ensure_sandbox_image(image: str = SANDBOX_IMAGE_NAME) -> None:
     except asyncio.TimeoutError as exc:
         raise RuntimeError("docker did not respond") from exc
     if code == 0:
-        return
+        if not shell_runtime.container_mode():
+            return
+        info = json.loads(stdout)[0]
+        image_labels = info["Config"].get("Labels") or {}
+        shell_runtime.require_ownership(image_labels, "shell-image")
+        if image_labels.get("maxwell.shell.source") == _sandbox_source_hash():
+            return
+    elif b"No such" not in stderr:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or "shell image inspect failed")
     (_stdout, stderr), build_code = await _run_docker_cmd(
-        "build", "-t", image, SANDBOX_DOCKERFILE_DIR, timeout=900
+        "build", "-t", image, *labels, "-f",
+        str(Path(SANDBOX_DOCKERFILE_DIR) / "Dockerfile"),
+        SANDBOX_DOCKERFILE_DIR, timeout=900
     )
     if build_code != 0:
-        raise RuntimeError(
-            stderr.decode(errors="replace").strip() or "docker build failed"
-        )
+        raise RuntimeError(stderr.decode(errors="replace").strip() or "docker build failed")
 
 
 def _taint_gate_blocks(tool: Any, message: Any, kwargs: dict) -> bool:
@@ -7366,8 +7338,14 @@ class ShellTool(Tool):
     # tool we expose, so it gets the taint-check / user-confirmation gate.
     is_destructive = True
 
-    CONTAINER_NAME = "maxwell-shell"
-    IMAGE_NAME = "maxwell-shell"
+    @property
+    def CONTAINER_NAME(self):
+        return shell_runtime.resource_name("shell") if shell_runtime.container_mode() else "maxwell-shell"
+
+    @property
+    def IMAGE_NAME(self):
+        return shell_runtime.resource_name("shell-image") if shell_runtime.container_mode() else SANDBOX_IMAGE_NAME
+
     DOCKERFILE_DIR = os.path.join(os.path.dirname(__file__), "docker")
 
     # Output / command-length caps. Read from env so the operator can tune
@@ -7453,12 +7431,12 @@ class ShellTool(Tool):
     @staticmethod
     def _full_host_access() -> bool:
         """Opt-in host RCE mode. Default is isolated (no /host, no host net)."""
-        return os.environ.get("MAXWELL_SHELL_FULL_HOST", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
+        full = os.environ.get("MAXWELL_SHELL_FULL_HOST", "").strip().lower() in {
+            "1", "true", "yes", "on",
         }
+        if full and shell_runtime.container_mode():
+            raise ValueError("MAXWELL_SHELL_FULL_HOST is forbidden in container mode")
+        return full
 
     def get_description(self):
         # Surface live limits so the model doesn't have to guess. Pulled at
@@ -7498,76 +7476,99 @@ class ShellTool(Tool):
     async def _run_docker(self, *args: str, timeout: int = 30):
         return await _run_docker_cmd(*args, timeout=timeout)
 
+    async def _verify_daemon(self):
+        if shell_runtime.container_mode():
+            (stdout, stderr), code = await self._run_docker("info", "--format", "{{json .SecurityOptions}}", timeout=10)
+            if code or stderr.strip() or "name=rootless" not in json.loads(stdout or b"[]"):
+                raise RuntimeError("container shell requires a rootless Docker daemon")
+
+    async def _inspect_container(self):
+        (stdout, stderr), code = await self._run_docker(
+            "inspect", "--type", "container", self.CONTAINER_NAME, timeout=10
+        )
+        if code:
+            if b"No such" not in stderr:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "sandbox inspect failed")
+            return None
+        info = json.loads(stdout)[0]
+        labels = info["Config"].get("Labels") or {}
+        if shell_runtime.container_mode():
+            shell_runtime.require_ownership(labels, "shell")
+        elif labels.get("maxwell.shell.mode") not in {"full", "isolated"} or labels.get("maxwell.shell.init") != "1":
+            raise ValueError("existing container is not an owned Maxwell shell")
+        return info
+
+    async def _verify_container(self, info):
+        full = self._full_host_access()
+        labels = info["Config"].get("Labels") or {}
+        if labels.get("maxwell.shell.mode") != ("full" if full else "isolated") or labels.get("maxwell.shell.init") != "1":
+            raise ValueError("shell container mode does not match configuration")
+        host = info["HostConfig"]
+        workspace = _shell_workspace()
+        source = shell_runtime.host_path(workspace, roots=("shell",)) if shell_runtime.container_mode() else workspace
+        expected_mounts = {(str(source), "/home/maxwell", True)}
+        if full:
+            expected_mounts.add(("/", "/host", True))
+        mounts = {(m["Source"], m["Destination"], m["RW"]) for m in info["Mounts"] if m["Type"] == "bind"}
+        if mounts != expected_mounts or any(m["Type"] not in {"bind", "tmpfs"} for m in info["Mounts"]):
+            raise ValueError("shell container has unexpected mounts")
+        if host.get("Privileged") or host.get("PidMode") == "host" or host.get("IpcMode") == "host" or host.get("Devices") or host.get("DeviceRequests") or host.get("VolumesFrom"):
+            raise ValueError("shell container has unsafe host access")
+        expected_limits = {"Memory": 4 * 1024**3, "NanoCpus": 2_000_000_000, "PidsLimit": 1024}
+        if any(host.get(key) != value for key, value in expected_limits.items()):
+            raise ValueError("shell container resource limits do not match configuration")
+        if host.get("PortBindings") or host.get("PublishAllPorts"):
+            raise ValueError("shell container must not publish ports")
+        if host.get("Tmpfs") != {"/tmp": "rw,exec,nosuid,size=256m"} or any(m["Type"] == "tmpfs" and m["Destination"] != "/tmp" for m in info["Mounts"]):
+            raise ValueError("shell container scratch mounts do not match configuration")
+        config = info["Config"]
+        if config.get("User") != "root" or config.get("WorkingDir") != "/home/maxwell" or config.get("Cmd") != ["sleep", "infinity"] or config.get("Entrypoint"):
+            raise ValueError("shell container process does not match configuration")
+        if set(info["NetworkSettings"]["Networks"]) != {"host" if full else "bridge"}:
+            raise ValueError("shell container has unexpected network attachments")
+        if host.get("NetworkMode") != ("host" if full else "bridge") or host.get("Init") is not True:
+            raise ValueError("shell container network/init does not match configuration")
+        if not full and (set(host.get("CapDrop") or []) != {"ALL"} or set(host.get("CapAdd") or []) != {"CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "NET_RAW", "NET_BIND_SERVICE"} or set(host.get("SecurityOpt") or []) != {"no-new-privileges:true"}):
+            raise ValueError("shell container security options do not match configuration")
+        if shell_runtime.container_mode():
+            (stdout, stderr), code = await self._run_docker("image", "inspect", self.IMAGE_NAME, timeout=15)
+            if code:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "shell image missing")
+            image = json.loads(stdout)[0]
+            image_labels = image["Config"].get("Labels") or {}
+            shell_runtime.require_ownership(image_labels, "shell-image")
+            if image_labels.get("maxwell.shell.source") != _sandbox_source_hash() or info["Image"] != image["Id"]:
+                raise ValueError("shell container image identity/source mismatch")
+        return info["Id"]
+
+    async def _verify_export_container(self):
+        self._full_host_access()
+        await self._verify_daemon()
+        info = await self._inspect_container()
+        if info is None or not info["State"]["Running"]:
+            raise ValueError("shell container is not running")
+        return await self._verify_container(info)
+
     async def _ensure_container(self):
-        # Reuse a running container when present and access mode matches.
-        # Recreate when missing/stopped or when full-host mode flag changed.
         desired_mode = "full" if self._full_host_access() else "isolated"
-        try:
-            (stdout, _stderr), code = await self._run_docker(
-                "inspect",
-                "--type",
-                "container",
-                "-f",
-                '{{.State.Running}} {{index .Config.Labels "maxwell.shell.mode"}} '
-                '{{index .Config.Labels "maxwell.shell.init"}}',
-                self.CONTAINER_NAME,
-                timeout=10,
-            )
-            if code == 0:
-                parts = stdout.decode(errors="replace").strip().split(None, 2)
-                running = (parts[0] if parts else "").lower() == "true"
-                mode = parts[1] if len(parts) > 1 else ""
-                init = parts[2] if len(parts) > 2 else ""
-                if running and mode == desired_mode and init == "1":
-                    return
-                if not running and mode == desired_mode and init == "1":
-                    (_stdout, stderr), start_code = await self._run_docker(
-                        "start", self.CONTAINER_NAME, timeout=15
-                    )
-                    if start_code == 0:
-                        return
-                # Wrong mode or start failed — require a successful rm, then recreate.
-                (_stdout, _stderr), rm_code = await self._run_docker(
-                    "rm", "-f", self.CONTAINER_NAME, timeout=10
-                )
-                if rm_code != 0:
-                    raise RuntimeError(
-                        "could not remove the existing sandbox container"
-                    )
-                # `docker rm -f` may return before the name is reusable.
-                # Confirm disappearance before building/running the
-                # replacement, otherwise the next run can hit a stale-name
-                # race and leave the sandbox unavailable.
-                for _ in range(100):
-                    (_stdout, _stderr), inspect_code = await self._run_docker(
-                        "inspect",
-                        "--type",
-                        "container",
-                        "-f",
-                        "{{.Id}}",
-                        self.CONTAINER_NAME,
-                        timeout=10,
-                    )
-                    if inspect_code != 0:
-                        break
-                    await asyncio.sleep(0.1)
-                else:
-                    raise RuntimeError(
-                        "sandbox container did not disappear after removal"
-                    )
-        except FileNotFoundError as exc:
-            raise RuntimeError("docker is not installed or not on PATH") from exc
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError("docker did not respond while checking sandbox") from exc
-
-        try:
-            await _ensure_sandbox_image(self.IMAGE_NAME)
-        except RuntimeError:
-            raise
-        except Exception as exc:
-            raise RuntimeError(f"could not prepare sandbox image: {exc}") from exc
-
-        shell_host = os.path.join(os.path.dirname(__file__), "shelldocker")
+        await self._verify_daemon()
+        info = await self._inspect_container()
+        if info is not None:
+            labels = info["Config"].get("Labels") or {}
+            if labels.get("maxwell.shell.mode") == desired_mode and labels.get("maxwell.shell.init") == "1":
+                container_id = await self._verify_container(info)
+                if not info["State"]["Running"]:
+                    (_stdout, stderr), code = await self._run_docker("start", container_id, timeout=15)
+                    if code:
+                        raise RuntimeError(stderr.decode(errors="replace").strip() or "shell start failed")
+                return await self._verify_export_container()
+            (_stdout, stderr), code = await self._run_docker("rm", "-f", info["Id"], timeout=10)
+            if code:
+                raise RuntimeError(stderr.decode(errors="replace").strip() or "could not remove sandbox")
+        await _ensure_sandbox_image(self.IMAGE_NAME)
+        workspace = _shell_workspace()
+        workspace.mkdir(parents=True, exist_ok=True)
+        shell_host = shell_runtime.host_path(workspace, roots=("shell",)) if shell_runtime.container_mode() else workspace
         run_args = [
             "run",
             "-d",
@@ -7625,12 +7626,15 @@ class ShellTool(Tool):
                     "NET_BIND_SERVICE",
                 ]
             )
+        if shell_runtime.container_mode():
+            run_args.extend(shell_runtime.label_args("shell"))
         run_args.append(self.IMAGE_NAME)
         (_stdout, stderr), run_code = await self._run_docker(*run_args, timeout=30)
         if run_code != 0:
             raise RuntimeError(
                 stderr.decode(errors="replace").strip() or "docker run failed"
             )
+        return await self._verify_export_container()
 
     @staticmethod
     def _command_arg(command: str | None = None, **kwargs) -> str | None:
@@ -7705,7 +7709,7 @@ class ShellTool(Tool):
         if not sanitized:
             raise RuntimeError("empty command")
         async with self._lifecycle_lock:
-            await self._ensure_container()
+            container_id = await self._ensure_container()
             exec_token = f"maxwell-exec-{uuid.uuid4().hex}"
             pid_file = f"/tmp/{exec_token}.pid"
             # Run the user's shell in its own session/process group and leave
@@ -7724,7 +7728,7 @@ class ShellTool(Tool):
                 "/home/maxwell",
                 "--user",
                 "root",
-                self.CONTAINER_NAME,
+                container_id,
                 "setsid",
                 "--wait",
                 "bash",
@@ -7802,14 +7806,14 @@ class ShellTool(Tool):
                     timeout=self._timeout_seconds(),
                 )
             except asyncio.TimeoutError:
-                await self._kill_container_exec(pid_file)
+                await self._kill_container_exec(pid_file, container_id)
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 await proc.wait()
                 raise
             except asyncio.CancelledError:
                 # Outer autonomy wait_for or other cancel can hit here; always kill child.
-                await self._kill_container_exec(pid_file)
+                await self._kill_container_exec(pid_file, container_id)
                 if proc.returncode is None:
                     with contextlib.suppress(ProcessLookupError):
                         proc.kill()
@@ -7822,7 +7826,7 @@ class ShellTool(Tool):
                 # Belt-and-suspenders: ensure no zombie if communicate didn't finish.
                 if proc.returncode is None:
                     try:
-                        await self._kill_container_exec(pid_file)
+                        await self._kill_container_exec(pid_file, container_id)
                         proc.kill()
                         await proc.wait()
                     except Exception as e:
@@ -7832,7 +7836,7 @@ class ShellTool(Tool):
                 stderr_buf.extend(b"\n[output truncated at MAXWELL_SHELL_MAX_OUTPUT]")
             return bytes(stdout_buf), bytes(stderr_buf), proc.returncode
 
-    async def _kill_container_exec(self, pid_file: str) -> None:
+    async def _kill_container_exec(self, pid_file: str, container_id: str) -> None:
         """Terminate the timed-out command, not just its docker client."""
         quoted = shlex.quote(pid_file)
         cleanup = (
@@ -7844,11 +7848,13 @@ class ShellTool(Tool):
             "esac"
         )
         with contextlib.suppress(Exception):
+            if await self._verify_export_container() != container_id:
+                return
             await self._run_docker(
                 "exec",
                 "--user",
                 "root",
-                self.CONTAINER_NAME,
+                container_id,
                 "bash",
                 "-lc",
                 cleanup,
@@ -8095,80 +8101,18 @@ class ShellTool(Tool):
         return [f.strip() for f in raw.split(",") if f.strip()]
 
     async def _send_container_file(self, message: Message, rel_path: str) -> str | None:
-        """Copy a file out of the container, stage it in data/exports/, and
-        send it to Discord. Returns filename on success.
-
-        Staging into data/exports/ (which send_file already allowlists) means a
-        follow-up `send_file path=.../exports/<name>` can re-attach the same
-        artifact without another docker cp — the round-trip is one-shot.
-        """
-        # Sanitize — no path traversal escapes from /home/maxwell
-        clean = rel_path.strip().lstrip("/")
-        # The model usually passes a full container path like
-        # /home/maxwell/img/foo.png (the system prompt tells it to). lstrip
-        # only killed the leading slash, so strip the home/maxwell prefix
-        # too — otherwise we re-prepend it and docker cp looks for
-        # /home/maxwell/home/maxwell/img/foo.png (which is the bug we're fixing).
-        clean = re.sub(r"^home/maxwell/?", "", clean)
-        if ".." in clean:
-            logger.warning(f"Shell file send blocked — path traversal: {rel_path}")
+        if getattr(self.bot, "tools", {}).get("shell") is not self or not getattr(getattr(self.bot, "config", None), "ENABLE_SHELL", False):
             return None
-
-        container_path = f"/home/maxwell/{clean}"
-        tmp_dir = tempfile.mkdtemp(prefix="maxwell_shell_")
-        local_path = os.path.join(tmp_dir, os.path.basename(clean))
-
         try:
-            (_stdout, stderr), code = await self._run_docker(
-                "cp", f"{self.CONTAINER_NAME}:{container_path}", local_path, timeout=15
-            )
-            if code != 0:
-                logger.warning(
-                    f"docker cp failed for {container_path}: {stderr.decode(errors='replace')}"
-                )
-                return None
-
-            if not os.path.isfile(local_path):
-                logger.warning(f"File not found after docker cp: {local_path}")
-                return None
-
-            file_size = os.path.getsize(local_path)
-            if file_size > 10 * 1024 * 1024:
-                logger.warning(f"Shell file too large to send: {file_size} bytes")
-                return None
-
-            filename = os.path.basename(clean)
-            # Step aside for the live progress message before posting
-            # the file artifact.
+            async with self._lifecycle_lock:
+                await self._verify_export_container()
+                blob = await asyncio.to_thread(_read_shell_export, rel_path, 10 * 1024 * 1024)
+            filename = Path(rel_path).name
             self._signal_streaming(message)
-            await message.channel.send(file=File(local_path, filename=filename))
-            logger.info(f"Sent shell file: {filename} ({file_size} bytes)")
-
-            # Stage a copy into the canonical exports dir for later re-attach.
-            try:
-                exports_dir = _shell_exports_dir()
-                os.makedirs(exports_dir, exist_ok=True)
-                staged = os.path.join(exports_dir, filename)
-                # Avoid clobbering an existing export with the same name.
-                if os.path.exists(staged):
-                    base, ext = os.path.splitext(filename)
-                    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                    staged = os.path.join(exports_dir, f"{base}_{stamp}{ext}")
-                shutil.copy2(local_path, staged)
-                logger.info(f"Staged shell file to exports: {staged}")
-            except Exception as e:
-                logger.warning(f"Failed to stage shell file to exports: {e}")
-
+            await message.channel.send(file=File(BytesIO(blob), filename=filename))
             return filename
-        except asyncio.TimeoutError:
-            logger.warning(f"docker cp timed out for {container_path}")
+        except (OSError, ValueError, RuntimeError, asyncio.TimeoutError, discord.HTTPException):
             return None
-        except Exception as e:
-            logger.warning(f"Failed to send shell file {rel_path}: {e}")
-            return None
-        finally:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _shorten(text, n: int) -> str:
@@ -8333,7 +8277,7 @@ class FetchUrlTool(Tool):
         if mime.startswith("audio/") or url_ext in SeeVideoTool.AUDIO_EXTS:
             return (
                 "Error: URL contains audio media, not readable text. "
-                "Attach or post the audio URL so Maxwell can hear it."
+                "Attach or post the audio URL so Dame Curie can hear it."
             )
 
         try:
@@ -10089,7 +10033,7 @@ class JoinVcTool(Tool):
 
 
 class VcStatusTool(Tool):
-    """Show Maxwell's current voice channel and who else is there."""
+    """Show Dame Curie's current voice channel and who else is there."""
 
     def get_description(self):
         return (
@@ -10255,7 +10199,7 @@ def _email_cfg(bot) -> dict:
         "user": getattr(cfg, "MAXWELL_EMAIL_USER", "maxwell@z3ki.dev"),
         "password": getattr(cfg, "MAXWELL_EMAIL_PASSWORD", ""),
         "from_addr": getattr(cfg, "MAXWELL_EMAIL_FROM", "maxwell@z3ki.dev"),
-        "from_name": getattr(cfg, "MAXWELL_EMAIL_FROM_NAME", "Maxwell"),
+        "from_name": getattr(cfg, "MAXWELL_EMAIL_FROM_NAME", "Dame Curie"),
     }
 
 
@@ -11241,7 +11185,7 @@ class XPostTool(Tool):
 
 
 # ---------------------------------------------------------------------------
-# Self-modification tools. These let Maxwell rewrite its own base
+# Self-modification tools. These let Dame Curie rewrite its own base
 # personality + per-server prompts at runtime. The runtime load is hot —
 # _load_control() reads mtime, so a write to bot_control.json is picked up
 # on the next prompt assembly without a restart. server prompts are read
@@ -11291,22 +11235,17 @@ class UpdateBasePersonalityTool(Tool):
             )
 
         try:
-            control = dict(self.bot._control)
-            control["base_personality"] = text
-            self.bot._control = control
-            import asyncio
-            from pathlib import Path
+            from prompt_storage import get_prompt_store
 
-            await asyncio.to_thread(
-                _atomic_json_write_sync,
-                Path(self.bot.config.DATA_DIR) / "bot_control.json",
-                control,
-            )
+            store = get_prompt_store(self.bot.config.DATA_DIR)
+            await asyncio.to_thread(store.set_personality, text)
+            if not store.external:
+                self.bot._control["base_personality"] = text
         except Exception as e:
             return f"Error: failed to persist base_personality: {e}"
         return (
             f"base_personality updated. {len(text)} chars written to "
-            "bot_control.json. The change is live on the next turn — no "
+            f"{store.personality_path}. The change is live on the next turn — no "
             "restart needed. MAXWELL_BASE_KNOWLEDGE (in code) was NOT "
             "touched; only the per-runtime personality paragraph was rewritten."
         )
@@ -11316,7 +11255,7 @@ class UpdateServerPromptTool(Tool):
     """Rewrite the per-server custom prompt (same as `,prompt <text>`).
 
     Same effect as the `,prompt <text>` command but invokable from
-    inside an LLM turn — Maxwell can edit its own per-server instructions
+    inside an LLM turn — Dame Curie can edit its own per-server instructions
     when it has a reason. Pass server_id (numeric snowflake) or pass 'DM'
     for the DM default. Pass empty text to clear the per-server prompt.
     """
@@ -11383,16 +11322,16 @@ _CHESS_MENTION_RE = re.compile(r"<@!?(\d+)>")
 
 
 def _chess_bot_name(bot=None) -> str:
-    """Live people-facing name for this process (Maxwell, Uni, a nick, …)."""
+    """Live people-facing name for this process (Dame Curie, Uni, a nick, …)."""
     user = getattr(bot, "user", None) if bot is not None else None
     name = getattr(bot, "bot_name", None) if bot is not None else None
     name = str(
         name
         or getattr(user, "display_name", None)
         or getattr(user, "name", None)
-        or "Maxwell"
+        or "Dame Curie"
     ).strip()
-    return name or "Maxwell"
+    return name or "Dame Curie"
 
 
 def _chess_user_label(user) -> str:
@@ -11590,13 +11529,13 @@ def _chess_render_safe(game) -> bytes | None:
 def _chess_state_text(game, bot_name: str | None = None) -> str:
     """The board + metadata the model needs to play, as plain text.
 
-    When it is Maxwell's turn this is his entire view of the position, because
+    When it is Dame Curie's turn this is his entire view of the position, because
     he now picks the move himself instead of delegating to the search. A bare
     SAN list is not enough for that: the annotations say what each move
     captures, whether it checks or mates, and whether the piece lands on a
     square where it is simply taken.
     """
-    name = str(bot_name or "").strip() or "Maxwell"
+    name = str(bot_name or "").strip() or "Dame Curie"
     lines: list[str] = []
     lines.append("CHESS BOARD (text — see attached image for the real board):")
     lines.append(_chess_board_ascii(game.board))
@@ -11618,7 +11557,7 @@ def _chess_state_text(game, bot_name: str | None = None) -> str:
     lines.append(f"It is {who}'s move.")
 
     if game.bot_turn:
-        # Maxwell's own turn: give him the annotated position, all of it. The
+        # Dame Curie's own turn: give him the annotated position, all of it. The
         # legal list is not truncated here — a move he cannot see is a move he
         # cannot play, and in a sharp position the cut-off 49th move is
         # sometimes the only one that does not lose.
@@ -11721,7 +11660,7 @@ async def _chess_record(bot, message, text: str) -> None:
         logger.debug("Failed to record tool output in channel memory: %s", e)
 
 
-# game_id -> consecutive illegal/absent moves on Maxwell's own turn. Maxwell
+# game_id -> consecutive illegal/absent moves on Dame Curie's own turn. Dame Curie
 # picks his own moves now, so the failure mode to protect against is a game
 # wedged forever because he keeps naming a move that is not legal. After
 # _CHESS_MAX_MISSES tries the local search plays one move so the game advances;
@@ -11833,7 +11772,7 @@ class ChessStartTool(Tool):
             return "Error: bot_side must be 'white', 'black', or 'auto'."
 
         # depth/jitter only ever reach the local search, which is now just the
-        # wedge-breaker for when Maxwell repeatedly fails to name a legal move.
+        # wedge-breaker for when Dame Curie repeatedly fails to name a legal move.
         # Kept accepted-but-clamped so an old caller passing depth= is not an
         # error, and stored on the game so the fallback still has settings.
         max_depth = int(depth or 3)
@@ -11851,7 +11790,7 @@ class ChessStartTool(Tool):
             jitter=0.35,
         )
 
-        # Maxwell plays his own chess. If he has the white side he does NOT get
+        # Dame Curie plays his own chess. If he has the white side he does NOT get
         # an engine move dropped in here — the tool returns the annotated
         # position and he names his own opening move on the follow-up turn
         # (chess_start is in RESULT_TOOL_NAMES, so that turn always happens).
@@ -11963,7 +11902,7 @@ class ChessMoveTool(Tool):
         engine_fallback = False
         try:
             if game.bot_turn:
-                # Maxwell's own turn. He names the move; the local search is
+                # Dame Curie's own turn. He names the move; the local search is
                 # only reached after repeated failures to name a legal one, so
                 # a game can never wedge on his turn.
                 if move:
@@ -12012,7 +11951,7 @@ class ChessMoveTool(Tool):
 
         if error_text:
             if game.bot_turn:
-                # An illegal move from Maxwell himself: hand back the position
+                # An illegal move from Dame Curie himself: hand back the position
                 # so the next attempt is informed, and count it toward the
                 # fallback so a stubborn loop still ends in a played move.
                 misses = _chess_note_miss(game.game_id)
@@ -12024,7 +11963,7 @@ class ChessMoveTool(Tool):
                 )
             return f"Error: {error_text}"
 
-        # The human just moved and it is now Maxwell's turn. Do not pick his
+        # The human just moved and it is now Dame Curie's turn. Do not pick his
         # move here — chess_move returns its result to the model, so he plays
         # it himself on the follow-up turn with the annotated position in hand.
         bot_to_move = respond and game.bot_turn and not game.is_over
@@ -12302,11 +12241,11 @@ class UsageTool(Tool):
 
 
 class ManagePluginTool(Tool):
-    """Manage Maxwell modular plugins (enable, disable, list, status)."""
+    """Manage Dame Curie modular plugins (enable, disable, list, status)."""
 
     def get_description(self):
         return (
-            "Manage Maxwell modular plugins. Params: action (required: 'list', 'enable', 'disable', 'status'), "
+            "Manage Dame Curie modular plugins. Params: action (required: 'list', 'enable', 'disable', 'status'), "
             "plugin (optional, plugin name), user_id (optional, user ID or @mention), "
             "is_global (optional boolean, enable/disable plugin globally - requires admin)."
         )
@@ -12333,7 +12272,7 @@ class ManagePluginTool(Tool):
             plugins = pm.list_plugins(user_id=author_id)
             if not plugins:
                 return "No plugins currently installed in plugins/."
-            lines = ["**Installed Maxwell Plugins:**"]
+            lines = ["**Installed Dame Curie Plugins:**"]
             for p in plugins:
                 glob = "🌐 GLOBAL" if p["enabled_globally"] else "🔒 PER-USER"
                 status = (
@@ -12362,7 +12301,7 @@ class ManagePluginTool(Tool):
         # Admin gate check for global modifications
         if is_global:
             if not is_admin:
-                return "Error: Modifying global plugin status requires Maxwell admin permissions."
+                return "Error: Modifying global plugin status requires Dame Curie admin permissions."
 
         target_user = user_id
         if target_user:
