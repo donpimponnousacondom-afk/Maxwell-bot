@@ -79,13 +79,8 @@ def _bool_env(name: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _json_env(name: str) -> dict:
-    """A JSON object out of an env var, or {} — a typo never stops startup.
-
-    Used for the small override maps (X path templates). A malformed value
-    is worth a log line at first use, not a crash on import, so it degrades
-    to "no overrides".
-    """
+def _json_env(name: str, *, strict: bool = False) -> dict:
+    """Read a JSON object; strict request options fail closed on malformed input."""
     raw = os.getenv(name, "").strip()
     if not raw:
         return {}
@@ -94,8 +89,12 @@ def _json_env(name: str) -> dict:
 
         value = json.loads(raw)
     except (TypeError, ValueError):
+        if strict:
+            raise ValueError(f"{name} must be a valid JSON object") from None
         print(f"warning: {name} is not valid JSON — ignoring it", file=sys.stderr)
         return {}
+    if strict and not isinstance(value, dict):
+        raise ValueError(f"{name} must be a JSON object")
     return value if isinstance(value, dict) else {}
 
 
@@ -206,6 +205,8 @@ class Config:
     OLLAMA_TOP_P = _float_env("OLLAMA_TOP_P", 0.95, min_value=0.0, max_value=1.0)
     OLLAMA_TOP_K = _int_env("OLLAMA_TOP_K", 20, min_value=0)
     OLLAMA_DISABLE_REASONING = _bool_env("OLLAMA_DISABLE_REASONING", False)
+    OLLAMA_EXTRA_HEADERS = _json_env("OLLAMA_EXTRA_HEADERS", strict=True)
+    OLLAMA_EXTRA_BODY = _json_env("OLLAMA_EXTRA_BODY", strict=True)
     OLLAMA_FALLBACK_BASE_URL = os.getenv("OLLAMA_FALLBACK_BASE_URL", "").strip()
     OLLAMA_FALLBACK_API_KEY = os.getenv("OLLAMA_FALLBACK_API_KEY", "").strip()
     OLLAMA_FALLBACK_MODEL = os.getenv("OLLAMA_FALLBACK_MODEL", "").strip()

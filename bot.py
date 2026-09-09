@@ -3404,6 +3404,8 @@ class MaxwellBot(commands.Bot):
             top_p=self.config.OLLAMA_TOP_P,
             top_k=self.config.OLLAMA_TOP_K,
             api_key=self.config.OLLAMA_API_KEY,
+            extra_headers=self.config.OLLAMA_EXTRA_HEADERS,
+            extra_body=self.config.OLLAMA_EXTRA_BODY,
             disable_reasoning=self.config.OLLAMA_DISABLE_REASONING,
             fallback_base_url=self.config.OLLAMA_FALLBACK_BASE_URL,
             fallback_model=self.config.OLLAMA_FALLBACK_MODEL,

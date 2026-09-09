@@ -1,5 +1,13 @@
 # Current implementation and deployment status
 
+## Implemented, not deployed — primary request options (2026-09-09)
+
+- Added `OLLAMA_EXTRA_BODY` and `OLLAMA_EXTRA_HEADERS` as strict JSON-object configuration for the main client's primary endpoint. Enables OpenRouter `provider.only` and explicit `reasoning.effort` without changing account/workspace-wide routing. Runtime fields and explicit reasoning-disable calls retain precedence; API-key Authorization wins case-insensitively.
+- Primary options are not sent to fallback/vision or separately constructed background clients. Shared main-client background calls inherit them; nested request bodies are independently copied for each attempt. Malformed configuration fails closed without printing its contents; existing lenient X override parsing is unchanged.
+- Focused implementation evidence: **43 passed** in a source-only isolated snapshot on Python3.14.4, mocked transports, disabled dotenv, clean synthetic roots, private-read guard and loopback-only network namespace. Scoped Ruff checks pass. Complete exact-commit regression is pending below the initial implementation milestone.
+- No production configuration/model/credential/reasoning changes, image builds or restarts. Running image remains `3229a84`; it does **not** implement these new options. Image rebuild and an explicitly authorized deployment are required before the production bot can use them. Main/autonomy reasoning remains not explicitly disabled with no requested effort; auxiliary calls request reasoning disabled.
+- Configuration examples and precedence: [configuration guide](CONFIGURATION.md#custom-request-options-and-openrouter-routing) and `.env.example`.
+
 ## Deployed — 2026-09-09
 
 **Curie is running in her private rootless Docker stack.** Real Discord login matches the original identity; the existing chat provider initialized successfully. The authenticated dashboard reports online from a fresh Discord snapshot. First successful live check: 1174/1174 trusted embeddings, zero pending, zero container restarts and zero error-level startup log lines. Bot activation and memory storage remain enabled. Counts naturally change during operation.

@@ -71,6 +71,33 @@ OLLAMA_MODEL=the-loaded-model-name
 OLLAMA_API_KEY=
 ```
 
+## Custom request options and OpenRouter routing
+
+`OLLAMA_EXTRA_BODY` and `OLLAMA_EXTRA_HEADERS` accept JSON objects, defaulting to `{}`. Header values must be strings. Invalid JSON/non-object values stop startup rather than silently dropping routing restrictions. These options require an application image built from the updated source and a bot restart; changing only the production `.env` does not update an older image.
+
+For per-request DeepInfra routing without account/workspace-wide provider changes:
+
+```ini
+OLLAMA_BASE_URL=https://openrouter.ai/api/v1
+OLLAMA_MODEL=openai/gpt-oss-120b:nitro
+OLLAMA_DISABLE_REASONING=false
+OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]}}'
+OLLAMA_EXTRA_HEADERS={}
+```
+
+Keep the existing OpenRouter key in `OLLAMA_API_KEY`. Provider selection is a **body** field, not a header. Availability and account-level restrictions still apply; `only` does not override them. See [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection). The base slug `deepinfra` allows its variants; use `deepinfra/turbo` to target that endpoint specifically. `:nitro` prioritizes throughput among eligible endpoints; it is not itself a provider pin.
+
+To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. This is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level and leaves the model/provider default unchanged. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
+For actual custom headers, for example `OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://your-domain.example","X-Title":"Curie"}'`. The configured API key takes precedence over any case variant of `Authorization`.
+
+Scope and precedence:
+
+- Options apply only to the main client's **primary endpoint**, including background/auxiliary calls that reuse that client and primary model overrides. They are not inherited by fallback, vision, or separately constructed autonomy/auxiliary clients—even on the same host. OpenRouter's `provider.only` does not disable Maxwell's separately configured fallback endpoint.
+- Runtime-owned `model`, `messages`, `temperature`, `top_p`, `top_k`, `max_tokens`, `stream`, `stream_options`, `tools` and `tool_choice` take precedence. Use their existing configuration/call arguments rather than extra-body overrides.
+- Each request gets its own copy of the extra body, preserving configured routing through retries without sharing mutable nested state. Existing retry/streaming/telemetry behavior remains authoritative.
+- Headers can contain credentials: keep them in private instance configuration, never source control or public files. Clear endpoint-specific options when changing the main endpoint.
+
 ## Provider retries
 
 `OLLAMA_RETRY_ATTEMPTS` defaults to **5 total attempts** (range 1–10), not five retries. Explicit environment values override this default. Transient failures wait **10, 20, 30, 40 seconds** before attempts 2–5; the delay is linear and also applies when switching endpoints. Deterministic request rejection/failover and corrected-payload retries do not use this backoff, but still consume the fixed attempt budget.
