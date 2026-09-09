@@ -2,13 +2,13 @@
 
 ## Boundary and current verification
 
-See [STATUS.md](STATUS.md) for dated implementation, test and deployment evidence. This guide describes the target and commands; it does not by itself certify a deployed stack. Root has authorized the current rollout recorded there.
+See [STATUS.md](STATUS.md) for dated implementation, test and completed Curie deployment evidence, and [SCREEN_WORKFLOW.md](SCREEN_WORKFLOW.md) for installed-host commands. This operating reference does not itself authorize a new deployment or reconnect.
 
 One Linux service user and **one private rootless Docker engine per bot identity**. Each engine runs bot, API, static web, its own Ollama embedder/model initializer, the shell sandbox, and generated-site backends. Root in an application container is the service user's rootless identity, not host root. The private Docker socket still gives application code authority over that service user's files and containers: do not share an engine, account, supplementary groups, or writable paths between identities.
 
 This deployment does not enable full-host shell access or runtime source mutation. Application/API/web/Ollama and generated-backend root filesystems are read-only; prompts, memory, model cache and generated-site state use separate writable mounts. The persistent shell root filesystem and workspace are writable. The shell container filesystem is disposable: `stop` preserves it; `down` removes it. Put durable shell output in `/home/maxwell`.
 
-Offline tests are available. Private-daemon lifecycle, ACL inheritance, actual image builds, network reachability, and backup/restore against a live rootless engine still require host acceptance testing. Do not interpret Python dependency installation as a successful Docker build. Base image tags and apt repositories are not digest/snapshot pinned; builds are not fully reproducible.
+Each new host requires actual private-daemon lifecycle, ACL, image, network and backup/restore acceptance; the completed current-host evidence is in STATUS.md. Do not equate imports with a Docker build or bot startup. Python/Caddy base tags and apt repositories are not digest/snapshot pinned, so builds are not fully reproducible even though the CLI/Ollama images and Python dependencies are pinned.
 
 ## Layout
 
@@ -41,7 +41,7 @@ Do not replace a working distro Docker package merely to provision another ident
 
 `docker/rootless-docker.service` is the Debian user-service unit. Install it as `~/.config/systemd/user/docker.service`, with the directories owned by the service user (not root). Install `docker/rootless-delegate.conf` into `/etc/systemd/system/user@UID.service.d/maxwell-delegate.conf` **only for the new identity UID**, then reload systemd before starting its lingering user manager. This delegates CPU/cpuset/I/O/memory/PID controllers without restarting or changing unrelated users. Enable the Docker unit via `systemctl --user enable --now docker`. Follow [Docker's rootless systemd/cgroup guidance](https://docs.docker.com/engine/security/rootless/tips/); never run it as a system-wide `User=` Docker service.
 
-Verify `docker info` reports both `name=rootless` and `CgroupDriver=systemd`, and run an actual resource-limited container. Private engines on this host use `/run/user/1003/docker.sock` (curie) and `/run/user/1004/docker.sock` (synthetic acceptance). Those UIDs are host evidence, not portable constants.
+Verify `docker info` reports both `name=rootless` and `CgroupDriver=systemd`, and run an actual resource-limited container. Provisioned engines on this host use `/run/user/1003/docker.sock` (curie) and `/run/user/1004/docker.sock` (synthetic acceptance, now stopped with lingering disabled). Those UIDs are host evidence, not portable constants.
 
 ### Fresh official Docker installations
 
@@ -78,7 +78,7 @@ Copy `docker/deploy.env.example` and `docker/bot.env.example` into the indicated
 
 Compose provisions `qwen3-embedding:0.6b` in a private per-project model volume using pinned Ollama 0.33.3. `ollama-pull` alone has registry egress and runs a loopback-only temporary server; it skips an already-present model and exits. The runtime `ollama` service joins only the internal embeddings network, with no published ports. Bot/API perform a real finite nonzero 1024-vector check before starting; explicit `ENABLE_RAG=false` skips that embedding request. See [CONFIGURATION.md](CONFIGURATION.md#compartmentalized-deployment-and-rag) for cache identity and bounded backfill.
 
-Caddy serves `/admin/` and proxies `/api/` on `127.0.0.1:WEB_PORT`. Both admin variables must be set; keep authentication enabled. The image removes Caddy's upstream `cap_net_bind_service` file capability because it listens on unprivileged port 8080 with all capabilities dropped. Otherwise Linux refuses to execute it under that bounding set. The web HTTP healthcheck and `instance.py up`'s `--wait --wait-timeout 300` prevent a successful creation command being mistaken for a healthy dashboard.
+Caddy serves `/admin/` and proxies `/api/` on `127.0.0.1:WEB_PORT`. Both admin variables must be set; keep authentication enabled. The image removes Caddy's upstream `cap_net_bind_service` file capability because it listens on unprivileged port 8080 with all capabilities dropped. Otherwise Linux refuses to execute it under that bounding set. The web HTTP healthcheck and `instance.py up`'s `--wait --wait-timeout 300` prevent a successful creation command being mistaken for a healthy dashboard. They do not prove Discord login: independently verify a fresh online snapshot, provider startup and restart count. The application must also pass actual bot construction under read-only restrictions; imports missed the repaired plugin-state path bug.
 
 Use the original configured dashboard credentials; do not paste them into chats or command arguments. For a remote host, forward the instance port over SSH and open `http://localhost:8081/admin/` (substitute its port). This deployment does not silently publish a public origin; configure an authenticated TLS reverse proxy explicitly before advertising externally reachable generated-site links.
 
@@ -183,8 +183,8 @@ Normal exceptions roll back published target files. A kill or power loss is not 
 
 1. Offline tests pass; inspect the image source allowlist and verify no runtime/secret files enter build contexts.
 2. Each service user sees only its own rootless engine; another user's socket/state is inaccessible.
-3. Build/pull app and web images; record tags/digests and verify optional feature imports in the image.
-4. Start one test identity; verify health, dashboard auth, prompt editing, model configuration reload, and voice scratch without real-channel side effects.
+3. Build/pull app and web images; record frozen provenance and verify optional imports **and actual `MaxwellBot()` construction/closure** in a read-only, networkless image with synthetic state. Do not call login/start/provider initialization.
+4. Start test API/web/Ollama services with synthetic configuration, not a second real Discord login; verify health, dashboard auth, prompt editing, model configuration reload, and local voice/browser scratch without real-channel side effects.
 5. Create a test shell workspace and site backend; confirm source read-only, `/data` writable, per-instance networking, and ownership labels.
 6. Verify `stop`, `restart`, and `down` semantics; verify a second identity is untouched.
 7. Backup test state with a UID10001-owned file; restore into a fresh same-ID test target, reapply ACLs, and compare numeric ownership and contents before using real state.

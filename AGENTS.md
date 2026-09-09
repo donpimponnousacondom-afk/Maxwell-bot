@@ -6,12 +6,12 @@ This is `dame_curie`, a Maxwell side project. Preserve Maxwell code, path, API a
 
 - [Current implementation and deployment status](docs/STATUS.md) is the single current-state ledger. Update it after every material implementation or acceptance milestone.
 - [Rootless per-identity deployment](docs/DOCKER.md) is the target architecture and operating reference, not proof of deployment.
-- [Shared Screen workflow](docs/SCREEN_WORKFLOW.md) documents the legacy host-native deployment and rollback controls.
+- [Shared Screen workflow](docs/SCREEN_WORKFLOW.md) documents current rootless lifecycle/log-following and rollback controls. Ctrl-c in Screen stops the log follower, not the containerized bot.
 - Historical audit/changelog content is preserved in Git at `96b4803:AGENTS.md`. It is evidence of past observations, not current authority. In particular arbitrary shell `docker cp` exports were removed in `6fa80e8`; do not report them as an outstanding current defect.
 
 ## Active authorization
 
-Root has explicitly authorized completing and validating the isolated Docker/Ollama/dashboard deployment, including host prerequisites and a safe cutover, without clarification questions while away. Root stopped the existing Screen process. Verify that remains true before migration; never run two bots with the same identity or two writers against one state directory.
+Root explicitly authorized and completed the isolated Docker/Ollama/dashboard rollout on 2026-09-09. The real identity now runs once in Compose; the original host-native bot remains stopped. Current image/test/runtime evidence is in `docs/STATUS.md`. Never launch a second bot with the same identity or another application's writer against its state. A later deployment or restart still needs task-specific authority; this completed rollout is not perpetual permission to reconnect the bot.
 
 The approved target is **one Linux service user, private rootless Docker engine and Compose project per bot identity**. Each identity has private credentials, prompts, memory, generated sites, shell workspace and Ollama model storage/service. Shared source/images do not imply shared memories. Do not substitute a shared rootful Docker daemon or PM2 for this boundary.
 
