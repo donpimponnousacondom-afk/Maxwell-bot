@@ -19,6 +19,28 @@ The installer writes `.env` from `.env.example` and updates only the keys it ask
 
 See [`.env.example`](../.env.example) for the full set of advanced knobs, including embeddings, dashboard host/port, TTS, X/Twitter, email, captcha solving, and tool-specific limits.
 
+## Compartmentalized deployment and RAG
+
+The host-native installer above is not the rootless deployment manager. See [DOCKER.md](DOCKER.md) for private per-identity bot/API/web/Ollama services and [STATUS.md](STATUS.md) for current acceptance evidence. Container configuration lives in private `/srv/maxwell/<id>/config/bot.env`; environment changes require bot/API restart, whereas supported external prompt edits reload live.
+
+Chat and embedding configuration are independent. Keep the existing chat `OLLAMA_BASE_URL`, model and API key when enabling the private embedder:
+
+```ini
+ENABLE_RAG=true
+MAXWELL_EMBED_BASE_URL=http://ollama:11434
+MAXWELL_EMBED_MODEL=qwen3-embedding:0.6b
+MAXWELL_EMBED_DIM=1024
+MAXWELL_EMBED_API_KEY=
+```
+
+Those DNS names apply inside the instance, not to host-native Python. Ollama has no published host port; only the instance bot/API network can reach its runtime. The separate initialization container downloads the model, then exits. The persistent model volume survives normal `down`, but is a re-downloadable cache, not a memory backup.
+
+Vectors and the durable embedding cache are tagged by endpoint/model/dimension/input-derivation identity. Legacy untagged vectors, other backends and malformed vectors are excluded from semantic retrieval, **without deleting raw memory**. Changing the model or endpoint requires explicit re-embedding; never label existing vectors as if they came from the new model. Merely renaming a model does not prove its weights are unchanged.
+
+`rag_maintenance.py status --db /state/data/maxwell_rag.db` reports counts only. `backfill --db /state/data/maxwell_rag.db --limit 100 --batch-size 4 --max-seconds 60` performs a bounded resumable pass using the same validated client. Invoke these inside the matching configured application image, not an unrelated host venv. `eligible_pending == 0` means all eligible rows are complete; raw `pending` also includes intentionally excluded empty/low-signal events. `ENABLE_RAG=false` sends no embedding requests. The legacy `MAXWELL_EMBED_PENDING_ON_BOOT=true` hook performs one bounded pass, not an unlimited startup migration.
+
+Run `doctor.py --probe` only when live provider requests are intended: it probes chat as well as embeddings. Its embedding check requires a correctly sized finite nonzero vector, not merely HTTP 200. For embedding-only acceptance use the explicit maintenance path or deployment readiness check instead.
+
 ## Common provider snippets
 
 ```ini

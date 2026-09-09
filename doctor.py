@@ -145,7 +145,7 @@ def check_docker(cfg) -> None:
     except (OSError, subprocess.SubprocessError) as e:
         line("warn", "docker not usable", f"{type(e).__name__}: {e}")
         return
-    if proc.returncode == 0:
+    if proc.returncode == 0 and proc.stdout.strip() and not proc.stderr.strip():
         line("ok", "docker daemon reachable", f"server {proc.stdout.strip()}")
     else:
         detail = (proc.stderr or proc.stdout).strip().splitlines()
@@ -220,22 +220,31 @@ async def _probe_chat(cfg) -> tuple[str, str]:
 async def _probe_embeddings(cfg) -> tuple[str, str]:
     import aiohttp
 
-    from rag_memory import EMBED_HEADERS, EMBED_MODEL, EMBED_URL
+    from rag_memory import _embed_endpoint, validate_embedding_response
 
+    if not cfg.ENABLE_RAG:
+        return "warn", "disabled (ENABLE_RAG=false); no request sent"
+    url = _embed_endpoint(cfg.EMBED_BASE_URL)
+    headers = {"Authorization": f"Bearer {cfg.EMBED_API_KEY}"} if cfg.EMBED_API_KEY else {}
+    state, detail = "warn", "embedding probe failed"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                EMBED_URL,
-                json={"model": EMBED_MODEL, "input": "maxwell doctor probe"},
-                headers=EMBED_HEADERS,
+                url,
+                json={"model": cfg.EMBED_MODEL, "input": "maxwell doctor probe"},
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                body = await resp.text()
-                if resp.status < 400:
-                    return "ok", f"{EMBED_MODEL} @ {EMBED_URL}"
-                return "warn", f"HTTP {resp.status} from {EMBED_URL}: {body[:120]}"
-    except Exception as e:
-        return "warn", f"{type(e).__name__}: {e}"
+                if resp.status == 200:
+                    validate_embedding_response(await resp.json(), cfg.EMBED_DIM)
+                    state, detail = "ok", f"{cfg.EMBED_MODEL}: valid {cfg.EMBED_DIM}-dim embedding"
+                else:
+                    detail = f"HTTP {resp.status}; check the embedding endpoint/model/auth"
+    except (ValueError, TypeError, OverflowError):
+        detail = f"invalid embedding response; expected one finite nonzero {cfg.EMBED_DIM}-dim vector"
+    except (aiohttp.ClientError, OSError, TimeoutError) as exc:
+        detail = f"{type(exc).__name__}; check the embedding endpoint"
+    return state, detail
 
 
 def probe(cfg) -> None:

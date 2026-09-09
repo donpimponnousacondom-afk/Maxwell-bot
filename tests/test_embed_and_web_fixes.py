@@ -51,13 +51,8 @@ def _unit_vec(seed: int) -> np.ndarray:
 # ─── 1. embed_cache seeding ──────────────────────────────────────────
 
 
-def test_embed_cache_seed_skips_legacy_truncated_rows(tmp_path, monkeypatch):
-    """Rows over the old 8000-char cutoff must not be seeded into the cache.
-
-    Their stored vector came from truncated text, so caching it under the
-    full-text key would hand _embed() a vector that does not correspond
-    to the text it was asked to embed.
-    """
+def test_embed_cache_skips_legacy_vectors_of_unknown_identity(tmp_path, monkeypatch):
+    """Neither short nor truncated legacy rows establish a trusted vector space."""
     mgr = RAGMemoryManager(str(tmp_path))
     short = "s" * 100
     long = "L" * (LEGACY_EMBED_TRUNCATE + 5000)
@@ -87,24 +82,14 @@ def test_embed_cache_seed_skips_legacy_truncated_rows(tmp_path, monkeypatch):
             > 0
         )
 
-    assert _has(short_key), "short row should seed the cache under its full-text key"
+    assert not _has(short_key), "short vectors also have unknown model identity"
     assert not _has(long_key), "legacy-truncated long row must NOT be seeded"
-    # The long row must contribute NO cache entry at all. Checking only the
-    # full-text key would pass even with the old [:8000] seed, which wrote a
-    # never-matched key rather than writing nothing.
     total = mgr2._db.execute("SELECT COUNT(*) AS c FROM embed_cache").fetchone()["c"]
-    assert total == 1, (
-        f"expected only the short row cached, got {total} entries — "
-        "the long row was seeded under an unreachable key"
-    )
+    assert total == 0
 
 
-def test_embed_cache_seed_key_matches_embed_lookup(tmp_path, monkeypatch):
-    """A seeded short row must actually produce a cache HIT in _embed().
-
-    This is the bug that made the seed dead weight: the seed wrote one key
-    and _embed() looked up a different one, so the embed API was hit anyway.
-    """
+def test_unknown_vector_cannot_produce_a_cache_hit(tmp_path, monkeypatch):
+    """A legacy vector needs re-embedding, not adoption under today's model name."""
     content = "the quick brown fox jumps over the lazy dog"
     vec = _unit_vec(7)
     mgr = RAGMemoryManager(str(tmp_path))
@@ -120,15 +105,17 @@ def test_embed_cache_seed_key_matches_embed_lookup(tmp_path, monkeypatch):
 
     mgr2 = RAGMemoryManager(str(tmp_path))
 
-    # Any HTTP attempt means the cache missed.
-    def _boom(*a, **k):
-        raise AssertionError("embed API called — cache seed did not match lookup")
+    calls = []
 
-    monkeypatch.setattr(rag_memory.aiohttp, "ClientSession", _boom)
+    def _offline(*a, **k):
+        calls.append(True)
+        raise OSError("offline test endpoint")
+
+    monkeypatch.setattr(rag_memory.aiohttp, "ClientSession", _offline)
 
     got = _run(mgr2._embed(content))
-    assert got is not None
-    assert np.allclose(got, vec, atol=1e-6)
+    assert got is None
+    assert calls == [True]
 
 
 # ─── 2/3. batch migration path ───────────────────────────────────────

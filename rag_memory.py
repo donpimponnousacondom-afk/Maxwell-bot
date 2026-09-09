@@ -19,6 +19,7 @@ minimal — same method names, same return shapes.
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -58,7 +59,9 @@ except Exception:  # pragma: no cover - config import failure is not fatal here
     EMBED_DIM = int(os.getenv("MAXWELL_EMBED_DIM", "1024"))
     EMBED_API_KEY = os.getenv("MAXWELL_EMBED_API_KEY", "")
     EMBED_BASE_URL = os.getenv("MAXWELL_EMBED_BASE_URL", "http://localhost:11434")
-    EMBEDDINGS_ENABLED = True
+    EMBEDDINGS_ENABLED = os.getenv("ENABLE_RAG", "true").strip().lower() not in {
+        "0", "false", "no", "off"
+    }
 
 
 def _embed_endpoint(base_url: str) -> str:
@@ -97,13 +100,19 @@ def _extract_embeddings(data: dict) -> list[list[float]]:
     # OpenAI: {"data": [{"embedding": [...], "index": 0}, ...]}
     items = data.get("data")
     if isinstance(items, list) and items:
-        out = [
-            item["embedding"]
+        if not all(
+            isinstance(item, dict) and isinstance(item.get("embedding"), list)
             for item in items
-            if isinstance(item, dict) and isinstance(item.get("embedding"), list)
-        ]
-        if out:
-            return out
+        ):
+            return []
+        if any("index" in item for item in items):
+            indices = [item.get("index") for item in items]
+            if not all(type(index) is int for index in indices):
+                return []
+            if sorted(indices) != list(range(len(items))):
+                return []
+            items = sorted(items, key=lambda item: item["index"])
+        return [item["embedding"] for item in items]
     return []
 
 
@@ -157,6 +166,108 @@ EMBED_CHUNK_OVERLAP = 200
 # vectorized from text[:8000], so their cached vectors are NOT valid under the
 # current full-text/chunked derivation. Only used to detect legacy rows.
 LEGACY_EMBED_TRUNCATE = 8000
+
+def embedding_backend_id(
+    endpoint: str | None = None, model: str | None = None, dimension: int | None = None
+) -> str:
+    """Fingerprint the vector space and input derivation, never the API key."""
+    specification = [
+        _embed_endpoint(EMBED_URL if endpoint is None else endpoint),
+        EMBED_MODEL if model is None else model,
+        EMBED_DIM if dimension is None else dimension,
+        "normalized-mean-pool-v2",
+        EMBED_MAX_CHARS,
+        EMBED_CHUNK_OVERLAP,
+    ]
+    return hashlib.sha256(json.dumps(specification).encode()).hexdigest()
+
+
+def validate_embedding(vector, dimension: int) -> np.ndarray:
+    """Validate one finite, nonzero numeric vector and return normalized float32."""
+    values = np.asarray(vector)
+    if values.shape != (dimension,):
+        raise ValueError(f"expected a one-dimensional vector of length {dimension}")
+    if values.dtype.kind not in "iuf" or any(
+        isinstance(value, (bool, np.bool_)) for value in vector
+    ):
+        raise ValueError("embedding values must be numbers")
+    if not np.isfinite(values).all():
+        raise ValueError("embedding values must be finite")
+    if np.max(np.abs(values.astype(np.float64))) > np.finfo(np.float32).max:
+        raise ValueError("embedding values exceed float32 range")
+    norm = np.linalg.norm(values.astype(np.float64))
+    if norm == 0:
+        raise ValueError("embedding must be nonzero")
+    return (values / norm).astype(np.float32)
+
+
+def validate_embedding_response(
+    data: dict, dimension: int, count: int = 1
+) -> list[np.ndarray]:
+    """Reject partial, malformed or misindexed Ollama/OpenAI embedding responses."""
+    if not isinstance(data, dict) or data.get("error") is not None:
+        raise ValueError("embedding response is not a successful object")
+    vectors = _extract_embeddings(data)
+    if len(vectors) != count:
+        raise ValueError(f"expected {count} embedding vector(s), received {len(vectors)}")
+    return [validate_embedding(vector, dimension) for vector in vectors]
+
+
+def embedding_blob_valid(blob: bytes, dimension: int) -> bool:
+    """Check stored vectors without trusting their backend tag or byte length alone."""
+    if not isinstance(blob, bytes) or len(blob) != dimension * 4:
+        return False
+    vector = np.frombuffer(blob, dtype=np.float32)
+    return bool(np.isfinite(vector).all() and np.any(vector))
+
+
+def embedding_eligible(kind: str, source: str, content: str) -> bool:
+    """Keep raw chat noise unembedded without excluding system-authored durable facts."""
+    eligible = bool(content.strip())
+    if kind in {"message", "bot_output"}:
+        eligible = source != "system" and len(_strip_for_embedding(content)) >= _MIN_EMBED_LEN
+    return eligible
+
+
+def embedding_status(
+    db: sqlite3.Connection, backend: str | None = None, dimension: int | None = None
+) -> dict:
+    """Read counts only, including legacy schemas; never migrate or contact a service."""
+    backend = embedding_backend_id() if backend is None else backend
+    dimension = EMBED_DIM if dimension is None else dimension
+    columns = {row[1] for row in db.execute("PRAGMA table_info(vectors)")}
+    if not {"kind", "content", "embedding"} <= columns:
+        raise ValueError("database has no RAG vectors table")
+    tag = "embedding_backend" if "embedding_backend" in columns else "''"
+    source = "source" if "source" in columns else "'user'"
+    eligible = f"embedding_eligible(kind, {source}, content)"
+    db.create_function("embedding_valid", 1, lambda blob: embedding_blob_valid(blob, dimension))
+    db.create_function("embedding_eligible", 3, embedding_eligible)
+    counts = db.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(embedding IS NULL), 0), "
+        f"COALESCE(SUM(embedding IS NOT NULL AND COALESCE({tag}, '') != ?), 0), "
+        f"COALESCE(SUM(embedding IS NOT NULL AND {tag} = ? AND NOT embedding_valid(embedding)), 0), "
+        f"COALESCE(SUM(NOT {eligible}), 0), "
+        f"COALESCE(SUM({eligible} AND (embedding IS NULL OR COALESCE({tag}, '') != ? "
+        f"OR NOT embedding_valid(embedding))), 0) FROM vectors",
+        (backend, backend, backend),
+    ).fetchone()
+    total, unembedded, stale, invalid, excluded, eligible_pending = counts
+    return {
+        "enabled": EMBEDDINGS_ENABLED,
+        "backend": backend,
+        "dimension": dimension,
+        "total": total,
+        "embedded": total - unembedded - stale - invalid,
+        "pending": unembedded + stale + invalid,
+        "eligible_pending": eligible_pending,
+        "excluded": excluded,
+        "excluded_pending": unembedded + stale + invalid - eligible_pending,
+        "unembedded": unembedded,
+        "stale": stale,
+        "invalid": invalid,
+    }
+
 
 # Recency decay (seconds). 14 days. Score multiplied by exp(-age/tau).
 RECENCY_TAU_SECONDS = 14 * 86400.0
@@ -613,10 +724,21 @@ class RAGMemoryManager:
       - rag_relevant_context(query, channel_id, top_k) -> list[dict]
     """
 
-    def __init__(self, data_dir: str, max_messages: int = 10000):
+    def __init__(
+        self, data_dir: str, max_messages: int = 10000, *, db_path: Path | None = None
+    ):
         self.data_dir = Path(data_dir)
         self.max_messages = min(max_messages, 10000)
-        self.db_path = self.data_dir / "maxwell_rag.db"
+        self.db_path = self.data_dir / "maxwell_rag.db" if db_path is None else Path(db_path)
+        self._maintenance_only = db_path is not None
+        self.embed_url = EMBED_URL
+        self.embed_model = EMBED_MODEL
+        self.embed_dim = EMBED_DIM
+        self.embed_headers = dict(EMBED_HEADERS)
+        self.embedding_backend = embedding_backend_id(
+            self.embed_url, self.embed_model, self.embed_dim
+        )
+        self._backfill_lock = asyncio.Lock()
         from prompt_storage import get_prompt_store
 
         self.prompt_store = get_prompt_store(self.data_dir)
@@ -650,7 +772,7 @@ class RAGMemoryManager:
 
     def _spawn(self, coro) -> asyncio.Task | None:
         """Create a bounded, tracked background task for embed work."""
-        if self._embed_endpoint_paused():
+        if not EMBEDDINGS_ENABLED or self._embed_endpoint_paused():
             with contextlib.suppress(Exception):
                 coro.close()
             return None
@@ -671,7 +793,16 @@ class RAGMemoryManager:
         return task
 
     def _init_db(self):
-        """Create SQLite DB and tables."""
+        """Create SQLite DB and tables; explicit maintenance opens only the given DB."""
+        if self._maintenance_only:
+            self._db = sqlite3.connect(
+                self.db_path.resolve().as_uri() + "?mode=rw",
+                uri=True,
+                isolation_level=None,
+            )
+            self._db.row_factory = sqlite3.Row
+            self._init_embedding_schema()
+            return
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(
             str(self.db_path),
@@ -829,27 +960,7 @@ class RAGMemoryManager:
                 "ON vectors(kind, channel_id, content_hash) WHERE content_hash != ''"
             )
 
-        # ─── persistent embedding cache ────────────────────────────────
-        # Survives restart. Indexed on (key, dim) for O(log n) point lookups.
-        # Text inputs are normalized before hashing (strip whitespace) so
-        # the same content embedded twice hits the same cache slot.
-        self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS embed_cache (
-                key TEXT NOT NULL,
-                dim INTEGER NOT NULL,
-                embedding BLOB NOT NULL,
-                created_at REAL NOT NULL,
-                last_used_at REAL NOT NULL,
-                hits INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (key, dim)
-            )
-            """
-        )
-        self._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_embed_cache_used "
-            "ON embed_cache(last_used_at)"
-        )
+        self._init_embedding_schema()
 
         # ─── global user entity memory ─────────────────────────────────
         # One row per Discord user id, independent of guild. Discord ids are
@@ -893,43 +1004,6 @@ class RAGMemoryManager:
 
         self.graph = KnowledgeGraph(self._db)
 
-        # Seed embed_cache from existing rows so the first recall after
-        # upgrade doesn't pay hundreds of cold ollama calls. Cheap (we
-        # already have the blobs in `vectors.embedding`).
-        #
-        # IMPORTANT: this must run AFTER the CREATE TABLE above (it used to
-        # run before, so every INSERT hit "no such table: embed_cache" on a
-        # fresh DB and the seed silently did nothing). The cache key must
-        # also match _embed()'s derivation (sha256 of stripped text) — the
-        # old md5(content) keys never matched lookups, so seeded entries
-        # were dead weight.
-        for r in self._db.execute(
-            "SELECT content, embedding FROM vectors WHERE embedding IS NOT NULL"
-        ).fetchall():
-            try:
-                seed_text = str(r["content"] or "").strip()
-                # The [:8000] that used to be applied here matched _embed()'s
-                # old hard truncation. _embed() now hashes the FULL stripped
-                # text (chunking instead of truncating), so a truncated key
-                # never matches a lookup — every row over the old cutoff was
-                # seeded as dead weight and re-embedded on every restart.
-                # Short rows: key on the full text (identical to the old key).
-                # Long rows: skip entirely — their stored vector came from
-                # truncated text and is not a valid cache entry for the
-                # chunked derivation. They re-embed once, correctly.
-                if not seed_text or len(seed_text) > LEGACY_EMBED_TRUNCATE:
-                    continue
-                key = _hashlib.sha256(seed_text.encode("utf-8")).hexdigest()
-                self._db.execute(
-                    "INSERT OR IGNORE INTO embed_cache "
-                    "(key, dim, embedding, created_at, last_used_at, hits) "
-                    "VALUES (?, ?, ?, ?, 0, 0)",
-                    (key, EMBED_DIM, r["embedding"], time.time()),
-                )
-            except Exception as e:
-                # Backfill is best-effort; a failed seed just means a cache miss.
-                logger.debug("embed_cache backfill row failed: %s", e)
-
         # FTS5/BM25 hybrid search was prototyped but caused DB corruption
         # under concurrent writes (triggers + per-message embedding tasks
         # racing). Removed in favor of pure-cosine retrieval with cache.
@@ -947,6 +1021,43 @@ class RAGMemoryManager:
             f"RAGMemoryManager initialized at {self.db_path} "
             f"({self._count_all()} vectors)"
         )
+
+    def _init_embedding_schema(self) -> None:
+        """Add identity/cursor metadata without rewriting raw memories or trusting old vectors."""
+        columns = {row[1] for row in self._db.execute("PRAGMA table_info(vectors)")}
+        if not {"id", "kind", "content", "metadata", "embedding"} <= columns:
+            raise ValueError("database has no compatible RAG vectors table")
+        if "embedding_backend" not in columns:
+            self._db.execute(
+                "ALTER TABLE vectors ADD COLUMN embedding_backend TEXT NOT NULL DEFAULT ''"
+            )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS embed_cache ("
+            "key TEXT NOT NULL, dim INTEGER NOT NULL, embedding BLOB NOT NULL, "
+            "created_at REAL NOT NULL, last_used_at REAL NOT NULL, "
+            "hits INTEGER NOT NULL DEFAULT 0, backend TEXT NOT NULL DEFAULT '', "
+            "PRIMARY KEY (key, dim))"
+        )
+        cache_columns = {row[1] for row in self._db.execute("PRAGMA table_info(embed_cache)")}
+        if "backend" not in cache_columns:
+            self._db.execute(
+                "ALTER TABLE embed_cache ADD COLUMN backend TEXT NOT NULL DEFAULT ''"
+            )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_embed_cache_used ON embed_cache(last_used_at)"
+        )
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS embed_backfill ("
+            "backend TEXT NOT NULL, kind TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY (backend, kind))"
+        )
+        self._db.create_function(
+            "embedding_valid", 1, lambda blob: embedding_blob_valid(blob, self.embed_dim)
+        )
+
+    def embedding_status(self) -> dict:
+        """Counts for the configured vector space, not every non-NULL blob."""
+        return embedding_status(self._db, self.embedding_backend, self.embed_dim)
 
     def _count_all(self) -> int:
         try:
@@ -1062,7 +1173,7 @@ class RAGMemoryManager:
     async def _embed(self, text: str) -> np.ndarray | None:
         """Generate embedding via ollama, cached on disk to SQLite.
 
-        Cache key is sha256(stripped_text). The cache survives bot
+        Cache key includes the backend identity and full stripped text. It survives bot
         restarts and is shared across processes (admin API, one-off
         scripts) since it lives in the same SQLite db.
 
@@ -1089,23 +1200,25 @@ class RAGMemoryManager:
 
         import hashlib
 
-        cache_key = hashlib.sha256(text.encode()).hexdigest()
+        cache_key = hashlib.sha256(
+            f"{self.embedding_backend}\0{text}".encode()
+        ).hexdigest()
 
         # ─── disk cache hit ─────────────────────────────────────────
         try:
             cached = self._db.execute(
-                "SELECT embedding FROM embed_cache WHERE key=? AND dim=?",
-                (cache_key, EMBED_DIM),
+                "SELECT embedding FROM embed_cache WHERE key=? AND dim=? AND backend=?",
+                (cache_key, self.embed_dim, self.embedding_backend),
             ).fetchone()
             if cached and cached["embedding"]:
-                vec = _blob_to_embedding(cached["embedding"])
-                if len(vec) == EMBED_DIM:
+                if embedding_blob_valid(cached["embedding"], self.embed_dim):
+                    vec = _blob_to_embedding(cached["embedding"])
                     # Bump last_used_at + hits so LRU keeps useful entries.
                     with contextlib.suppress(Exception):
                         self._db.execute(
                             "UPDATE embed_cache SET last_used_at=?, hits=hits+1 "
                             "WHERE key=? AND dim=?",
-                            (time.time(), cache_key, EMBED_DIM),
+                            (time.time(), cache_key, self.embed_dim),
                         )
                     return vec
         except Exception as e:
@@ -1122,51 +1235,27 @@ class RAGMemoryManager:
         # ─── embed (single-chunk fast path vs multi-chunk mean-pool) ───
         try:
             chunk_vecs: list[np.ndarray] = []
-            async with (
-                self._embed_semaphore,
-                aiohttp.ClientSession() as session,
-            ):
-                for ci, chunk_text in enumerate(chunks_to_embed):
-                    payload = {"model": EMBED_MODEL, "input": chunk_text}
-                    async with session.post(
-                        EMBED_URL,
-                        json=payload,
-                        headers=EMBED_HEADERS,
-                        timeout=aiohttp.ClientTimeout(total=EMBED_HTTP_TIMEOUT_SECONDS),
-                    ) as resp:
-                        if resp.status != 200:
-                            body = await resp.text()
-                            # A non-200 is just as persistent as a refused
-                            # connection — a 404 for a model that isn't pulled
-                            # repeats for every single message. Trip the same
-                            # breaker so it's one line per outage, not one per
-                            # embed.
-                            self._trip_embed_breaker(
-                                f"HTTP {resp.status}: {body[:200]}"
-                            )
+            async with self._embed_semaphore:
+                if not EMBEDDINGS_ENABLED or self._embed_endpoint_paused():
+                    return None
+                async with aiohttp.ClientSession() as session:
+                    for chunk_text in chunks_to_embed:
+                        if not EMBEDDINGS_ENABLED:
                             return None
-                        data = await resp.json()
-                        embeddings = _extract_embeddings(data)
-                        if not embeddings:
-                            logger.warning(
-                                f"Embedding API returned no embeddings "
-                                f"(chunk {ci}/{len(chunks_to_embed)})"
-                            )
-                            return None
-                        cv = np.array(embeddings[0], dtype=np.float32)
-                        if len(cv) != EMBED_DIM:
-                            logger.warning(
-                                f"Embedding dimension mismatch on chunk "
-                                f"{ci}: {len(cv)} != {EMBED_DIM}"
-                            )
-                            return None
-                        # L2-normalize each chunk before pooling so the
-                        # mean isn't dominated by whichever chunk happened
-                        # to land at a larger norm.
-                        n = np.linalg.norm(cv)
-                        if n > 1e-8:
-                            cv = cv / n
-                        chunk_vecs.append(cv)
+                        payload = {"model": self.embed_model, "input": chunk_text}
+                        if self.embed_url.endswith("/api/embed"):
+                            payload["truncate"] = False
+                        async with session.post(
+                            self.embed_url,
+                            json=payload,
+                            headers=self.embed_headers,
+                            timeout=aiohttp.ClientTimeout(total=EMBED_HTTP_TIMEOUT_SECONDS),
+                        ) as resp:
+                            if resp.status != 200:
+                                self._trip_embed_breaker(f"HTTP {resp.status}")
+                                return None
+                            data = await resp.json()
+                            chunk_vecs.extend(validate_embedding_response(data, self.embed_dim))
 
             if not chunk_vecs:
                 return None
@@ -1176,9 +1265,7 @@ class RAGMemoryManager:
                 # Mean-pool L2-normalized chunk vectors, re-normalize.
                 stacked = np.stack(chunk_vecs)
                 vec = stacked.mean(axis=0)
-                n = np.linalg.norm(vec)
-                if n > 1e-8:
-                    vec = vec / n
+                vec = validate_embedding(vec, self.embed_dim)
                 logger.debug(
                     f"_embed mean-pooled {len(chunk_vecs)} chunks "
                     f"(text len={len(text)})"
@@ -1188,18 +1275,19 @@ class RAGMemoryManager:
             try:
                 self._db.execute(
                     "INSERT OR REPLACE INTO embed_cache "
-                    "(key, dim, embedding, created_at, last_used_at, hits) "
-                    "VALUES (?, ?, ?, ?, ?, COALESCE("
+                    "(key, dim, backend, embedding, created_at, last_used_at, hits) "
+                    "VALUES (?, ?, ?, ?, ?, ?, COALESCE("
                     "  (SELECT hits FROM embed_cache WHERE key=? AND dim=?),"
                     "  0) + 1)",
                     (
                         cache_key,
-                        EMBED_DIM,
+                        self.embed_dim,
+                        self.embedding_backend,
                         _embedding_to_blob(vec),
                         time.time(),
                         time.time(),
                         cache_key,
-                        EMBED_DIM,
+                        self.embed_dim,
                     ),
                 )
                 self._maybe_prune_embed_cache()
@@ -1217,10 +1305,13 @@ class RAGMemoryManager:
         except (aiohttp.ClientError, OSError) as e:
             # Connection refused / DNS / reset: the endpoint itself is down,
             # so back off instead of retrying per message.
-            self._trip_embed_breaker(str(e))
+            self._trip_embed_breaker(type(e).__name__)
+            return None
+        except (ValueError, TypeError, OverflowError):
+            self._trip_embed_breaker("invalid embedding response; check model and dimension")
             return None
         except Exception as e:
-            logger.warning(f"Embedding failed: {e}")
+            logger.warning("Embedding failed: %s", type(e).__name__)
             return None
 
     def _trip_embed_breaker(self, reason: str) -> None:
@@ -1245,6 +1336,7 @@ class RAGMemoryManager:
             )
             self._embed_suppressed_failures = 0
         self._embed_endpoint_down_until = 0.0
+        self._query_embed_disabled_until = 0.0
 
     async def _embed_for_query(self, query: str) -> np.ndarray | None:
         """Best-effort query embedding with a strict interactive deadline.
@@ -1255,7 +1347,7 @@ class RAGMemoryManager:
         query embedding so the other RAG searches in the same turn return
         immediately too.
         """
-        if not str(query or "").strip():
+        if not EMBEDDINGS_ENABLED or not str(query or "").strip():
             return None
         now = time.monotonic()
         if now < self._query_embed_disabled_until:
@@ -1314,141 +1406,122 @@ class RAGMemoryManager:
             logger.debug("embed_cache prune failed: %s", e)
 
     async def _embed_and_store(self, row_id: str, text: str) -> bool:
-        """Generate embedding and update the row in DB."""
+        """Embed a stored text snapshot; an edit/delete during HTTP must win."""
+        if not EMBEDDINGS_ENABLED:
+            return False
+        row = self._db.execute(
+            "SELECT kind, content, metadata FROM vectors WHERE id=?", (row_id,)
+        ).fetchone()
+        if row is None or row["content"] != text:
+            return False
+        stored = False
         try:
-            vec = await self._embed(text)
+            embed_text = text
+            if row["kind"] == WEB_RESULT_KIND:
+                metadata = json.loads(row["metadata"] or "{}")
+                if not isinstance(metadata, dict):
+                    raise ValueError("web metadata must be an object")
+                title = str(metadata.get("title") or "").strip()
+                embed_text = f"{title}\n{text}".strip()[:WEB_RESULT_EMBED_MAX_CHARS]
+            vec = await self._embed(embed_text)
             if vec is not None:
-                blob = _embedding_to_blob(vec)
-                import hashlib as _hashlib
-
-                ch = _hashlib.sha256(_strip_for_embedding(text).encode("utf-8")).hexdigest()
-                self._db.execute(
-                    "UPDATE vectors SET embedding=? WHERE id=? AND "
-                    "(content_hash=? OR "
-                    "(content_hash='' AND content=?) OR "
-                    "(content_hash IS NULL AND content=?))",
-                    (blob, row_id, ch, str(text or "")[:8000], str(text or "")[:8000]),
+                vec = validate_embedding(vec, self.embed_dim)
+                cursor = self._db.execute(
+                    "UPDATE vectors SET embedding=?, embedding_backend=? "
+                    "WHERE id=? AND content=? AND metadata IS ? AND kind=?",
+                    (
+                        _embedding_to_blob(vec), self.embedding_backend,
+                        row_id, text, row["metadata"], row["kind"],
+                    ),
                 )
-                return True
-            return False
-        except (GeneratorExit, asyncio.CancelledError):
-            raise
-        except Exception:
-            return False
+                stored = cursor.rowcount > 0
+        except (ValueError, TypeError, sqlite3.Error) as exc:
+            logger.debug("Embedding row update failed: %s", type(exc).__name__)
+        return stored
 
     async def _embed_pending(self, kind: str):
-        """Embed all rows of a kind that don't have embeddings yet."""
-        try:
-            rows = self._db.execute(
-                "SELECT id, content FROM vectors WHERE kind=? AND embedding IS NULL",
-                (kind,),
-            ).fetchall()
-            embedded = 0
-            for row in rows:
-                if await self._embed_and_store(row["id"], row["content"]):
-                    embedded += 1
-            if rows:
-                logger.info(f"Embedded {embedded}/{len(rows)} pending {kind} vectors")
-        except Exception as e:
-            logger.warning(f"Failed to embed pending {kind}: {e}")
+        """Run one bounded maintenance pass for a migrated kind."""
+        return await self.backfill_embeddings(kind=kind)
 
     async def _embed_pending_all(self, batch_size: int = 4):
-        """Embed ALL rows without embeddings, in batches. Used for migration.
+        """Legacy startup hook: bounded, resumable and subject to ENABLE_RAG."""
+        return await self.backfill_embeddings(batch_size=batch_size)
 
-        Uses ollama's batch embed API to speed up — sends multiple texts
-        in a single request instead of one-at-a-time.
-        """
-        try:
-            total_embedded = 0
-            # Rows that failed to embed stay embedding IS NULL, so a naive
-            # `while True` re-SELECTs the same batch forever when ollama is
-            # down or keeps rejecting a row. Track what we've already tried
-            # and stop when a pass makes no forward progress.
-            attempted: set[str] = set()
-            while True:
-                rows = [
-                    r
-                    for r in self._db.execute(
-                        "SELECT id, content FROM vectors WHERE embedding IS NULL "
-                        "LIMIT ?",
-                        (batch_size * 4,),
-                    ).fetchall()
-                    if r["id"] not in attempted
-                ][:batch_size]
-                if not rows:
+    async def backfill_embeddings(
+        self, *, limit: int = 100, batch_size: int = 4,
+        max_seconds: float = 60.0, kind: str = "",
+    ) -> dict:
+        """Advance a persisted cursor; bound rows, memory and elapsed network work."""
+        if not 1 <= limit <= 10000 or not 1 <= batch_size <= 64:
+            raise ValueError("limit must be 1..10000 and batch_size 1..64")
+        if not 0 < max_seconds <= 600:
+            raise ValueError("max_seconds must be >0 and <=600")
+        report = {
+            "attempted": 0, "embedded": 0, "failed": 0, "skipped": 0,
+            "cursor": 0, "scan_complete": False, "stopped": "disabled",
+        }
+        if EMBEDDINGS_ENABLED:
+            try:
+                deadline = time.monotonic() + max_seconds
+                async with asyncio.timeout(max_seconds), self._backfill_lock:
+                    await self._backfill_pass(limit, batch_size, kind, report, deadline)
+            except TimeoutError:
+                report["stopped"] = "deadline"
+        return {**report, "counts": self.embedding_status()}
+
+    async def _backfill_pass(
+        self, limit: int, batch_size: int, kind: str, report: dict, deadline: float
+    ) -> None:
+        """Walk one finite rowid snapshot, including rows beyond a failed prefix."""
+        key = (self.embedding_backend, kind)
+        progress = self._db.execute(
+            "SELECT cursor FROM embed_backfill WHERE backend=? AND kind=?", key
+        ).fetchone()
+        report["cursor"] = progress["cursor"] if progress else 0
+        highwater = self._db.execute("SELECT COALESCE(MAX(rowid), 0) FROM vectors").fetchone()[0]
+        remaining = limit
+        report["stopped"] = "limit"
+        while remaining:
+            if time.monotonic() >= deadline:
+                report["stopped"] = "deadline"
+                break
+            if not EMBEDDINGS_ENABLED or self._embed_endpoint_paused():
+                report["stopped"] = "endpoint_paused" if EMBEDDINGS_ENABLED else "disabled"
+                break
+            rows = self._db.execute(
+                "SELECT rowid AS position, * FROM vectors "
+                "WHERE rowid>? AND rowid<=? AND (?='' OR kind=?) AND "
+                "(embedding IS NULL OR COALESCE(embedding_backend, '') != ? "
+                "OR NOT embedding_valid(embedding)) ORDER BY rowid LIMIT ?",
+                (report["cursor"], highwater, kind, kind, self.embedding_backend,
+                 min(batch_size, remaining)),
+            ).fetchall()
+            if not rows:
+                report.update(cursor=0, scan_complete=True, stopped="scan_complete")
+                self._db.execute(
+                    "INSERT OR REPLACE INTO embed_backfill VALUES (?, ?, ?)", (*key, 0)
+                )
+                break
+            for row in rows:
+                await asyncio.sleep(0)
+                if time.monotonic() >= deadline:
+                    report["stopped"] = "deadline"
+                    return
+                if self._embed_endpoint_paused() or not EMBEDDINGS_ENABLED:
                     break
-                attempted.update(r["id"] for r in rows)
-
-                # Long rows need sentence-boundary chunking + mean-pooling,
-                # which the batch API can't express (one vector per input).
-                # They used to be silently truncated at 8000 chars here even
-                # though _embed() had already been raised to EMBED_MAX_CHARS
-                # — the batch path is a migration path, so those rows were
-                # permanently stored with a truncated vector. Route them
-                # through _embed_and_store (chunked, cached) instead.
-                long_rows = [
-                    r for r in rows if len(r["content"] or "") > EMBED_MAX_CHARS
-                ]
-                rows = [r for r in rows if len(r["content"] or "") <= EMBED_MAX_CHARS]
-                for row in long_rows:
-                    if await self._embed_and_store(row["id"], row["content"]):
-                        total_embedded += 1
-                if not rows:
-                    continue
-
-                # Batch embed: send all texts in one request
-                texts = [row["content"] for row in rows]
-                payload = {"model": EMBED_MODEL, "input": texts}
-
-                try:
-                    fallback_rows = None
-                    async with (
-                        self._embed_semaphore,
-                        aiohttp.ClientSession() as session,
-                        session.post(
-                            EMBED_URL,
-                            json=payload,
-                            headers=EMBED_HEADERS,
-                            timeout=aiohttp.ClientTimeout(total=120),
-                        ) as resp,
-                    ):
-                        if resp.status != 200:
-                            body = await resp.text()
-                            logger.warning(
-                                f"Batch embed API returned {resp.status}: {body[:200]}"
-                            )
-                            fallback_rows = rows
-                        else:
-                            data = await resp.json()
-                            embeddings = _extract_embeddings(data)
-                            if not embeddings:
-                                logger.warning("Batch embed returned no embeddings")
-                            else:
-                                for i, row in enumerate(rows):
-                                    if i < len(embeddings):
-                                        vec = np.array(embeddings[i], dtype=np.float32)
-                                        if len(vec) == EMBED_DIM:
-                                            blob = _embedding_to_blob(vec)
-                                            self._db.execute(
-                                                "UPDATE vectors SET embedding=? WHERE id=?",
-                                                (blob, row["id"]),
-                                            )
-                                            total_embedded += 1
-                    if fallback_rows:
-                        for row in fallback_rows:
-                            if await self._embed_and_store(row["id"], row["content"]):
-                                total_embedded += 1
-                except Exception as e:
-                    logger.warning(f"Batch embed failed: {e}")
-                    # Fall back to one-by-one for this batch
-                    for row in rows:
-                        if await self._embed_and_store(row["id"], row["content"]):
-                            total_embedded += 1
-
-            if total_embedded:
-                logger.info(f"Batch-embedded {total_embedded} vectors total")
-        except Exception as e:
-            logger.warning(f"Failed to embed pending vectors: {e}")
+                content = row["content"]
+                if not embedding_eligible(row["kind"], dict(row).get("source", "user"), content):
+                    report["skipped"] += 1
+                else:
+                    report["attempted"] += 1
+                    stored = await self._embed_and_store(row["id"], content)
+                    report["embedded" if stored else "failed"] += 1
+                report["cursor"] = row["position"]
+                self._db.execute(
+                    "INSERT OR REPLACE INTO embed_backfill VALUES (?, ?, ?)",
+                    (*key, report["cursor"]),
+                )
+                remaining -= 1
 
     # ─── channel memory (short-term) ──────────────────────────────
 
@@ -1712,7 +1785,7 @@ class RAGMemoryManager:
         # 32k-token context absorbs any Discord message — no chunking.
         # Skip if content too short to be worth embedding.
         if should_embed:
-            self._spawn(self._embed_and_store(msg_id, content))
+            self._spawn(self._embed_and_store(msg_id, content[:8000]))
 
     async def clear_channel_memory(self, channel_id: str):
         self._db.execute(
@@ -1728,7 +1801,8 @@ class RAGMemoryManager:
             cur = self._db.execute(
                 "SELECT COUNT(*) as c, MIN(created_at) as oldest, "
                 "MAX(last_used_at) as newest, SUM(hits) as total_hits "
-                "FROM embed_cache"
+                "FROM embed_cache WHERE backend=?",
+                (self.embedding_backend,),
             ).fetchone()
             return {
                 "entries": cur["c"] or 0,
@@ -2268,7 +2342,8 @@ class RAGMemoryManager:
         ).fetchone()
         embedded = self._db.execute(
             "SELECT COUNT(*) AS c FROM vectors WHERE kind='entity' "
-            "AND embedding IS NOT NULL"
+            "AND embedding IS NOT NULL AND embedding_backend=? AND embedding_valid(embedding)",
+            (self.embedding_backend,),
         ).fetchone()
         return {
             "users": int(users["c"] if users else 0),
@@ -2567,7 +2642,7 @@ class RAGMemoryManager:
                 time.time(),
             ),
         )
-        self._spawn(self._embed_and_store(cid, content))
+        self._spawn(self._embed_and_store(cid, content[:1500]))
         return cid
 
     async def list_negatives(self, limit: int = 50) -> list[dict]:
@@ -2819,10 +2894,8 @@ class RAGMemoryManager:
             body = str(r.get("body") or "").strip()
             if (not title and not body) or not r.get("href"):
                 continue
-            embed_text = f"{title}\n{title}\n{body}".strip()[
-                :WEB_RESULT_EMBED_MAX_CHARS
-            ]
             stored_content = f"{title}\n{body}".strip()[:WEB_RESULT_EMBED_MAX_CHARS]
+            embed_text = f"{title}\n{stored_content}".strip()[:WEB_RESULT_EMBED_MAX_CHARS]
             vec = await self._embed(embed_text)
             embedded.append((r, vec, stored_content))
         if not embedded:
@@ -2838,8 +2911,6 @@ class RAGMemoryManager:
                 now_iso = _utcnow_iso()
                 now_ts = time.time()
                 for r, vec, stored_content in embedded:
-                    if vec is None:
-                        continue
                     title = str(r.get("title") or "").strip()
                     href = str(r.get("href") or "").strip()
                     content_hash = hashlib.sha256(
@@ -2859,9 +2930,9 @@ class RAGMemoryManager:
                             "  author_id, source, content, content_hash, "
                             "  metadata, scope, importance, timestamp, "
                             "  created_at, parent_id, chunk_index, "
-                            "  downvotes, updated_at, embedding"
+                            "  downvotes, updated_at, embedding, embedding_backend"
                             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                            "  ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             (
                                 f"web_{content_hash[:16]}",
                                 WEB_RESULT_KIND,
@@ -2881,7 +2952,8 @@ class RAGMemoryManager:
                                 0,
                                 0,
                                 now_ts,
-                                _embedding_to_blob(vec),
+                                _embedding_to_blob(vec) if vec is not None else None,
+                                self.embedding_backend if vec is not None else "",
                             ),
                         )
                         if self._db.execute(
@@ -3027,8 +3099,8 @@ class RAGMemoryManager:
                 return _score_with_recency(1.0, ts_str)  # just the multiplier
 
         # ─── build SQL ───────────────────────────────────────────────
-        where_parts = ["embedding IS NOT NULL"]
-        params: list = []
+        where_parts = ["embedding IS NOT NULL", "embedding_backend=?"]
+        params: list = [self.embedding_backend]
         if kinds:
             placeholders = ",".join("?" * len(kinds))
             where_parts.append(f"kind IN ({placeholders})")
@@ -3065,16 +3137,16 @@ class RAGMemoryManager:
 
         # ─── score ───────────────────────────────────────────────────
         results = []
-        query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+        query_norm = validate_embedding(query_vec, self.embed_dim)
         for row in rows:
             blob = row["embedding"]
             if not blob:
                 continue
             try:
-                vec = _blob_to_embedding(blob)
-                if len(vec) != EMBED_DIM:
+                if not embedding_blob_valid(blob, self.embed_dim):
                     continue
-                vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
+                vec = _blob_to_embedding(blob)
+                vec_norm = validate_embedding(vec, self.embed_dim)
                 sim = float(np.dot(query_norm, vec_norm))
                 if sim < min_similarity:
                     continue
@@ -3132,7 +3204,8 @@ class RAGMemoryManager:
             try:
                 neg_rows = self._db.execute(
                     "SELECT embedding FROM vectors WHERE kind='negative' "
-                    "AND embedding IS NOT NULL"
+                    "AND embedding IS NOT NULL AND embedding_backend=?",
+                    (self.embedding_backend,),
                 ).fetchall()
                 if neg_rows:
                     neg_vecs = []
@@ -3140,9 +3213,9 @@ class RAGMemoryManager:
                         nb = nr["embedding"]
                         if not nb:
                             continue
-                        nv = _blob_to_embedding(nb)
-                        if len(nv) == EMBED_DIM:
-                            nv_norm = nv / (np.linalg.norm(nv) + 1e-8)
+                        if embedding_blob_valid(nb, self.embed_dim):
+                            nv = _blob_to_embedding(nb)
+                            nv_norm = validate_embedding(nv, self.embed_dim)
                             neg_vecs.append(nv_norm)
                     if neg_vecs:
                         neg_stack = np.stack(neg_vecs)
@@ -3157,7 +3230,7 @@ class RAGMemoryManager:
                                 filtered.append(c)
                                 continue
                             cv = _blob_to_embedding(blob)
-                            cv_norm = cv / (np.linalg.norm(cv) + 1e-8)
+                            cv_norm = validate_embedding(cv, self.embed_dim)
                             # max cosine with any negative
                             max_neg_sim = float(np.max(neg_stack @ cv_norm))
                             if max_neg_sim >= 0.85:
