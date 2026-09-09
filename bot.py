@@ -25,6 +25,19 @@ from types import SimpleNamespace
 from typing import Any, cast
 from urllib.parse import urljoin, urlparse
 
+from response_observability import (
+    DeliveryMeasurements,
+    capture_running_build,
+    clean_message_content,
+    footer_template_error,
+    format_debug,
+    prepare_delivery,
+    record_delivery,
+    send_command_response,
+    send_measured,
+    update_footer_control,
+)
+
 import aiohttp
 import discord
 from discord.ext import commands
@@ -2786,6 +2799,8 @@ class MaxwellBot(commands.Bot):
             captcha_handler=self._handle_captcha,
             mobile_status=True,
         )
+        self._running_build = capture_running_build(Path(__file__).resolve().parent)
+        self._delivery_measurements = DeliveryMeasurements()
         self.config = Config()
         # Persona switch MUST happen BEFORE validate so GF token/data_dir overrides take effect
         # load_dotenv(override=True) in config.py nukes PM2's DISCORD_TOKEN/DATA_DIR for GF,
@@ -4501,7 +4516,7 @@ class MaxwellBot(commands.Bot):
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         rendered = render_discord_context_text(
             parent,
-            getattr(parent, "content", "") or "",
+            clean_message_content(self, parent),
             known_users=(getattr(self, "_recent_users", None) or {}).get(
                 channel_id, {}
             ),
@@ -4595,12 +4610,12 @@ class MaxwellBot(commands.Bot):
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         rendered = render_discord_context_text(
             ref,
-            getattr(ref, "content", "") or "",
+            clean_message_content(self, ref),
             known_users=(getattr(self, "_recent_users", None) or {}).get(
                 channel_id, {}
             ),
         )
-        quoted = " ".join((rendered or str(getattr(ref, "content", "") or "")).split())[
+        quoted = " ".join((rendered or clean_message_content(self, ref)).split())[
             :240
         ]
         return {
@@ -4917,7 +4932,7 @@ class MaxwellBot(commands.Bot):
                 ).strip()
                 or "someone"
             )
-            text = " ".join(str(getattr(item, "content", "") or "").split())[:240]
+            text = " ".join(clean_message_content(self, item).split())[:240]
             if text:
                 rendered.append(f"{name}: {text}")
         if len(rendered) < 2:
@@ -5866,7 +5881,7 @@ class MaxwellBot(commands.Bot):
         normal MESSAGE_CREATE path so an edited row replaces the old text
         instead of leaving the model with contradictory snapshots.
         """
-        memory_content = str(getattr(message, "content", "") or "")
+        memory_content = clean_message_content(self, message)
         attachments = self._payload_attr_list(message, "attachments", 5)
         if attachments:
             attachment_names = []
@@ -7236,7 +7251,7 @@ class MaxwellBot(commands.Bot):
             logger.warning(f"Failed recording reaction removal: {e}")
 
     async def _handle_command(self, message):
-        content = message.content[1:].strip()
+        content = message.content[len(self.command_prefix):].strip()
         parts = content.split(maxsplit=1)
         cmd = parts[0].lower() if parts else ""
         args = parts[1] if len(parts) > 1 else None
@@ -7257,6 +7272,7 @@ class MaxwellBot(commands.Bot):
             "summarize",
             "solo",
             "x",
+            "debug",
         }
         if cmd in admin_commands and not self._is_admin(message.author.id):
             await message.channel.send("not authorized")
@@ -7693,11 +7709,28 @@ class MaxwellBot(commands.Bot):
                     )
             elif cmd == "solo":
                 await self._handle_solo_command(message, args)
+            elif cmd == "footer":
+                await self._handle_footer_command(message, args)
+            elif cmd == "debug":
+                reference = getattr(message, "reference", None)
+                target_id = str(reference.message_id) if reference is not None else None
+                target_channel = getattr(reference, "channel_id", None)
+                if target_channel is not None and str(target_channel) != channel_id:
+                    text = "Debug references must be in this channel."
+                else:
+                    registry = getattr(self, "_delivery_measurements", None) or DeliveryMeasurements()
+                    text = format_debug(registry, channel_id, target_id)
+                await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
+            elif cmd == "version":
+                await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none())
             elif cmd == "help":
                 await message.channel.send(
                     "Commands:\n"
                     "` ,guide [goal]` / `,guided-goal [goal]` - create a thread and ask 5 clarifying questions before building (use when request is vague)\n"
                     "` ,help` - show this list\n"
+                    f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
+                    f"`{self.command_prefix}debug` - measured bot reply in this channel (admin; reply to select)\n"
+                    f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
                     "` ,prompt [text]` - view/set server prompt (admin)\n"
                     "` ,clearprompt` - clear server prompt (admin)\n"
@@ -7906,6 +7939,38 @@ class MaxwellBot(commands.Bot):
             )
             with contextlib.suppress(discord.Forbidden):
                 await message.channel.send("Something went wrong with that command.")
+
+    async def _handle_footer_command(self, message, args):
+        parts = (args or "status").split(maxsplit=1)
+        action = parts[0].lower()
+        control = dict(self._control)
+        if action in {"status", ""}:
+            state = "on" if control.get("footer_enabled", True) else "off"
+            text = f"Footer: {state}\nFormat: {control.get('footer_format', DEFAULT_CONTROL['footer_format'])}"
+        elif not self._is_admin(message.author.id):
+            text = "not authorized"
+        elif action in {"on", "enable", "off", "disable", "format"}:
+            template = parts[1] if len(parts) > 1 else ""
+            error = footer_template_error(template) if action == "format" else None
+            if error:
+                text = error
+            else:
+                if action == "format":
+                    key, value = "footer_format", template
+                    text = "Footer format updated."
+                else:
+                    key, value = "footer_enabled", action in {"on", "enable"}
+                    text = "Footer enabled." if value else "Footer disabled."
+                await asyncio.to_thread(
+                    update_footer_control,
+                    Path(self.config.DATA_DIR) / "bot_control.json",
+                    key,
+                    value,
+                )
+                self._load_control(force=True)
+        else:
+            text = f"usage: `{self.command_prefix}footer on|off|enable|disable|format <text>|status`"
+        await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
 
     async def _handle_solo_command(self, message, args):
         """`,solo` — lock a server to one channel, or unlock it.
@@ -8646,6 +8711,7 @@ class MaxwellBot(commands.Bot):
             )
             t_ai = time.perf_counter()
             raw_resp = await self._vc_generate_ai_response(messages)
+            response_metrics = getattr(raw_resp, "metrics", None)
             t_ai_done = time.perf_counter()
             resp = self._vc_format_response(raw_resp)
             if not resp:
@@ -8672,8 +8738,10 @@ class MaxwellBot(commands.Bot):
             )
             if mode in {"text", "both"}:
                 t_text = time.perf_counter()
-                await text_channel.send(
-                    self._render_custom_emojis(resp, guild) if guild else resp
+                await send_measured(
+                    self, text_channel,
+                    self._render_custom_emojis(resp, guild) if guild else resp,
+                    response_metrics,
                 )
                 logger.info(
                     "VC timing text_send user=%s ms=%.1f",
@@ -8682,7 +8750,8 @@ class MaxwellBot(commands.Bot):
                 )
             if mode in {"voice", "both"}:
                 t_play = time.perf_counter()
-                await self._play_vc_response(guild, text_channel, resp)
+                metrics_kwargs = {"response_metrics": response_metrics} if response_metrics is not None else {}
+                await self._play_vc_response(guild, text_channel, resp, **metrics_kwargs)
                 logger.info(
                     "VC timing play_done user=%s play_call_ms=%.1f total_ms=%.1f",
                     getattr(user, "id", "?"),
@@ -8711,7 +8780,7 @@ class MaxwellBot(commands.Bot):
             ):
                 self._vc_active_tasks.pop(key, None)
 
-    async def _play_vc_response(self, guild, text_channel, response: str):
+    async def _play_vc_response(self, guild, text_channel, response: str, *, response_metrics=None):
         # ENABLE_TTS_VC was documented as the switch for voice-channel
         # playback and read by nobody — only ENABLE_TTS (the `tts` tool) was
         # ever checked, so turning VC playback off in .env left the bot
@@ -8719,7 +8788,7 @@ class MaxwellBot(commands.Bot):
         # of this method already does when it cannot speak.
         if not getattr(self.config, "ENABLE_TTS_VC", True):
             with contextlib.suppress(Exception):
-                await text_channel.send(response)
+                await send_measured(self, text_channel, response, response_metrics)
             return
         t_total = time.perf_counter()
         key = self._vc_context_key(guild, None, text_channel)
@@ -8729,7 +8798,7 @@ class MaxwellBot(commands.Bot):
             t_lock = time.perf_counter()
             vc = self._vc_get_client(guild, voice_channel)
             if not vc or not vc.is_connected():
-                await text_channel.send(response)
+                await send_measured(self, text_channel, response, response_metrics)
                 logger.info(
                     "VC timing fallback_text reason=not_connected total_ms=%.1f",
                     (time.perf_counter() - t_total) * 1000,
@@ -8803,7 +8872,7 @@ class MaxwellBot(commands.Bot):
                         "VC playback failed after %.1fms",
                         (time.perf_counter() - t_total) * 1000,
                     )
-                    await text_channel.send(response)
+                    await send_measured(self, text_channel, response, response_metrics)
 
     async def _handle_context_command(self, message, args: str | None):
         arg = (args or "").strip()
@@ -8926,7 +8995,7 @@ class MaxwellBot(commands.Bot):
             )
         )
         ref_content = render_discord_context_text(
-            ref, ref.content or "", known_users=self._recent_users.get(ch_id, {})
+            ref, clean_message_content(self, ref), known_users=self._recent_users.get(ch_id, {})
         )
         if ref.attachments:
             ref_content = (ref_content + " [media attached]").strip()
@@ -9341,12 +9410,13 @@ class MaxwellBot(commands.Bot):
                 disable_reasoning=True,
                 fast_fallback=True,
             )
+            response_metrics = getattr(text, "metrics", None)
             text = (text or "").strip()
             if not text or text == "__NO_RESPONSE__":
                 return
             user = await self._captcha_resolve_user(recipients[0])
             if user is not None:
-                await user.send(text[:1500])
+                await send_measured(self, user, text[:1500], response_metrics)
         except Exception as e:
             logger.debug("captcha LLM explanation skipped: %s", e)
 
@@ -14098,6 +14168,7 @@ class MaxwellBot(commands.Bot):
             native_calls = self._native_calls_from(response)
             # Token usage rides on the ProviderResult, so read it BEFORE the
             # recovery below can replace `response` with a plain string.
+            response_metrics = getattr(response, "metrics", None)
             usage = self._usage_from(response)
             if usage:
                 self._token_tracker.record(usage)
@@ -14170,6 +14241,7 @@ class MaxwellBot(commands.Bot):
                     native_tool_calls=pending_native or None,
                     include_images=True,
                     existing_progress=first_dispatch_progress,
+                    response_metrics=response_metrics,
                 )
                 first_dispatch_progress = None
                 pending_native = None
@@ -14314,6 +14386,7 @@ class MaxwellBot(commands.Bot):
                                 await followup_progress.stop()
                             followup_progress = None
                         raise
+                    followup_metrics = getattr(followup, "metrics", None)
                     usage = self._usage_from(followup)
                     if usage:
                         self._token_tracker.record(usage)
@@ -14334,6 +14407,7 @@ class MaxwellBot(commands.Bot):
                         first_dispatch_progress = followup_progress
                         # else: leave it alive for the transition below
                     if (followup and str(followup).strip()) or pending_native:
+                        response_metrics = followup_metrics
                         response = followup or ""
                         followup_turn_ran = True
                     else:
@@ -14445,10 +14519,13 @@ class MaxwellBot(commands.Bot):
                         await self._ensure_reasoning_trace(
                             message, all_tool_results, site_result, "auto_site"
                         )
-                        try:
-                            await message.reply(site_result)
-                        except (discord.NotFound, discord.Forbidden):
-                            await message.channel.send(site_result)
+                        _, site_chunks = prepare_delivery(self, site_result, response_metrics, self._split_response)
+                        for index, site_chunk in enumerate(site_chunks):
+                            try:
+                                sent = await message.reply(site_chunk) if index == 0 else await message.channel.send(site_chunk)
+                            except (discord.NotFound, discord.Forbidden):
+                                sent = await message.channel.send(site_chunk)
+                            record_delivery(self, message.channel, sent, response_metrics)
                         normal_reply_sent = True
                         # Record the auto-routed site link in memory so
                         # the user can come back and ask "where did you
@@ -14491,7 +14568,7 @@ class MaxwellBot(commands.Bot):
                 response, send_stickers = self._extract_stickers_from_text(
                     response, message.guild
                 )
-                chunks = self._split_response(response, limit=1900)
+                _, chunks = prepare_delivery(self, response, response_metrics, self._split_response)
                 if not chunks and send_stickers:
                     chunks = [""]
                 # Fast-tool fix: try to transition the live progress message
@@ -14513,7 +14590,10 @@ class MaxwellBot(commands.Bot):
                             continue
                         try:
                             with contextlib.suppress(Exception):
-                                if await _prog.transition_to_final(chunks[0]):
+                                if await _prog.transition_to_final(
+                                    chunks[0],
+                                    on_delivered=lambda sent, metrics=response_metrics: record_delivery(self, message.channel, sent, metrics),
+                                ):
                                     transitioned = True
                                     break
                         except Exception as _e:  # noqa: BLE001
@@ -14561,6 +14641,7 @@ class MaxwellBot(commands.Bot):
                             if sent is None:
                                 break
                             reply_delivered = True
+                        record_delivery(self, message.channel, sent, response_metrics)
                 # Write the bot's own reply to channel memory. Without
                 # this the next turn sees the user's "Explain X" question
                 # but NOT the bot's answer — the user comes back and
@@ -14723,7 +14804,7 @@ class MaxwellBot(commands.Bot):
             logger.warning(f"Failed to force reasoning trace: {e}")
 
     async def _execute_tool_by_name(
-        self, message, name: str, params: dict, *, disabled: set, compatible: set
+        self, message, name: str, params: dict, *, disabled: set, compatible: set, response_metrics=None
     ) -> str:
         """Run a single tool and return the result text (including Tool name: prefix).
 
@@ -14858,7 +14939,10 @@ class MaxwellBot(commands.Bot):
                         else contextlib.nullcontext()
                     )
                     async with gate:
-                        raw = await tool.execute(message, **params)
+                        if name in {"send_message", "edit_message"} and response_metrics is not None:
+                            raw = await tool.execute(message, _response_metrics=response_metrics, **params)
+                        else:
+                            raw = await tool.execute(message, **params)
                     result_text = str(raw) if raw else "executed successfully"
                     logger.info(
                         "Tool %s finished: %s",
@@ -14948,6 +15032,7 @@ class MaxwellBot(commands.Bot):
         raw_tool_calls: list,
         include_images: bool = False,
         existing_progress=None,
+        response_metrics=None,
     ) -> tuple[str, list[str]] | tuple[str, list[str], list[str]]:
         """Execute OpenAI-style native tool_calls from the provider."""
         tool_results: list[str] = []
@@ -15139,6 +15224,7 @@ class MaxwellBot(commands.Bot):
                     params,
                     disabled=disabled,
                     compatible=compatible,
+                    response_metrics=response_metrics,
                 )
             finally:
                 # Restore the prior value (not blindly pop — a nested
@@ -15424,6 +15510,7 @@ class MaxwellBot(commands.Bot):
         native_tool_calls: list | None = None,
         include_images: bool = False,
         existing_progress=None,
+        response_metrics=None,
     ) -> tuple[str, list[str]] | tuple[str, list[str], list[str]]:
         """Native tool_calls only. The XML text-tag dispatch is gone — Maxwell
         is native function-calling only now. If the model didn't emit native
@@ -15449,6 +15536,7 @@ class MaxwellBot(commands.Bot):
                 native_tool_calls,
                 include_images=include_images,
                 existing_progress=existing_progress,
+                response_metrics=response_metrics,
             )
         cleaned = strip_tool_payload_leaks(response or "")
         return (cleaned, [], []) if include_images else (cleaned, [])
@@ -15517,9 +15605,7 @@ class MaxwellBot(commands.Bot):
     def _usage_from(self, response) -> dict:
         """Race-free token-usage extraction (see ``_native_calls_from``)."""
         usage = getattr(response, "usage", None)
-        if usage:
-            return dict(usage)
-        return getattr(self.ai_provider, "_last_usage", None) or {}
+        return dict(usage) if usage else {}
 
     def mark_message_tainted(self, message) -> None:
         """Mark a message as having read untrusted content in the current turn.

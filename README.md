@@ -248,10 +248,15 @@ It is useful as a free temporary fallback, but check OpenRouter for current avai
 
 ## Commands
 
-All commands use the `,` prefix. Admin commands require the user to be in the admin list.
+Examples below use the normal `,` prefix. Commands follow the configured `COMMAND_PREFIX` (for example, `!footer` when it is `!`; GF mode defaults to `.`). Admin commands require the user to be in the admin list.
 
 | Command | Admin | Description |
 |---|---|---|
+| `,footer [status]` | No | Show the bot-wide response-footer setting and format |
+| `,footer on` / `off` / `enable` / `disable` | Yes | Enable or disable per-response Discord footers (on by default) |
+| `,footer format <text>` | Yes | Set the one-line format, at most 300 characters; see below |
+| `,debug` | Yes | Inspect this channel's latest measured bot message; reply to a message to select that exact message |
+| `,version` | No | Show this process's startup-frozen Git build and start time |
 | `,stop` | No | Cancel the active AI request in this channel (` ,stop job <id>` cancels a background job) |
 | `,bg <goal>` | No | Start a background sub-agent job: instant ack, channel stays free, pings you when done |
 | `,jobs` | No | List background jobs |
@@ -297,6 +302,34 @@ All commands use the `,` prefix. Admin commands require the user to be in the ad
 | `,vc say <text>` | No | Speak text in VC with TTS |
 
 Live VC replies require `discord-ext-voice-recv`, `PyNaCl`, `ffmpeg`, and an audio-capable OpenAI-compatible provider.
+
+### Response footers and diagnostics
+
+Default Discord subtext:
+
+```text
+-# TTFT 4839ms | TPS 108.3
+```
+
+These are **that response's producing-call measurements**, not a provider-global last call, daily total or average. TPS is output tokens including reasoning divided by the successful request's whole elapsed seconds, for both streaming and JSON. `~` marks locally estimated token throughput/input, or a non-streaming/otherwise unobserved first-token latency proxy. Provider-reported counts take precedence; missing counts use one fixed offline CL100K tokenizer. See [measurement details](docs/CONFIGURATION.md#per-call-provider-measurements).
+
+With `COMMAND_PREFIX=!`, for example:
+
+```text
+!footer on
+!footer format This bot model {{MODEL}} | Time! {{TTFT}} | Tokens per second! {{TPS}}
+!debug
+!version
+!footer off
+```
+
+Formats accept only `{{TTFT}}`, `{{TPS}}`, `{{PROVIDER}}`, `{{CONTEXT}}`, `{{MODEL}}`, and `{{BOT}}`. `CONTEXT` means **input tokens for this call**, not model capacity. `PROVIDER` is the used endpoint's hostname; `MODEL` is the model selected for that request, including fallback/override. Templates must be a nonempty single line of at most 300 characters; rendered footer lines are bounded to 300 characters too. Footer mentions are neutralized without disabling mentions in the actual reply body. Settings are bot-wide and persist in the existing runtime controls.
+
+A split reply gets one footer on its last chunk, while every delivered chunk can be selected with `debug`. `send_message` replies, progress-message final edits, background results and autonomous conversational text deliveries retain their own producing-call metadata. Body text and stored history exclude the footer: a reserved invisible suffix identifies this bot's footer even after a format change or restart, without stripping other users' subtext. An edit that cannot fit both its requested body and footer preserves the body, omits the footer, and still records its measurements. Telegram and non-text deliveries do not get Discord footers.
+
+`debug` labels the exact measured message and call. A reply selects only that message in the same channel; an unrecorded reply never falls back to another message. Records are bounded to 1,024 delivered messages in this process, so evicted/pre-restart measurements are unavailable. The new footer/debug/version commands make no model request; their own footer uses unavailable call fields (`—`), never the diagnostic target's measurements. Other static notices do not acquire a model sample.
+
+`version` reports commit, branch, commit date/subject, dirty-at-startup state, process start time and Python version captured once at startup. Later commits do not change what the running process claims. A source tree without Git metadata reports unknown build fields rather than inventing a package version.
 
 ## Sites
 

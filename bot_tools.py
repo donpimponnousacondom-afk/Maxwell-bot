@@ -36,6 +36,7 @@ import uuid
 import discord
 from discord import Activity, File, Message, Status
 from tools import Tool
+from response_observability import clean_message_content, prepare_delivery, record_delivery, strip_footer
 from captcha_solver import CaptchaSolveError
 from control_defaults import parse_bool
 import site_backend
@@ -1833,7 +1834,12 @@ class EditMessageTool(Tool):
             msg = await message.channel.fetch_message(int(message_id))
             if msg.author.id != self.bot.user.id:
                 return "Error: I can only edit my own messages"
-            await msg.edit(content=content)
+            metrics = kwargs.pop("_response_metrics", None)
+            content = strip_footer(content, self_authored=True)
+            platform = str(getattr(message, "tool_platform", "discord") or "discord")
+            _, chunks = prepare_delivery(self.bot, content, metrics, SendMessageTool._chunks, platform=platform, limit=2000)
+            await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
+            record_delivery(self.bot, message.channel, msg, metrics, platform=platform, replace=True)
             return f"Message {message_id} edited successfully"
         except discord.NotFound:
             return f"Error: Message {message_id} not found"
@@ -2857,8 +2863,9 @@ class SearchMessagesTool(Tool):
             if not clean_query:
                 if chan and hasattr(chan, "history"):
                     async for msg in chan.history(limit=search_limit):
-                        snippet = msg.content[:150] + (
-                            "..." if len(msg.content) > 150 else ""
+                        content = clean_message_content(self.bot, msg)
+                        snippet = content[:150] + (
+                            "..." if len(content) > 150 else ""
                         )
                         results.append(
                             f"[{msg.id}] {msg.author.display_name}: {snippet}"
@@ -2872,9 +2879,10 @@ class SearchMessagesTool(Tool):
             if chan and hasattr(chan, "history"):
                 try:
                     async for msg in chan.history(limit=100):
-                        if clean_query in (msg.content or "").lower():
-                            snippet = msg.content[:150] + (
-                                "..." if len(msg.content) > 150 else ""
+                        content = clean_message_content(self.bot, msg)
+                        if clean_query in content.lower():
+                            snippet = content[:150] + (
+                                "..." if len(content) > 150 else ""
                             )
                             results.append(
                                 f"[#{getattr(chan, 'name', 'chat')} - {msg.id}] {msg.author.display_name}: {snippet}"
@@ -2902,9 +2910,10 @@ class SearchMessagesTool(Tool):
                         break
                     try:
                         async for msg in c.history(limit=50):
-                            if clean_query in (msg.content or "").lower():
-                                snippet = msg.content[:150] + (
-                                    "..." if len(msg.content) > 150 else ""
+                            content = clean_message_content(self.bot, msg)
+                            if clean_query in content.lower():
+                                snippet = content[:150] + (
+                                    "..." if len(content) > 150 else ""
                                 )
                                 results.append(
                                     f"[#{c.name} - {msg.id}] {msg.author.display_name}: {snippet}"
@@ -6614,7 +6623,7 @@ async def resolve_send_reply_target(message, reply=True, reply_to=None, bot=None
         score = score_reply_candidate(
             hint_n,
             author=_message_author_label(msg),
-            content=str(getattr(msg, "content", "") or ""),
+            content=clean_message_content(bot, msg),
         )
         if score > best_score:
             best_score = score
@@ -6722,6 +6731,7 @@ class SendMessageTool(Tool):
         reply_to: str | None = None,
         channel_id: str | None = None,
         user_id: str | None = None,
+        _response_metrics=None,
         **kwargs,
     ) -> str:
         text = str(content or "").strip()
@@ -6772,9 +6782,10 @@ class SendMessageTool(Tool):
             if self.bot and hasattr(self.bot, "_extract_stickers_from_text"):
                 text, stickers = self.bot._extract_stickers_from_text(text, guild)
 
-            chunks = self._chunks(text)
+            platform = str(getattr(message, "tool_platform", "discord") or "discord")
+            clean_chunks, chunks = prepare_delivery(self.bot, text, _response_metrics, self._chunks, platform=platform)
             if not chunks and stickers:
-                chunks = [""]
+                clean_chunks, chunks = [""], [""]
             target = None
             if reply and target_channel == getattr(message, "channel", None):
                 target = await resolve_send_reply_target(
@@ -6817,7 +6828,7 @@ class SendMessageTool(Tool):
                                 return "Error: missing permissions to send message"
                         elif i == 0 and use_reply:
                             try:
-                                await reply_to_message.reply(chunk, **extra)
+                                sent = await reply_to_message.reply(chunk, **extra)
                             except (discord.NotFound, discord.HTTPException) as exc:
                                 code = getattr(exc, "code", None)
                                 parent_gone = isinstance(
@@ -6833,11 +6844,12 @@ class SendMessageTool(Tool):
                                     raise
                                 if not parent_gone:
                                     raise
-                                await target_channel.send(chunk, **extra)
+                                sent = await target_channel.send(chunk, **extra)
                         else:
-                            await target_channel.send(chunk, **extra)
+                            sent = await target_channel.send(chunk, **extra)
+                        record_delivery(self.bot, target_channel, sent, _response_metrics, platform=platform)
                         sent_any = True
-                        sent_chunks.append(chunk)
+                        sent_chunks.append(clean_chunks[i])
                     except Exception:
                         if sent_any:
                             return "__MESSAGE_SENT__\n" + "\n".join(sent_chunks)

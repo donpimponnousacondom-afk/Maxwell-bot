@@ -27,6 +27,7 @@
 !rem.py
 !rem_defaults.json
 !response_guard.py
+!response_observability.py
 !site_backend.py
 !site_server.py
 !site_test.py

@@ -50,6 +50,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from response_observability import MeasuredActions, clean_message_content, prepare_delivery, record_delivery, strip_footer
 from typing import Any, ClassVar, cast
 
 import discord
@@ -206,7 +207,8 @@ def _message_relation_tags(
 
     if reply is not None and hasattr(reply, "author"):
         ref = _user_ref(reply.author, bot_user)
-        quoted = " ".join(str(getattr(reply, "content", "") or "").split())[:80]
+        reply_content = strip_footer(str(getattr(reply, "content", "") or ""), self_authored=bool(bot_user and str(reply.author.id) == str(bot_user.id)))
+        quoted = " ".join(reply_content.split())[:80]
         if quoted:
             quoted = quoted.replace('"', "'")
             tags.append(f'reply_to={ref} "{quoted}"')
@@ -1921,7 +1923,7 @@ class AutonomyEngine:
                         )
                     )
                     content = _visible_message_content(
-                        m, m.content or "", known_users=_ku
+                        m, clean_message_content(self.bot, m), known_users=_ku
                     )[:_ACTIVITY_CONTENT_CHARS]
                     if not content:
                         continue
@@ -2251,7 +2253,7 @@ class AutonomyEngine:
                         )
                     )
                     content = _visible_message_content(
-                        m, m.content or "", known_users=_ku
+                        m, clean_message_content(self.bot, m), known_users=_ku
                     )[:_ACTIVITY_CONTENT_CHARS]
                     if not content:
                         continue
@@ -2546,7 +2548,7 @@ class AutonomyEngine:
                                 ) or getattr(reply.author, "name", "?")
                                 content = _render_discord_context_text(
                                     reply,
-                                    reply.content or "",
+                                    clean_message_content(self.bot, reply),
                                     known_users=(
                                         getattr(self.bot, "_recent_users", {}) or {}
                                     ).get(
@@ -2845,7 +2847,9 @@ class AutonomyEngine:
                     stages["policy_gate"]["denied"] += 1
                     denials = stages["policy_gate"]["denials"]
                     denials[verdict.code] = denials.get(verdict.code, 0) + 1
-            ran = await self.run_allowed(verdicts)
+            metrics = getattr(planned, "metrics", None)
+            metrics_kwargs = {"response_metrics": metrics} if metrics is not None else {}
+            ran = await self.run_allowed(verdicts, **metrics_kwargs)
             stages["execute"]["ran"] += sum(
                 1 for r in ran if r.get("result") != "skipped"
             )
@@ -2904,7 +2908,7 @@ class AutonomyEngine:
 
             # Respect the total budget even if the model asked for more.
             room = MAX_TOOL_LOOP_ACTIONS - len(results)
-            more = more[:room]
+            more = MeasuredActions(more[:room], getattr(more, "metrics", None))
             stages["plan"]["actions"] += len(more)
             stages["plan"]["rounds"] += 1
             new_results = await _gate_and_run(more)
@@ -3093,7 +3097,7 @@ class AutonomyEngine:
         # Store validation failures for next tick's feedback
         self._last_validation_failures = validation_failures
 
-        return actions
+        return MeasuredActions(actions, getattr(raw_response, "metrics", None))
 
     def _parse_plan(self, raw: str) -> tuple[list[dict], list[str]]:
         """Extract and validate the JSON plan from LLM output.
@@ -3587,9 +3591,11 @@ class AutonomyEngine:
         mechanical-skip path) wants plan-in, results-out.
         """
         verdicts = await self.policy_gate(actions, planned_post_channels)
-        return await self.run_allowed(verdicts)
+        metrics = getattr(actions, "metrics", None)
+        metrics_kwargs = {"response_metrics": metrics} if metrics is not None else {}
+        return await self.run_allowed(verdicts, **metrics_kwargs)
 
-    async def run_allowed(self, verdicts: list[GateVerdict]) -> list[dict]:
+    async def run_allowed(self, verdicts: list[GateVerdict], *, response_metrics=None) -> list[dict]:
         """Execute the actions the gate allowed. One failure doesn't kill the rest.
 
         Denied actions still produce a result row — the planner reads results
@@ -3598,6 +3604,7 @@ class AutonomyEngine:
         """
         results = []
         ACTION_TIMEOUT = 30  # seconds per action
+        metrics_kwargs = {"response_metrics": response_metrics} if response_metrics is not None else {}
 
         for verdict in verdicts:
             action = verdict.action
@@ -3626,15 +3633,15 @@ class AutonomyEngine:
             try:
                 if kind == "send_dm":
                     await asyncio.wait_for(
-                        self._exec_send_dm(action, result), timeout=ACTION_TIMEOUT
+                        self._exec_send_dm(action, result, **metrics_kwargs), timeout=ACTION_TIMEOUT
                     )
                 elif kind == "post_channel":
                     await asyncio.wait_for(
-                        self._exec_post_channel(action, result), timeout=ACTION_TIMEOUT
+                        self._exec_post_channel(action, result, **metrics_kwargs), timeout=ACTION_TIMEOUT
                     )
                 elif kind == "run_tool":
                     await asyncio.wait_for(
-                        self._exec_run_tool(action, result), timeout=ACTION_TIMEOUT
+                        self._exec_run_tool(action, result, **metrics_kwargs), timeout=ACTION_TIMEOUT
                     )
                 elif kind == "update_memory":
                     await asyncio.wait_for(
@@ -3696,7 +3703,7 @@ class AutonomyEngine:
 
         return results
 
-    async def _exec_send_dm(self, action: dict, result: dict):
+    async def _exec_send_dm(self, action: dict, result: dict, *, response_metrics=None):
         user_id = action["target_user_id"]
         content = action["content"][:MAX_CONTENT_CHARS]
         result["target"] = f"user:{user_id}"
@@ -3740,15 +3747,17 @@ class AutonomyEngine:
                 return
 
         try:
-            msg = await dm_channel.send(content)
-            result["tool_called"] = "send_dm"
-            result["channel_id"] = str(getattr(dm_channel, "id", ""))
-            # Track for engagement checking
-            if msg:
-                self._note_autonomy_post(dm_channel.id, msg.id)
-                await self._remember_visible_self_message(
-                    dm_channel, msg, content, reason=action.get("reason", "")
-                )
+            clean_chunks, chunks = prepare_delivery(self.bot, content, response_metrics, getattr(self.bot, "_split_response", None))
+            for clean, chunk in zip(clean_chunks, chunks):
+                msg = await dm_channel.send(chunk)
+                record_delivery(self.bot, dm_channel, msg, response_metrics)
+                result["tool_called"] = "send_dm"
+                result["channel_id"] = str(getattr(dm_channel, "id", ""))
+                if msg:
+                    self._note_autonomy_post(dm_channel.id, msg.id)
+                    await self._remember_visible_self_message(
+                        dm_channel, msg, clean, reason=action.get("reason", "")
+                    )
         except discord.Forbidden as _exc:
             self._unreachable_dm_users[str(user_id)] = time.time()
             result["result"] = "error"
@@ -3759,7 +3768,7 @@ class AutonomyEngine:
             result["error"] = f"Discord API error sending DM: {e}"
             return
 
-    async def _exec_post_channel(self, action: dict, result: dict):
+    async def _exec_post_channel(self, action: dict, result: dict, *, response_metrics=None):
         channel_id = action["target_channel_id"]
         content = action["content"][:MAX_CONTENT_CHARS]
         reply_to_message_id = action.get("reply_to_message_id")
@@ -3814,6 +3823,7 @@ class AutonomyEngine:
                 result["error"] = "channel cannot receive messages"
                 return
 
+            clean_chunks, chunks = prepare_delivery(self.bot, content, response_metrics, getattr(self.bot, "_split_response", None))
             msg = None
             ref = None
             memory_reply = None
@@ -3821,7 +3831,7 @@ class AutonomyEngine:
                 try:
                     ref = await channel.fetch_message(int(reply_to_message_id))
                     if ref is not None and hasattr(ref, "reply"):
-                        msg = await ref.reply(content, mention_author=True)
+                        msg = await ref.reply(chunks[0], mention_author=True)
                         result["sent_as_reply"] = True
                         memory_reply = ref
                 except (
@@ -3836,20 +3846,27 @@ class AutonomyEngine:
                     )
 
             if msg is None:
-                msg = await channel.send(content)
+                msg = await channel.send(chunks[0])
                 result["sent_as_reply"] = False
 
             result["tool_called"] = "post_channel"
             # Track for engagement checking
             if msg:
+                record_delivery(self.bot, channel, msg, response_metrics)
                 self._note_autonomy_post(channel_id, msg.id)
                 await self._remember_visible_self_message(
                     channel,
                     msg,
-                    content,
+                    clean_chunks[0],
                     reply=memory_reply,
                     reason=action.get("reason", ""),
                 )
+            for clean, chunk in zip(clean_chunks[1:], chunks[1:]):
+                msg = await channel.send(chunk)
+                record_delivery(self.bot, channel, msg, response_metrics)
+                if msg:
+                    self._note_autonomy_post(channel_id, msg.id)
+                    await self._remember_visible_self_message(channel, msg, clean, reason=action.get("reason", ""))
         except discord.Forbidden as _exc:
             result["result"] = "error"
             result["error"] = "bot lacks permission to send in this channel"
@@ -3925,7 +3942,7 @@ class AutonomyEngine:
         except Exception as e:
             logger.warning(f"Failed to record autonomy self-message memory: {e}")
 
-    async def _exec_run_tool(self, action: dict, result: dict):
+    async def _exec_run_tool(self, action: dict, result: dict, *, response_metrics=None):
         tool_name = action["tool_name"]
         tool_args = action.get("tool_args", {})
         result["target"] = f"tool:{tool_name}"
@@ -4145,12 +4162,15 @@ class AutonomyEngine:
 
         # extract tool kwargs (exclude meta fields that aren't real tool params)
         exec_kwargs = {
-            k: v for k, v in tool_args.items() if k not in {"target_channel_id"}
+            k: v for k, v in tool_args.items() if k not in {"target_channel_id", "_response_metrics"}
         }
         if "target_message_id" in exec_kwargs and "message_id" not in exec_kwargs:
             exec_kwargs["message_id"] = exec_kwargs["target_message_id"]
         try:
-            tool_result = await tool.execute(syn_msg, **exec_kwargs)
+            if tool_name in {"send_message", "edit_message"} and response_metrics is not None:
+                tool_result = await tool.execute(syn_msg, _response_metrics=response_metrics, **exec_kwargs)
+            else:
+                tool_result = await tool.execute(syn_msg, **exec_kwargs)
             text = str(tool_result) if tool_result is not None else ""
             # Many tools (especially permission/admin guards) return "Error: ..." strings
             # instead of raising. Treat those as failures for accurate autonomy auditing.

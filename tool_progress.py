@@ -610,7 +610,7 @@ class ToolProgress:
         except Exception as e:  # noqa: BLE001
             logger.debug("Progress delete failed: %s", e)
 
-    async def transition_to_final(self, content: str) -> bool:
+    async def transition_to_final(self, content: str, *, on_delivered=None) -> bool:
         """Replace the live progress message with the final reply.
 
         When a tool batch completes with a final reply in hand, edit
@@ -640,13 +640,15 @@ class ToolProgress:
             self._deferred_task.cancel()
             self._deferred_task = None
         try:
-            _fire_and_forget(self._background_transition(posted, content))
+            _fire_and_forget(self._background_transition(posted, content, on_delivered=on_delivered))
         except RuntimeError:
             with contextlib.suppress(Exception):
                 await posted.edit(content=content)
+                if on_delivered is not None:
+                    on_delivered(posted)
         return True
 
-    async def _background_transition(self, posted: Any, content: str) -> None:
+    async def _background_transition(self, posted: Any, content: str, *, on_delivered=None) -> None:
         """Edit the message in place to the final reply. Fire-and-forget.
 
         The caller treats a True return from ``transition_to_final`` as "the
@@ -659,21 +661,27 @@ class ToolProgress:
         """
         try:
             await posted.edit(content=content)
-            return
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 "Progress transition-to-final edit failed (%s); "
                 "posting the reply as a new message instead",
                 e,
             )
+        else:
+            if on_delivered is not None:
+                on_delivered(posted)
+            return
         channel = getattr(self._msg, "channel", None)
         if channel is None:
             logger.error("Transition fallback impossible: no channel; reply dropped")
             return
         try:
-            await channel.send(content)
+            sent = await channel.send(content)
         except Exception as e:  # noqa: BLE001
             logger.error("Transition fallback send failed; reply dropped: %s", e)
+        else:
+            if on_delivered is not None:
+                on_delivered(sent)
 
 
 def make_progress(message: Any) -> ToolProgress:

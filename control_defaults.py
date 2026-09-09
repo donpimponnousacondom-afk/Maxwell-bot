@@ -25,6 +25,8 @@ DEFAULT_CONTROL = {
     "bot_enabled": True,
     "log_messages": False,
     "error_replies": True,
+    "footer_enabled": True,
+    "footer_format": "TTFT {{TTFT}} | TPS {{TPS}}",
     # When True, the apology posted on a failed turn carries a short,
     # secret-redacted line of the ACTUAL exception (type + message) instead of
     # a bare "Sorry, please try again." Operators could only see the real cause
