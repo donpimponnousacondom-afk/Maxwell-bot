@@ -21,6 +21,7 @@ Read these first if you are new to the project:
 - [High-level overview](docs/OVERVIEW.md)
 - [Complete installation guide](docs/INSTALL.md)
 - [Configuration quick reference](docs/CONFIGURATION.md)
+- [Dame Curie shared Screen workflow and agent handoff](docs/SCREEN_WORKFLOW.md)
 
 ### Manual path in brief
 

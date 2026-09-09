@@ -6,6 +6,8 @@ This repository is `dame_curie`, a Maxwell side project. Keep existing Maxwell n
 
 The root `AGENTS.md` applies to the whole checkout.
 
+For root's existing host-native deployment, read [the shared Screen workflow and handoff](docs/SCREEN_WORKFLOW.md) before touching runtime. Share `dame_curie` with `screen -x`; keep exactly one foreground bot under `flock -n /tmp/dame-curie-maxwell.lock ./run.sh`. Do not switch to PM2/Compose or restart for documentation-only changes.
+
 ## Operating rules
 
 - Preserve root's work. Inspect `git status`, the current branch, and recent commits before changing anything.
@@ -199,7 +201,7 @@ If semantic recall is unwanted, set `ENABLE_RAG=false` and restart. Do not leave
 
 ```bash
 git status --short --branch
-.venv/bin/python3 -m pytest -q
+.venv/bin/python3 -m pytest -q --deselect=tests/test_tool_progress.py::test_streaming_tick_inserts_space_between_glued_deltas
 .venv/bin/python3 doctor.py
 .venv/bin/python3 doctor.py --probe  # networked: only when explicitly intended
 docker info                          # must succeed as the bot runtime user
@@ -209,6 +211,13 @@ ss -ltnp 'sport = :11434'
 For RAG counts, inspect only counts/NULL status; never dump stored message content.
 
 ## Working changelog
+
+### 2026-09-09 — shared Screen workflow handoff
+
+- Added docs/SCREEN_WORKFLOW.md: attach/detach/scrollback cheat sheet, single foreground bot and flock contract, coordinated stop/verify/start, agent collaboration and secret-safe testing, identity reminders, current-state snapshot and paste-ready next-agent instructions.
+- Linked the runbook here and from README. Updated the validation command to exclude the existing credential-reading live-provider test; other historical architecture/audit claims remain dated and must be rechecked.
+- Sanity check: branch pr/fixing_number_max_tool_calls at 34f6580 before this slice, clean worktree, attached dame_curie window 0, one Python bot with a flock parent and this checkout as cwd. No runtime changes, restart, credential/data reads or live probes. Documentation shell syntax, relative links and diff whitespace checked; application suite not run for this docs-only change.
+- Next agent: re-check Git and runtime before choosing work; newer commits supersede interrupted chat TODOs. Continue only root's next assigned task, using the existing shared Screen deployment unless a cutover is explicitly approved.
 
 ### Portable tool-budget audit and repair handoff
 
