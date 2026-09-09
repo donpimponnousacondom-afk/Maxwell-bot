@@ -146,6 +146,15 @@ def test_down_stops_all_writers_before_removing_managed_containers(tmp_path):
     assert events[-1] == ("compose", "down", "--timeout", "45")
 
 
+def test_up_waits_for_live_service_health(tmp_path):
+    app = instance(tmp_path)
+    app.inventory = Mock(return_value=[])
+    app.compose = Mock()
+    ops.lifecycle(app, "up")
+    app.inventory.assert_called_once_with()
+    app.compose.assert_called_once_with("up", "-d", "--wait", "--wait-timeout", "300")
+
+
 def test_helper_mounts_only_state_and_no_network(tmp_path):
     app = instance(tmp_path)
     args = app.helper(ops.ARCHIVE_PROGRAM)

@@ -4,7 +4,13 @@ Maxwell is a Discord self-bot backed by any OpenAI-compatible API. It reads text
 
 **This is a self-bot** (`discord.py-self`, `self_bot=True`). Self-bots may violate Discord ToS. Use at your own risk.
 
-## Quick start
+## Dame Curie deployment
+
+For this fork's compartmentalized deployment, start with [current verified status](docs/STATUS.md) and the [rootless Docker/Ollama/dashboard runbook](docs/DOCKER.md). Each identity owns its engine, state and embedder. The dashboard is served at `/admin/` on the instance's loopback web port; running the API alone is not the complete web deployment. The [shared Screen guide](docs/SCREEN_WORKFLOW.md) retains the stopped host-native deployment's rollback controls.
+
+The upstream host-native instructions below are a separate installation path, **not commands to run alongside an existing instance**. Never start the same Discord identity in both modes.
+
+## Quick start (upstream host-native)
 
 The newcomer path is one command:
 
@@ -61,7 +67,7 @@ One thing is worth knowing up front: the `shell` tool runs inside a Docker conta
 - X (Twitter): `x_read` pulls the home timeline, any public account, a search, mentions, or one post; `x_post` posts, replies, quotes, likes, reposts and deletes. Reading needs no account at all; posting uses the session cookies of a logged-in browser. No paid API anywhere. See [X (Twitter)](#x-twitter).
 - Autonomy: periodic self-directed checks where Maxwell reviews context/goals and decides whether to act without running a decider on every few messages.
 - Per-server custom prompts, RAG vector memory, and scoped cross-context facts across DMs, servers, groups, and channels.
-- RAG vector memory: messages, long-term facts, and shared context entries are embedded through any OpenAI-compatible or Ollama embeddings endpoint and stored in a SQLite vector database. Semantic search retrieves the most relevant memories for each conversation — global across all channels and servers. With no embedder reachable the bot logs one line and falls back to recent-history context.
+- RAG vector memory: messages, long-term facts, and shared context entries are embedded through any OpenAI-compatible or Ollama embeddings endpoint and stored in a SQLite vector database. Semantic search retrieves the most relevant memories for each conversation — global across all channels and servers. When the embedder is unavailable, raw memories remain stored; endpoint warnings are rate-limited and semantic recall degrades until recovery.
 - Opt-in REM "dreaming" pass that periodically consolidates recent visible traffic into long-term memory.
 - Web dashboard/admin API protected by HTTP Basic auth.
 - Site building: `create_site` publishes a whole directory (index plus any CSS/JS/subpages/data files) byte-for-byte under a configurable public URL, `edit_site` patches a published site in place, `delete_site` takes it down. Pass `backend=true` and the page gets a real server side — named values and append-only lists at `/api/site/<slug>/`, same origin, no key — so a guestbook, counter, poll, or saved state is one `fetch()` away.

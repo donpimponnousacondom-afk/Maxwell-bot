@@ -7,6 +7,8 @@
 	header X-Content-Type-Options nosniff
 	header Referrer-Policy strict-origin-when-cross-origin
 
+	redir /admin /admin/ 308
+
 	@backend path /api/* /data/* /bot/*/api /bot/*/api/*
 	handle @backend {
 		reverse_proxy api:8765

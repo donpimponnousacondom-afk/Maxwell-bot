@@ -217,7 +217,7 @@ def lifecycle(instance: Instance, action: str) -> None:
         if action == "restart":
             instance.compose("restart", "--timeout", "45", "bot", "api")
         elif action == "up":
-            instance.compose("up", "-d")
+            instance.compose("up", "-d", "--wait", "--wait-timeout", "300")
         else:
             instance.compose("logs", "--follow", "--tail", "100")
 

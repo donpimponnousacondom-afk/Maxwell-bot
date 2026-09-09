@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import os
 import platform
 import re
 import shutil
@@ -308,6 +309,16 @@ def capture_running_build(root: Path) -> RunningBuild:
         )
         if result.returncode == 0:
             dirty = bool(result.stdout.strip())
+    else:
+        commit = os.getenv("MAXWELL_BUILD_COMMIT", "").strip() or "unknown"
+        branch = os.getenv("MAXWELL_BUILD_BRANCH", "").strip() or "unknown"
+        date = os.getenv("MAXWELL_BUILD_DATE", "").strip() or "unknown"
+        subject = os.getenv("MAXWELL_BUILD_SUBJECT", "").strip() or "unknown"
+        dirty = {"true": True, "false": False}.get(
+            os.getenv("MAXWELL_BUILD_DIRTY", "").strip().lower()
+        )
+        if date != "unknown":
+            date = datetime.fromisoformat(date).astimezone(timezone.utc).isoformat()
     return RunningBuild(
         commit, branch, date, subject, dirty, started_at, platform.python_version()
     )

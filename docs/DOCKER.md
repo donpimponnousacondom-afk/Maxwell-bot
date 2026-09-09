@@ -4,9 +4,9 @@
 
 See [STATUS.md](STATUS.md) for dated implementation, test and deployment evidence. This guide describes the target and commands; it does not by itself certify a deployed stack. Root has authorized the current rollout recorded there.
 
-One Linux service user and **one private rootless Docker engine per bot identity**. Each engine runs bot, API, static web, the shell sandbox, and generated-site backends. Root in an application container is the service user's rootless identity, not host root. The private Docker socket still gives application code authority over that service user's files and containers: do not share an engine, account, supplementary groups, or writable paths between identities.
+One Linux service user and **one private rootless Docker engine per bot identity**. Each engine runs bot, API, static web, its own Ollama embedder/model initializer, the shell sandbox, and generated-site backends. Root in an application container is the service user's rootless identity, not host root. The private Docker socket still gives application code authority over that service user's files and containers: do not share an engine, account, supplementary groups, or writable paths between identities.
 
-This deployment does not enable full-host shell access or runtime source mutation. Images are read-only; shell workspace, prompts, memory, and generated sites are writable. The shell container filesystem is disposable: `stop` preserves it; `down` removes it. Put durable shell output in `/home/maxwell`.
+This deployment does not enable full-host shell access or runtime source mutation. Application/API/web/Ollama and generated-backend root filesystems are read-only; prompts, memory, model cache and generated-site state use separate writable mounts. The persistent shell root filesystem and workspace are writable. The shell container filesystem is disposable: `stop` preserves it; `down` removes it. Put durable shell output in `/home/maxwell`.
 
 Offline tests are available. Private-daemon lifecycle, ACL inheritance, actual image builds, network reachability, and backup/restore against a live rootless engine still require host acceptance testing. Do not interpret Python dependency installation as a successful Docker build. Base image tags and apt repositories are not digest/snapshot pinned; builds are not fully reproducible.
 
@@ -73,6 +73,16 @@ docker compose version
 Inspect stdout **and stderr**. Resolve rootless networking/cgroup warnings deliberately rather than switching to a rootful daemon. A user login is preferable to ad-hoc `sudo` environment inheritance; verify the lingering user service survives logout.
 
 Copy `docker/deploy.env.example` and `docker/bot.env.example` into the indicated locations as that service user, using mode 0600. Set the actual UID in `ENGINE_SOCKET`, unique loopback `WEB_PORT`, versioned image names, distinct Discord credentials, public origin, and selected provider settings. Keep `MAXWELL_SHELL_FULL_HOST=false`. Localhost inside a container is not the host's embedding, SMTP, or IMAP service: configure reachable endpoints and firewall them deliberately. Separate Telegram polling tokens as well.
+
+### Embeddings and dashboard startup
+
+Compose provisions `qwen3-embedding:0.6b` in a private per-project model volume using pinned Ollama 0.33.3. `ollama-pull` alone has registry egress and runs a loopback-only temporary server; it skips an already-present model and exits. The runtime `ollama` service joins only the internal embeddings network, with no published ports. Bot/API perform a real finite nonzero 1024-vector check before starting; explicit `ENABLE_RAG=false` skips that embedding request. See [CONFIGURATION.md](CONFIGURATION.md#compartmentalized-deployment-and-rag) for cache identity and bounded backfill.
+
+Caddy serves `/admin/` and proxies `/api/` on `127.0.0.1:WEB_PORT`. Both admin variables must be set; keep authentication enabled. The image removes Caddy's upstream `cap_net_bind_service` file capability because it listens on unprivileged port 8080 with all capabilities dropped. Otherwise Linux refuses to execute it under that bounding set. The web HTTP healthcheck and `instance.py up`'s `--wait --wait-timeout 300` prevent a successful creation command being mistaken for a healthy dashboard.
+
+Use the original configured dashboard credentials; do not paste them into chats or command arguments. For a remote host, forward the instance port over SSH and open `http://localhost:8081/admin/` (substitute its port). This deployment does not silently publish a public origin; configure an authenticated TLS reverse proxy explicitly before advertising externally reachable generated-site links.
+
+Application images support `MAXWELL_BUILD_COMMIT`, `MAXWELL_BUILD_BRANCH`, `MAXWELL_BUILD_DATE`, `MAXWELL_BUILD_SUBJECT` and `MAXWELL_BUILD_DIRTY` build arguments. Populate them from the exact source commit used for a secret-free build; do not mount `.git` or credentials into images. Version reporting uses that frozen metadata when Git is absent and honestly reports unknown if the builder omitted it.
 
 ### Editable prompts
 

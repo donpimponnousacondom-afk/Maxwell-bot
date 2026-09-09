@@ -152,6 +152,7 @@ from api.config import (  # noqa: E402
 )
 import site_backend  # noqa: E402
 import site_server  # noqa: E402
+from rag_memory import embedding_status  # noqa: E402
 
 from api.auth import (  # noqa: E402
     _DISCORD_TOKENS,
@@ -238,10 +239,8 @@ async def rag_memory_stats(request):
             "MAX(timestamp) as last "
             "FROM vectors WHERE kind='message' GROUP BY channel_id"
         )
-        total_vectors = _rag_query_one("SELECT COUNT(*) as c FROM vectors")
-        embedded = _rag_query_one(
-            "SELECT COUNT(*) as c FROM vectors WHERE embedding IS NOT NULL"
-        )
+        with contextlib.closing(_rag_db()) as connection:
+            embeddings = embedding_status(connection)
         messages = _rag_query_one(
             "SELECT COUNT(*) as c FROM vectors WHERE kind='message'"
         )
@@ -265,10 +264,11 @@ async def rag_memory_stats(request):
                 "messages": messages["c"] if messages else 0,
                 "context": context["c"] if context else 0,
                 "ltm": ltm["c"] if ltm else 0,
-                "total_vectors": total_vectors["c"] if total_vectors else 0,
-                "embedded": embedded["c"] if embedded else 0,
-                "pending_embeddings": (total_vectors["c"] if total_vectors else 0)
-                - (embedded["c"] if embedded else 0),
+                "total_vectors": embeddings["total"],
+                "embedded": embeddings["embedded"],
+                "pending_embeddings": embeddings["pending"],
+                "eligible_pending": embeddings["eligible_pending"],
+                "excluded_pending": embeddings["excluded_pending"],
                 "embed_model": RAG_EMBED_MODEL,
             }
         )
@@ -2065,22 +2065,21 @@ async def bot_status(request):
             "SELECT COUNT(*) as c FROM vectors WHERE kind='shared_context'"
         )
         ltm_row = _rag_query_one("SELECT COUNT(*) as c FROM vectors WHERE kind='ltm'")
-        total_row = _rag_query_one("SELECT COUNT(*) as c FROM vectors")
-        emb_row = _rag_query_one(
-            "SELECT COUNT(*) as c FROM vectors WHERE embedding IS NOT NULL"
-        )
+        with contextlib.closing(_rag_db()) as connection:
+            embeddings = embedding_status(connection)
         rag_stats = {
             "channels": chan_row["c"] if chan_row else 0,
             "messages": msg_row["c"] if msg_row else 0,
             "context": ctx_row["c"] if ctx_row else 0,
             "ltm": ltm_row["c"] if ltm_row else 0,
-            "total_vectors": total_row["c"] if total_row else 0,
-            "embedded": emb_row["c"] if emb_row else 0,
-            "pending_embeddings": (total_row["c"] if total_row else 0)
-            - (emb_row["c"] if emb_row else 0),
+            "total_vectors": embeddings["total"],
+            "embedded": embeddings["embedded"],
+            "pending_embeddings": embeddings["pending"],
+            "eligible_pending": embeddings["eligible_pending"],
+            "excluded_pending": embeddings["excluded_pending"],
             "embed_model": RAG_EMBED_MODEL,
         }
-    except sqlite3.Error:
+    except sqlite3.Error, ValueError:
         rag_stats = {
             "channels": 0,
             "messages": 0,
@@ -2089,6 +2088,8 @@ async def bot_status(request):
             "total_vectors": 0,
             "embedded": 0,
             "pending_embeddings": 0,
+            "eligible_pending": 0,
+            "excluded_pending": 0,
             "embed_model": RAG_EMBED_MODEL,
         }
     online = bool(bot_proc and bot_proc.get("pm2_env", {}).get("status") == "online")

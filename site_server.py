@@ -1123,7 +1123,7 @@ def contract(slug: str) -> str:
         f"  Public path : /bot/{slug}/api/...  ->  your routes, with /bot/{slug}/api stripped.\n"
         f"                A route defined as /notes is reached at /bot/{slug}/api/notes.\n"
         "  Entry       : app.py, listening on 0.0.0.0:$PORT (the runtime sets PORT).\n"
-        "  Installed   : python 3.12 + flask, waitress, fastapi, uvicorn, websockets, "
+        "  Installed   : python 3.14 + flask, waitress, fastapi, uvicorn, websockets, "
         "sqlalchemy, bcrypt, pyjwt, itsdangerous, requests, httpx, jinja2, pillow, "
         "and the stdlib (sqlite3, json, urllib). Anything else: pass packages=[...].\n"
         "  WebSockets  : supported end to end — use FastAPI + uvicorn (waitress "
