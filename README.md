@@ -329,7 +329,7 @@ A split reply gets one footer on its last chunk, while every delivered chunk can
 
 `debug` labels the exact measured message and call. A reply selects only that message in the same channel; an unrecorded reply never falls back to another message. Records are bounded to 1,024 delivered messages in this process, so evicted/pre-restart measurements are unavailable. The new footer/debug/version commands make no model request; their own footer uses unavailable call fields (`—`), never the diagnostic target's measurements. Other static notices do not acquire a model sample.
 
-`version` reports commit, branch, commit date/subject, dirty-at-startup state, process start time and Python version captured once at startup. Later commits do not change what the running process claims. A source tree without Git metadata reports unknown build fields rather than inventing a package version.
+`version` reports commit, branch, commit date/subject, dirty-at-startup state, process start time and Python version captured once at startup. Both timestamps use UTC (`+00:00`). The entire report, including its enabled footer, is displayed in a code block for readability. Later commits do not change what the running process claims. A source tree without Git metadata reports unknown build fields rather than inventing a package version.
 
 ## Sites
 

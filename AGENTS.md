@@ -212,6 +212,12 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### 2026-09-09 — UTC and code-block version reports
+
+- Root requested homogeneous UTC timestamps and a code block around the complete version report, including its enabled unavailable-metrics footer. Git commit dates are converted to UTC during the existing startup snapshot; process start was already UTC. Only the version command opts into fenced delivery; other command/reply formatting and startup-frozen provenance remain unchanged.
+- Fenced delivery reserves delimiter space, neutralizes embedded backtick runs before splitting and keeps the rendered footer within 300 characters without a literal subtext prefix. Self-authored history cleanup removes that terminal footer while retaining the surrounding code block; foreign content is unchanged. Added exact command-output, positive/negative timezone and midnight rollover, frozen snapshot, long-report, fence and footer-hygiene regressions; updated README.
+- Validation: 64 focused tests and the complete 1,846-test suite passed under isolated Python 3.14.4; one unavailable-Chromium skip and one deliberate live-test deselection. Full tests ran from a deployment-private-data-free source snapshot with disabled dotenv, isolated paths and private-read/non-loopback audit barriers. Scoped Ruff lint/format and diff whitespace pass; independent read-only review found no blocker. Root approved a coordinated existing-Screen restart after this verified commit; no runtime/config/dependency change has been made in this source slice.
+
 ### 2026-09-09 — observability build deployed in the existing shared Screen
 
 - After implementation commit 88e9ae3, preflight found the previous bot/flock gone and the existing Screen shell idle. Root explicitly chose targeted dependency installation and startup. Installed only tiktoken 0.14.0 and regex 2026.9.3 from local pinned wheels with no dependency resolution; requests 2.34.2 and the existing Python 3.13.5 runtime were preserved. An offline runtime smoke verified the vendored CL100K encoding. Development/full-suite verification remains Python 3.14.4 as recorded below.

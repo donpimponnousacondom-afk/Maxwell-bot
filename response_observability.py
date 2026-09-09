@@ -41,7 +41,13 @@ def footer_template_error(template: str) -> str | None:
     return error
 
 
-def render_footer(template: str, metrics: CallMetrics | None, bot_name: str) -> str:
+def render_footer(
+    template: str,
+    metrics: CallMetrics | None,
+    bot_name: str,
+    *,
+    code_block: bool = False,
+) -> str:
     values = dict.fromkeys(FOOTER_TOKENS, "—")
     values["BOT"] = bot_name
     if metrics is not None:
@@ -62,18 +68,22 @@ def render_footer(template: str, metrics: CallMetrics | None, bot_name: str) -> 
     rendered = (
         " ".join(rendered.split()).replace(FOOTER_MARKER, "").replace("@", "@\u200b")
     )
-    return "-# " + rendered[: 300 - 3 - len(FOOTER_MARKER)] + FOOTER_MARKER
+    prefix = "" if code_block else "-# "
+    if code_block:
+        rendered = re.sub(r"`(?=`)", "`\u200b", rendered)
+    return prefix + rendered[: 300 - len(prefix) - len(FOOTER_MARKER)] + FOOTER_MARKER
 
 
 def strip_footer(text: str, *, self_authored: bool) -> str:
-    body, separator, last_line = text.rpartition("\n")
+    fenced = text.startswith("```\n") and text.endswith("\n```")
+    body, separator, last_line = (text[:-4] if fenced else text).rpartition("\n")
     if (
         self_authored
         and separator
-        and last_line.startswith("-# ")
+        and (fenced or last_line.startswith("-# "))
         and last_line.endswith(FOOTER_MARKER)
     ):
-        return body
+        return body + "\n```" if fenced else body
     return text
 
 
@@ -93,6 +103,7 @@ def prepare_delivery(
     platform: str = "discord",
     limit: int = 1900,
     unmeasured: bool = False,
+    code_block: bool = False,
 ) -> tuple[list[str], list[str]]:
     control = getattr(bot, "_control", {}) or {}
     footer = ""
@@ -105,9 +116,15 @@ def prepare_delivery(
         if not isinstance(template, str) or footer_template_error(template):
             template = DEFAULT_FOOTER_FORMAT
         footer = render_footer(
-            template, metrics, str(getattr(bot, "bot_name", "Maxwell"))
+            template,
+            metrics,
+            str(getattr(bot, "bot_name", "Maxwell")),
+            code_block=code_block,
         )
     limit = min(limit, 2000 - len(footer) - 1) if footer else limit
+    if code_block:
+        text = re.sub(r"`(?=`)", "`\u200b", text)
+        limit = min(limit, 2000) - 8
     clean_chunks = (
         splitter(text, limit=limit)
         if splitter is not None
@@ -116,6 +133,9 @@ def prepare_delivery(
     wire_chunks = list(clean_chunks)
     if footer and wire_chunks and wire_chunks[-1]:
         wire_chunks[-1] += "\n" + footer
+    if code_block:
+        clean_chunks = [f"```\n{chunk}\n```" for chunk in clean_chunks]
+        wire_chunks = [f"```\n{chunk}\n```" for chunk in wire_chunks]
     return clean_chunks, wire_chunks
 
 
@@ -128,9 +148,16 @@ async def send_measured(bot, channel, text: str, metrics: CallMetrics | None) ->
         record_delivery(bot, getattr(sent, "channel", channel), sent, metrics)
 
 
-async def send_command_response(bot, channel, text: str, *, allowed_mentions) -> None:
+async def send_command_response(
+    bot, channel, text: str, *, allowed_mentions, code_block: bool = False
+) -> None:
     _, chunks = prepare_delivery(
-        bot, text, None, getattr(bot, "_split_response", None), unmeasured=True
+        bot,
+        text,
+        None,
+        getattr(bot, "_split_response", None),
+        unmeasured=True,
+        code_block=code_block,
     )
     for chunk in chunks:
         await channel.send(chunk, allowed_mentions=allowed_mentions)
@@ -264,6 +291,7 @@ def capture_running_build(root: Path) -> RunningBuild:
         )
         if result.returncode == 0:
             commit, date, subject = result.stdout.rstrip("\n").split("\n", 2)
+            date = datetime.fromisoformat(date).astimezone(timezone.utc).isoformat()
         result = subprocess.run(
             [git, "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,

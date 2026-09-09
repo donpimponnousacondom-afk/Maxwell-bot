@@ -442,12 +442,15 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
         assert "Running build:" in message.channel.sent[-1].content
         assert all(
             sent.content.endswith("-# TTFT — | TPS —" + FOOTER_MARKER)
-            for sent in message.channel.sent
+            for sent in message.channel.sent[:-1]
+        )
+        assert message.channel.sent[-1].content == (
+            "```\n" + build.format() + "\nTTFT — | TPS —" + FOOTER_MARKER + "\n```"
         )
         assert len(bot._delivery_measurements.records) == 1
         bot._control["footer_enabled"] = False
         await MaxwellBot._handle_command(bot, message)
-        assert FOOTER_MARKER not in message.channel.sent[-1].content
+        assert message.channel.sent[-1].content == "```\n" + build.format() + "\n```"
         message.content = "!debug"
         message.author.id = 8
         await MaxwellBot._handle_command(bot, message)
@@ -456,14 +459,24 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
     asyncio.run(scenario())
 
 
-def test_version_is_frozen_after_source_head_changes(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "commit_date,utc_date",
+    [
+        ("2026-09-09T00:00:00Z", "2026-09-09T00:00:00+00:00"),
+        ("2026-09-09T12:44:04+02:00", "2026-09-09T10:44:04+00:00"),
+        ("2026-09-09T23:44:04-05:00", "2026-09-10T04:44:04+00:00"),
+    ],
+)
+def test_version_is_frozen_after_source_head_changes(
+    monkeypatch, tmp_path, commit_date, utc_date
+):
     import response_observability as observability
 
     (tmp_path / ".git").mkdir()
     calls = []
     outputs = iter(
         [
-            "a" * 40 + "\n2026-09-09T00:00:00Z\nfirst commit\n",
+            "a" * 40 + f"\n{commit_date}\nfirst commit\n",
             "first-branch\n",
             " M source.py\n",
         ]
@@ -486,6 +499,34 @@ def test_version_is_frozen_after_source_head_changes(monkeypatch, tmp_path):
     assert "dirty at startup: yes" in first
     assert len(calls) == 3
     assert snapshot.commit == "a" * 40
+    assert snapshot.date == utc_date
+    assert f"Commit date: {utc_date}" in first
+    assert snapshot.started_at.endswith("+00:00")
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_fenced_report_bounds_footer_hygiene_and_embedded_fences(enabled):
+    from bot import MaxwellBot
+
+    bot = fake_bot(_control={"footer_enabled": enabled, "footer_format": "```" * 100})
+    clean, wire = prepare_delivery(
+        bot,
+        "Subject: ```example```\n" * 200,
+        None,
+        MaxwellBot._split_response,
+        unmeasured=True,
+        code_block=True,
+    )
+    assert len(wire) > 1
+    assert all(len(chunk) <= 2000 for chunk in wire)
+    assert all(chunk.startswith("```\n") and chunk.endswith("\n```") for chunk in wire)
+    assert all(chunk.count("```") == 2 for chunk in wire)
+    assert sum(FOOTER_MARKER in chunk for chunk in wire) == int(enabled)
+    assert [strip_footer(chunk, self_authored=True) for chunk in wire] == clean
+    assert [strip_footer(chunk, self_authored=False) for chunk in wire] == wire
+    if enabled:
+        assert len(wire[-1].splitlines()[-2]) <= 300
+        assert not wire[-1].splitlines()[-2].startswith("-# ")
 
 
 def test_intentional_unmeasured_footer_has_no_call_fields():

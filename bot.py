@@ -7722,7 +7722,7 @@ class MaxwellBot(commands.Bot):
                     text = format_debug(registry, channel_id, target_id)
                 await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
             elif cmd == "version":
-                await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none())
+                await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none(), code_block=True)
             elif cmd == "help":
                 await message.channel.send(
                     "Commands:\n"
