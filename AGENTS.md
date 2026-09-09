@@ -212,6 +212,13 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### 2026-09-09 — offline tokenizer preparation for per-response observability
+
+- Root approved only provider usage negotiation, per-call TTFT/TPS and reasoning-aware token counts, configurable Discord footers, message-scoped debug, and startup-frozen version reporting. The audited upstream search/profile/autonomy/presence changes are explicitly excluded. CONTEXT means input tokens; bare debug targets the latest measured message in that channel, while reply debug targets that exact message.
+- Pinned tiktoken 0.14.0, regex 2026.9.3 and requests 2.34.2 for host dependencies; updated the image lock. Vendored the official 100,256-entry CL100K vocabulary with its MIT license and exact SHA-256, allowing later runtime estimates without a tokenizer network fetch. The vocabulary is reference data, not 100,256 lines of application logic.
+- Preparation validation: seven tokenizer-asset/packaging tests passed under isolated Python 3.14.4; new asset tests pass Ruff lint/format. Python 3.14 wheels installed only into the isolated test dependency directory; compatible wheels for the existing host interpreter were downloaded but not installed. Runtime configuration, production venv and Screen are untouched in this preparation slice.
+- Provider and Discord delivery/command implementation remains in progress in separate working changes. TPS methodology is output including reasoning divided by successful-request elapsed time in both stream modes; non-stream TTFT is an explicitly marked response-time approximation. Reported counts take precedence over consistent local estimates; no shared last-call data may decorate another response.
+
 ### 2026-09-09 — reconcile live retry override/docs and restart shared Screen
 
 - Root's follow-up caught two missed references: README still advertised three attempts, and the deployment's exact OLLAMA_RETRY_ATTEMPTS override was still 3. On explicit direction, inspected that one non-secret setting and changed it to 5. The ignored deployment file is not staged; no other configuration keys were inspected or changed.
