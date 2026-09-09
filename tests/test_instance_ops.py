@@ -89,6 +89,26 @@ def test_inventory_ignores_other_instance_and_requires_labels():
         ops.select_owned([own], "curie", "maxwell-curie")
 
 
+@pytest.mark.parametrize("service", ["ollama", "ollama-pull"])
+def test_inventory_accepts_owned_embedding_services(service):
+    own = container(service)
+    foreign = container(service, instance="other")
+    assert ops.select_owned([foreign, own], "curie", "maxwell-curie") == [own]
+
+
+def test_inventory_rejects_unknown_compose_service():
+    with pytest.raises(ValueError, match="unexpected service"):
+        ops.select_owned([container("unexpected")], "curie", "maxwell-curie")
+
+
+def test_stop_quiesces_embedding_clients_before_server(tmp_path):
+    app = instance(tmp_path)
+    app.inventory = Mock(return_value=[container("ollama"), container("bot"), container("api"), container("web"), container("ollama-pull", running=False)])
+    app.docker = Mock()
+    ops.lifecycle(app, "stop")
+    assert [call.args[-1] for call in app.docker.call_args_list] == ["bot", "api", "web", "ollama"]
+
+
 def test_inventory_rejects_foreign_checkout():
     own = container("bot")
     own["Config"]["Labels"]["com.docker.compose.project.config_files"] = "/elsewhere/compose.yaml"

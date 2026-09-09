@@ -170,7 +170,7 @@ def select_owned(containers: list[dict], name: str, project: str) -> list[dict]:
         if compose:
             if labels.get("maxwell.instance", name) != name:
                 raise ValueError("conflicting instance ownership labels")
-            if labels.get("com.docker.compose.service") not in {"bot", "api", "web"}:
+            if labels.get("com.docker.compose.service") not in {"bot", "api", "web", "ollama", "ollama-pull"}:
                 raise ValueError("unexpected service in instance project")
             if labels.get("com.docker.compose.project.config_files") != str(CHECKOUT / "compose.yaml"):
                 raise ValueError("Compose container belongs to another checkout")
@@ -182,7 +182,7 @@ def select_owned(containers: list[dict], name: str, project: str) -> list[dict]:
 
 def writer_order(item: dict) -> int:
     labels = item["Config"].get("Labels") or {}
-    return {"bot": 0, "api": 1, "web": 3}.get(labels.get("com.docker.compose.service"), 2)
+    return {"bot": 0, "api": 1, "web": 3, "ollama": 4, "ollama-pull": 4}.get(labels.get("com.docker.compose.service"), 2)
 
 
 def stop_running(instance: Instance, containers: list[dict]) -> None:

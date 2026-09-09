@@ -35,7 +35,17 @@ Generated-site state and plugin/email/X state live under `data`; generated publi
 
 The wrapper needs host Python 3.14, the Docker CLI with Compose v2, and a separately configured rootless Docker daemon for each account. It requires `docker info` to report rootless security options at the expected socket and rejects even exit-zero results with stderr diagnostics. It never falls back to `/var/run/docker.sock`.
 
-For Debian-family hosts, after configuring Docker's official package repository for the host distribution, install the rootless/Compose dependencies as host root:
+### Existing Debian Docker installations
+
+Do not replace a working distro Docker package merely to provision another identity. On this Debian 13 host, the existing rootful daemon serves an unrelated proxy and stays untouched. `docker.io` 26.1.5 already supplies rootless scripts under `/usr/share/docker.io/contrib/`; add `rootlesskit slirp4netns uidmap dbus-user-session fuse-overlayfs acl`. Compose v2.39.4 was installed as a CLI plugin after checking its [official release checksum](https://github.com/docker/compose/releases/tag/v2.39.4).
+
+`docker/rootless-docker.service` is the Debian user-service unit. Install it as `~/.config/systemd/user/docker.service`, with the directories owned by the service user (not root). Install `docker/rootless-delegate.conf` into `/etc/systemd/system/user@UID.service.d/maxwell-delegate.conf` **only for the new identity UID**, then reload systemd before starting its lingering user manager. This delegates CPU/cpuset/I/O/memory/PID controllers without restarting or changing unrelated users. Enable the Docker unit via `systemctl --user enable --now docker`. Follow [Docker's rootless systemd/cgroup guidance](https://docs.docker.com/engine/security/rootless/tips/); never run it as a system-wide `User=` Docker service.
+
+Verify `docker info` reports both `name=rootless` and `CgroupDriver=systemd`, and run an actual resource-limited container. Private engines on this host use `/run/user/1003/docker.sock` (curie) and `/run/user/1004/docker.sock` (synthetic acceptance). Those UIDs are host evidence, not portable constants.
+
+### Fresh official Docker installations
+
+For Debian-family hosts without a conflicting installation, after configuring Docker's official package repository for the host distribution, install the rootless/Compose dependencies as host root:
 
 ```sh
 apt-get install docker-ce-cli docker-ce-rootless-extras docker-compose-plugin uidmap dbus-user-session slirp4netns fuse-overlayfs acl

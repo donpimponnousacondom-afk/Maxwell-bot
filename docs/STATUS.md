@@ -45,7 +45,7 @@ Historical full-suite counts are not current-HEAD acceptance evidence. The new f
 
 ## Current limitations
 
-- Host prerequisite installation and image/service acceptance remain to be performed in this rollout.
+- Two private rootless engines and host prerequisites are now provisioned and live-checked. Application image/service acceptance remains in progress; the first actual build exposed the nonexistent `docker:26.1.5-cli` image tag, now being corrected to a verified pinned upstream tag/digest.
 - Existing `doctor.py`/installer checks and embedding cache identity have known gaps; work is underway rather than claimed complete.
 - Legacy full-host shell mode remains a separate host-native risk; container mode rejects it.
 - The shell workspace is intentionally shared within an identity, not per Discord user. Networked tools retain outbound access; no claim of universal network isolation.
@@ -53,4 +53,6 @@ Historical full-suite counts are not current-HEAD acceptance evidence. The new f
 
 ## Milestones
 
-- Documentation reconciliation: replaced the mixed historical `AGENTS.md` with a concise operating contract and this explicit status ledger. Historical evidence is retained at `96b4803:AGENTS.md`. No runtime/configuration change yet.
+- `9659a61` — documentation reconciliation: replaced the mixed historical `AGENTS.md` with a concise operating contract and this explicit status ledger. Historical evidence is retained at `96b4803:AGENTS.md`. No runtime/configuration change in that slice.
+- Rootless prerequisites: installed seven Debian dependency packages without replacing Docker or restarting the existing rootful proxy. Installed checksum-verified Compose v2.39.4. Created private `maxwell-curie`/`maxwell-acceptance` users (1003/1004), distinct subordinate UID/GID ranges, private state roots and lingering per-user engines. Both report rootless security and systemd cgroups. Actual hello-world ran with memory/CPU/PID limits; peer socket/state access was denied. Fixed initial unit installation directory ownership before engines started. No credentials or real memory migrated.
+- Operations integration: allowlisted only the two new owned embedding services, stopping bot/API before Ollama and preserving the existing foreign-owner refusal. 48 isolated Python 3.14 operations cases passed from a source-only snapshot with private-read/network barriers. The first runner command used the wrong cwd and ran no tests; the corrected command above passed. Live stack lifecycle/restore remains next.
