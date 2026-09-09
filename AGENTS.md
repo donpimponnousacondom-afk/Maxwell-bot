@@ -212,6 +212,13 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### 2026-09-09 — raw numeric self-mention reply detection
+
+- `bot.py` now recognizes exact `<@SELF_ID>` and `<@!SELF_ID>` tokens in the incoming message content when Discord's parsed mentions omit the user. Display names, role/channel tokens, other user IDs and forwarded snapshot text do not acquire direct-reply status.
+- Existing ingress controls remain authoritative: bot enable/reply toggles, ignored users, blacklist, allowed/blocked channels, per-guild solo channel and self-message protection. No changes to autonomy policy, parsed memory metadata or the existing APP-message console-log exclusion.
+- Added `tests/test_bot_mentions.py`: five dispatch regressions failed against the previous implementation; all 21 cases pass with the fix. Combined mention/watch/forwarding/queue/solo/identity verification: 134 passed under isolated Python 3.14.4 with temporary runtime paths, disabled dotenv and no live endpoint requests. Full offline suite is pending the concurrent provider-resilience slice.
+- No production restart, runtime configuration edit or credential access during this implementation. Core source fixes are separate from the planned isolation/split-brain work; coordinate the existing shared Screen restart after verification.
+
 ### 2026-09-09 — shared Screen workflow handoff
 
 - Added docs/SCREEN_WORKFLOW.md: attach/detach/scrollback cheat sheet, single foreground bot and flock contract, coordinated stop/verify/start, agent collaboration and secret-safe testing, identity reminders, current-state snapshot and paste-ready next-agent instructions.

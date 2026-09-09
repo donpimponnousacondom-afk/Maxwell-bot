@@ -4234,7 +4234,9 @@ class MaxwellBot(commands.Bot):
             return False
         if isinstance(getattr(message, "channel", None), discord.DMChannel):
             return True
-        if self.user in (getattr(message, "mentions", None) or []):
+        if self.user in (getattr(message, "mentions", None) or []) or re.search(
+            rf"<@!?{self.user.id}>", getattr(message, "content", "") or ""
+        ):
             return True
         if message_reference_is_forward(message):
             return False
