@@ -109,9 +109,13 @@ The host bot and its Docker-backed tools are different layers. Docker-group acce
 
 “This GUI” in this chat means the DeepSeek Harness Web GUI, not the repository's bot dashboard. No implicit browser context is available. Do not change the harness or start a second web server unless that is the requested task.
 
-## Sanity-check snapshot for this handoff
+## Latest verified rollout
 
-Observed on 2026-09-09, before this documentation change:
+On 2026-09-09 at 08:47:58 +0200, root requested the shared-Screen restart after core fixes `bd1281e` and `5e9b5be`. The old bot/flock exited before replacement PID `2321644` started under flock PID `2321643` in the same attached `152732.dame_curie` window 0. The deployment's exact `OLLAMA_RETRY_ATTEMPTS` override was changed from 3 to 5; startup logged successful Discord login/guild connection and natural provider requests reported `attempt=1/5`. No duplicate bot, detached display or supervisor change. Re-check all PIDs and state before acting; see the latest `AGENTS.md` changelog for verification details.
+
+## Historical snapshot for the original handoff
+
+Observed on 2026-09-09, before the original documentation change:
 
 - Branch `pr/fixing_number_max_tool_calls`, HEAD `34f6580`; worktree clean.
 - Attached session `152732.dame_curie`, window `0` named `bash`.

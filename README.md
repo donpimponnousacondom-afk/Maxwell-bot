@@ -122,12 +122,14 @@ required values are the first thing in the file. The ones that matter:
 | `OLLAMA_REM_MODEL` | REM dreamer model (defaults to `OLLAMA_MODEL`) |
 | `OLLAMA_MAX_TOKENS` | Max output tokens per completion (default: `8192`) |
 | `OLLAMA_TEMPERATURE` | Sampling temperature (default: `0.7`) |
-| `OLLAMA_FALLBACK_*` | Optional secondary endpoint, rotates with primary |
+| `OLLAMA_FALLBACK_*` | Optional secondary endpoint; normally primary for attempts 1–2, fallback thereafter, subject to cooldown/routing |
 | `OLLAMA_VISION_*` | Optional vision/omni model for image/video turns (blank base/key inherit primary) |
-| `OLLAMA_RETRY_ATTEMPTS` | Total attempts per request (default: `3`) |
-| `OLLAMA_EMPTY_RESPONSE_RETRIES` | Extra recovery attempts after an HTTP 200 with no text/tool call; rotates endpoints and retries with non-streaming JSON (default: `2`) |
+| `OLLAMA_RETRY_ATTEMPTS` | Total attempts per request (default: `5`); transient retries wait 10, 20, 30, 40 seconds |
+| `OLLAMA_EMPTY_RESPONSE_RETRIES` | Up to `2` remaining attempts recover empty HTTP 200 content with non-streaming JSON; never extends the total attempt budget |
 | `AUTONOMY_BASE_URL` / `AUTONOMY_API_KEY` / `AUTONOMY_MODEL` | Override the autonomy engine endpoint; blank = use main |
 | `AUX_BASE_URL` / `AUX_API_KEY` / `AUX_MODEL` | Background context agents; blank = fall back to autonomy, then main |
+
+Explicit deployment values override these defaults and require a bot restart. Caller deadlines may stop retries earlier; see the [provider retry policy](docs/CONFIGURATION.md#provider-retries).
 
 ### Optional features
 

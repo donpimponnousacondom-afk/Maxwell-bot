@@ -212,6 +212,13 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### 2026-09-09 — reconcile live retry override/docs and restart shared Screen
+
+- Root's follow-up caught two missed references: README still advertised three attempts, and the deployment's exact OLLAMA_RETRY_ATTEMPTS override was still 3. On explicit direction, inspected that one non-secret setting and changed it to 5. The ignored deployment file is not staged; no other configuration keys were inspected or changed.
+- Corrected README's default, transient waits, empty-content recovery and fallback descriptions. Updated the standalone tool-budget HTML's provider table, replay/ceiling findings and evidence references to 5e9b5be while preserving the broader audit's historical 57d5b8c scope. The consistency regression now checks README, CONFIGURATION.md and the portable audit alongside code/template defaults, so the previous stale references fail it.
+- Coordinated restart used the existing attached 152732.dame_curie window 0. Verified old bot 2232199 and flock 2232197 exited, confirmed the foreground shell and cleared pending input, then sent one flock-wrapped run.sh command. Replacement bot 2321644 / flock 2321643 started at 08:47:58 +0200 in this checkout. Sanitized startup logs confirm Discord login/guild connection and natural provider requests at attempt=1/5. No extra live model probe, duplicate bot, detached display or supervisor change; private raw Screen snapshots were deleted after extracting operational fields.
+- Updated docs/SCREEN_WORKFLOW.md with the verified rollout and labeled its older snapshot historical. Validation: 137 provider tests passed under the existing isolated Python 3.14.4 environment; Ruff lint/format and diff whitespace pass. Portable HTML has unique IDs, resolving fragment links, no external assets and unchanged styles/scripts. No application-source change or repeat of the full suite in this docs/configuration follow-up; the previous unrelated site-cache failure remains recorded below.
+
 ### 2026-09-09 — provider response diagnostics and paced fixed-budget retries
 
 - `providers.py`, `config.py` and `.env.example` now default to five total attempts with linear 10/20/30/40-second transient waits, including endpoint switches, HTTP 429/500/502/503/504 and empty-content recovery. Explicit retry settings and fast-fallback limits still apply. Deterministic corrections/failover consume remaining attempts without a delay; native-tool correction no longer starts another whole request budget. Empty-content, media and temperature recovery cannot extend the total ceiling.
