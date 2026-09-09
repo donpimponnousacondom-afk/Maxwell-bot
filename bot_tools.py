@@ -7512,11 +7512,23 @@ class ShellTool(Tool):
         mounts = {(m["Source"], m["Destination"], m["RW"]) for m in info["Mounts"] if m["Type"] == "bind"}
         if mounts != expected_mounts or any(m["Type"] not in {"bind", "tmpfs"} for m in info["Mounts"]):
             raise ValueError("shell container has unexpected mounts")
-        if host.get("Privileged") or host.get("PidMode") == "host" or host.get("IpcMode") == "host" or host.get("Devices") or host.get("VolumesFrom"):
+        if host.get("Privileged") or host.get("PidMode") == "host" or host.get("IpcMode") == "host" or host.get("Devices") or host.get("DeviceRequests") or host.get("VolumesFrom"):
             raise ValueError("shell container has unsafe host access")
+        expected_limits = {"Memory": 4 * 1024**3, "NanoCpus": 2_000_000_000, "PidsLimit": 1024}
+        if any(host.get(key) != value for key, value in expected_limits.items()):
+            raise ValueError("shell container resource limits do not match configuration")
+        if host.get("PortBindings") or host.get("PublishAllPorts"):
+            raise ValueError("shell container must not publish ports")
+        if host.get("Tmpfs") != {"/tmp": "rw,exec,nosuid,size=256m"} or any(m["Type"] == "tmpfs" and m["Destination"] != "/tmp" for m in info["Mounts"]):
+            raise ValueError("shell container scratch mounts do not match configuration")
+        config = info["Config"]
+        if config.get("User") != "root" or config.get("WorkingDir") != "/home/maxwell" or config.get("Cmd") != ["sleep", "infinity"] or config.get("Entrypoint"):
+            raise ValueError("shell container process does not match configuration")
+        if set(info["NetworkSettings"]["Networks"]) != {"host" if full else "bridge"}:
+            raise ValueError("shell container has unexpected network attachments")
         if host.get("NetworkMode") != ("host" if full else "bridge") or host.get("Init") is not True:
             raise ValueError("shell container network/init does not match configuration")
-        if not full and (set(host.get("CapDrop") or []) != {"ALL"} or set(host.get("CapAdd") or []) != {"CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "NET_RAW", "NET_BIND_SERVICE"} or "no-new-privileges:true" not in (host.get("SecurityOpt") or [])):
+        if not full and (set(host.get("CapDrop") or []) != {"ALL"} or set(host.get("CapAdd") or []) != {"CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "NET_RAW", "NET_BIND_SERVICE"} or set(host.get("SecurityOpt") or []) != {"no-new-privileges:true"}):
             raise ValueError("shell container security options do not match configuration")
         if shell_runtime.container_mode():
             (stdout, stderr), code = await self._run_docker("image", "inspect", self.IMAGE_NAME, timeout=15)

@@ -26,11 +26,14 @@ def shell_info(instance="alice", running=True, mode="isolated"):
         "Id": "container-id",
         "Image": "image-id",
         "State": {"Running": running},
-        "Config": {"Labels": {
+        "Config": {"User": "root", "WorkingDir": "/home/maxwell", "Cmd": ["sleep", "infinity"], "Entrypoint": None, "Labels": {
             "maxwell.instance": instance, "maxwell.kind": "shell",
             "maxwell.shell.mode": mode, "maxwell.shell.init": "1",
         }},
+        "NetworkSettings": {"Networks": {"bridge": {}}},
         "HostConfig": {
+            "Memory": 4 * 1024**3, "NanoCpus": 2_000_000_000, "PidsLimit": 1024,
+            "Tmpfs": {"/tmp": "rw,exec,nosuid,size=256m"},
             "NetworkMode": "bridge", "Init": True,
             "CapDrop": ["ALL"],
             "CapAdd": ["CHOWN", "SETUID", "SETGID", "DAC_OVERRIDE", "FOWNER", "NET_RAW", "NET_BIND_SERVICE"],
@@ -128,6 +131,31 @@ def test_export_rejects_unexpected_container(mutation):
     shell._run_docker = AsyncMock(side_effect=[docker_result(["name=rootless"]), docker_result([info]), docker_result([image_info()])])
     with pytest.raises(ValueError):
         asyncio.run(shell._verify_export_container())
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("HostConfig", "Memory", 0),
+    ("HostConfig", "NanoCpus", 0),
+    ("HostConfig", "PidsLimit", -1),
+    ("HostConfig", "PortBindings", {"80/tcp": [{"HostPort": "8080"}]}),
+    ("HostConfig", "PublishAllPorts", True),
+    ("HostConfig", "DeviceRequests", [{"Count": -1}]),
+    ("HostConfig", "Tmpfs", {"/tmp": "rw,size=4g"}),
+    ("HostConfig", "SecurityOpt", ["no-new-privileges:true", "seccomp=unconfined"]),
+    ("Config", "User", "other"),
+    ("Config", "WorkingDir", "/"),
+    ("Config", "Cmd", ["bash"]),
+    ("Config", "Entrypoint", ["/unexpected"]),
+    ("NetworkSettings", "Networks", {"bridge": {}, "private-embeddings": {}}),
+])
+def test_export_refuses_configuration_drift_before_image_or_execution(section, key, value):
+    info = shell_info()
+    info[section][key] = value
+    shell = ShellTool(bot=None)
+    shell._run_docker = AsyncMock(side_effect=[docker_result(["name=rootless"]), docker_result([info])])
+    with pytest.raises(ValueError):
+        asyncio.run(shell._verify_export_container())
+    assert shell._run_docker.call_count == 2
 
 
 def test_owned_mode_transition_removes_by_id(monkeypatch):
