@@ -2,6 +2,8 @@
 
 ## Boundary and current verification
 
+See [STATUS.md](STATUS.md) for dated implementation, test and deployment evidence. This guide describes the target and commands; it does not by itself certify a deployed stack. Root has authorized the current rollout recorded there.
+
 One Linux service user and **one private rootless Docker engine per bot identity**. Each engine runs bot, API, static web, the shell sandbox, and generated-site backends. Root in an application container is the service user's rootless identity, not host root. The private Docker socket still gives application code authority over that service user's files and containers: do not share an engine, account, supplementary groups, or writable paths between identities.
 
 This deployment does not enable full-host shell access or runtime source mutation. Images are read-only; shell workspace, prompts, memory, and generated sites are writable. The shell container filesystem is disposable: `stop` preserves it; `down` removes it. Put durable shell output in `/home/maxwell`.

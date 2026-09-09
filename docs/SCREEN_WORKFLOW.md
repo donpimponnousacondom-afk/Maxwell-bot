@@ -2,6 +2,10 @@
 
 This is the operating contract for root's **existing host-native deployment**, not the multi-instance Compose deployment described in [DOCKER.md](DOCKER.md). Read [AGENTS.md](../AGENTS.md) first. Do not migrate process managers as part of an unrelated fix.
 
+## Current rollout authorization
+
+Root has now explicitly stopped the host bot and authorized the rootless Docker/Ollama/dashboard rollout. See [STATUS.md](STATUS.md) for current gates and runtime state. Preserve this Screen session as the shared operator terminal. The instructions below remain the **legacy host-native and rollback** contract; do not launch the legacy bot while its identity runs in Compose. The historical PIDs and launch records below must never be treated as live process ownership.
+
 ## Non-negotiables
 
 - Worktree: `/home/codexy/Dame_Curie/Maxwell-bot`. Run `pwd`; do not confuse the repository with the DSH harness checkout.
