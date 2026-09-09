@@ -13,6 +13,15 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from provider_telemetry import (
+    CallMetrics,
+    ChatCompletionMessage,
+    OutputObservation,
+    build_call_metrics,
+    local_encoding,
+    merge_usage,
+)
+
 logger = logging.getLogger(__name__)
 
 # asyncio holds only a weak reference to a running task, so a bare
@@ -613,6 +622,7 @@ async def _read_sse_response(
     on_tool_call_name=None,
     on_token=None,
     custom_tool_calls: bool = False,
+    observation: OutputObservation | None = None,
 ) -> dict:
     """Read an OpenAI-style SSE chat-completions stream and reassemble it into
     the same dict shape a non-streamed `await resp.json()` would return.
@@ -666,7 +676,7 @@ async def _read_sse_response(
     role: str | None = None
     finish_reason: str | None = None
     reasoning_parts: list[str] = []
-    first_token_s: float | None = None
+    observation = observation if observation is not None else OutputObservation()
     done = False
     # When custom_tool_calls=True, we route text deltas through this buffer
     # which incrementally extracts bare-JSON tool calls ({"name": "...",
@@ -764,8 +774,6 @@ async def _read_sse_response(
                 raise ProviderResponseError(
                     f"Provider stream has non-object JSON: data_frames={data_count}"
                 )
-            if first_token_s is None:
-                first_token_s = time.perf_counter()
             for choice in obj.get("choices", []) or []:
                 choice_count += 1
                 idx = choice.get("index", 0)
@@ -773,6 +781,7 @@ async def _read_sse_response(
                 while len(merged["choices"]) <= idx:
                     merged["choices"].append({})
                 delta = choice.get("delta") or {}
+                observation.observe(delta, time.perf_counter(), choice_index=idx)
                 if delta.get("role"):
                     role = delta["role"]
                 visible_content_delta = ""
@@ -950,14 +959,20 @@ async def _read_sse_response(
             # Some providers stream usage in the final frame (Anthropic-style
             # models on OpenRouter do this; OpenAI does it when
             # stream_options.include_usage=true).
-            if obj.get("usage"):
-                merged["usage"] = obj["usage"]
+            for usage_key in ("usage", "usageMetadata"):
+                usage_value = obj.get(usage_key)
+                if isinstance(usage_value, dict):
+                    merge_usage(merged.setdefault(usage_key, {}), usage_value)
+            merge_usage(merged, {
+                key: obj[key] for key in ("prompt_eval_count", "eval_count") if key in obj
+            })
         else:
             # No inner break — keep iterating. Outer loop continues.
             continue
         # Inner break hit [DONE]; stop reading.
         break
 
+    observation.finished_s = time.perf_counter()
     diagnostics = (
         f"bytes={byte_count} data_frames={data_count} choices={choice_count} "
         f"malformed_frames={malformed_count} done={done} trailing_bytes={len(buf)}"
@@ -1024,7 +1039,7 @@ async def _read_sse_response(
         "message": message,
         "finish_reason": finish_reason,
     }
-    merged["__first_token_s__"] = first_token_s
+    merged["__first_token_s__"] = observation.first_token_s
     return merged
 
 
@@ -1176,7 +1191,7 @@ class ProviderResult(str):
     object makes the handoff per-call and race-free.
     """
 
-    __slots__ = ("tool_calls", "usage", "assistant_message")
+    __slots__ = ("tool_calls", "usage", "assistant_message", "metrics")
 
     def __new__(
         cls,
@@ -1184,6 +1199,7 @@ class ProviderResult(str):
         tool_calls: list | None = None,
         usage: dict | None = None,
         assistant_message: dict | None = None,
+        metrics: CallMetrics | None = None,
     ):
         inst = super().__new__(
             cls, content if isinstance(content, str) else str(content or "")
@@ -1191,6 +1207,7 @@ class ProviderResult(str):
         inst.tool_calls = list(tool_calls) if tool_calls else []
         inst.usage = dict(usage) if usage else {}
         inst.assistant_message = assistant_message
+        inst.metrics = metrics
         return inst
 
 
@@ -1494,6 +1511,7 @@ class OllamaProvider:
         top_p: float = 0.95,
         top_k: int = 20,
     ):
+        local_encoding()
         self.base_url = normalize_base_url(base_url)
         self.model = model
         self.max_tokens = max_tokens
@@ -1557,6 +1575,7 @@ class OllamaProvider:
         # Same idea for models that accept exactly one temperature (Console Go
         # rejects anything but 0.6 with a 400). Learned once, applied up front.
         self._endpoint_temperatures: dict[str, float] = {}
+        self._stream_usage_unsupported: set[str] = set()
         # Endpoints that have proven they cannot accept attachments (e.g. a
         # text-only fallback like inclusionai/ling-3.0-flash 404ing with "No
         # endpoints found that support image input"). Remembered across calls
@@ -1748,6 +1767,8 @@ class OllamaProvider:
             "top_k": self.top_k,
             "stream": True,
         }
+        if endpoint.name not in self._stream_usage_unsupported:
+            data["stream_options"] = {"include_usage": True}
         # Always include max_tokens from config or override
         effective_max = max_tokens if max_tokens is not None else self.max_tokens
         # Proactively clamp to a previously-learned per-endpoint output cap so
@@ -1875,11 +1896,7 @@ class OllamaProvider:
 
         tool_calls = message.get("tool_calls") or []
         tool_calls = tool_calls if isinstance(tool_calls, list) else []
-        # Capture usage synchronously right after the await returns, before any
-        # further await can let a concurrent call overwrite shared state. This
-        # value is attached to the returned ProviderResult so the caller never
-        # has to read the racy shared ``self._last_usage``.
-        usage = dict(self._last_usage) if self._last_usage else {}
+        usage = getattr(message, "usage", {})
         # Keep the shared stash for backward-compat callers / tests, but callers
         # should prefer the ProviderResult attributes (race-free).
         self._last_tool_calls = tool_calls
@@ -1902,6 +1919,7 @@ class OllamaProvider:
             tool_calls=tool_calls,
             usage=usage,
             assistant_message=message,
+            metrics=getattr(message, "metrics", None),
         )
 
     async def generate_chat_completion(
@@ -2073,6 +2091,8 @@ class OllamaProvider:
                 # failure path. Keep the caller's reasoning preference intact:
                 # some models reject an explicit reasoning-disabled parameter.
                 data["stream"] = False
+                data.pop("stream_options", None)
+            observation = OutputObservation()
             request_start = time.perf_counter()
             media_parts = sum(
                 1
@@ -2172,6 +2192,27 @@ class OllamaProvider:
                         )
                     if resp.status != 200:
                         error_text = await resp.text()
+                        if (
+                            resp.status in (400, 422)
+                            and "stream_options" in data
+                            and re.search(
+                                r"\b(?:stream_options|include_usage)\b",
+                                error_text,
+                                re.IGNORECASE,
+                            )
+                            and any(
+                                term in error_text.lower()
+                                for term in (
+                                    "not supported", "does not support", "unsupported",
+                                    "not allowed", "unknown parameter", "unknown field",
+                                    "unrecognized", "unexpected", "extra inputs",
+                                )
+                            )
+                        ):
+                            self._stream_usage_unsupported.add(endpoint.name)
+                            if attempt < max_attempts:
+                                recovery_endpoint = endpoint
+                                continue
                         if attempt >= max_attempts:
                             raise ProviderRequestError(
                                 f"Provider API error: {resp.status}"
@@ -2455,7 +2496,6 @@ class OllamaProvider:
                             f"Provider API error: {resp.status}"
                         )
 
-                    json_ms = 0.0
                     content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
                     safe_content_type = (
                         content_type if content_type in {
@@ -2475,16 +2515,11 @@ class OllamaProvider:
                             on_tool_call_name=on_tool_call_name,
                             on_token=on_token,
                             custom_tool_calls=custom_tool_calls,
+                            observation=observation,
                         )
                         result = {
                             k: v for k, v in merged.items() if not k.startswith("__")
                         }
-                        first_token_s = merged.get("__first_token_s__")
-                        # Streaming has no JSON-parse step; report the
-                        # time-to-first-token so the latency log stays useful
-                        # instead of fabricating a json_ms value.
-                        if first_token_s is not None:
-                            json_ms = (first_token_s - request_start) * 1000
                     else:
                         try:
                             result = await resp.json(content_type=None)
@@ -2492,7 +2527,7 @@ class OllamaProvider:
                             raise ProviderResponseError(
                                 f"Provider JSON decoding failed: error_type={type(e).__name__}"
                             ) from None
-                        json_ms = (time.perf_counter() - request_start) * 1000
+                        observation.finished_s = time.perf_counter()
                     if not isinstance(result, dict):
                         logger.warning(
                             "Provider %s returned 200 with non-dict JSON body (type=%s)",
@@ -2519,6 +2554,12 @@ class OllamaProvider:
                         raise ProviderResponseError("Provider JSON response produced no choices")
 
                     message = choices[0].get("message", {})
+                    if response_format == "json":
+                        for index, choice in enumerate(choices):
+                            observation.observe(
+                                choice.get("message", {}), observation.finished_s,
+                                choice_index=index,
+                            )
                     content = message.get("content") or ""
                     if isinstance(content, list):
                         content = "".join(
@@ -2647,12 +2688,19 @@ class OllamaProvider:
                             continue
                         raise ProviderEmptyResponseError("Empty response from provider")
 
-                    usage = result.get("usage", {})
-                    self._last_usage = {
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
+                    metrics = build_call_metrics(
+                        result, data, observation,
+                        provider=urlsplit(endpoint.base_url).hostname or "unknown",
+                        endpoint=endpoint.name, model=data["model"],
+                        request_start=request_start, stream=response_format == "sse",
+                        attempt=attempt,
+                    )
+                    usage = {
+                        "prompt_tokens": metrics.input_tokens,
+                        "completion_tokens": metrics.output_tokens,
+                        "total_tokens": metrics.input_tokens + metrics.output_tokens,
                     }
+                    self._last_usage = dict(usage)
                     # Healthy response: this endpoint is no longer rate-limited.
                     self._endpoint_cooldown.pop(endpoint.name, None)
                     logger.info(
@@ -2660,12 +2708,12 @@ class OllamaProvider:
                         endpoint.name,
                         resp.status,
                         headers_ms,
-                        json_ms,
+                        metrics.elapsed_ms,
                         len(content or ""),
                         len(message.get("tool_calls") or []),
-                        self._last_usage.get("total_tokens", 0),
+                        usage["total_tokens"],
                     )
-                    return message
+                    return ChatCompletionMessage(message, metrics=metrics, usage=usage)
             except asyncio.TimeoutError:
                 logger.warning(
                     "Provider timing timeout endpoint=%s elapsed_ms=%.1f timeout=%s",

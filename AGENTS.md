@@ -212,6 +212,13 @@ For RAG counts, inspect only counts/NULL status; never dump stored message conte
 
 ## Working changelog
 
+### 2026-09-09 — response-owned provider timing and usage negotiation
+
+- Added provider_telemetry.py with immutable CallMetrics, per-return completion metadata and fixed local CL100K estimates. Successful-attempt whole-request TPS includes output and reasoning, never input or previous calls; SSE TTFT begins on generated content/reasoning/tool payload, while JSON/missing-first timing is explicitly estimated. Actual MIME parsing and actual selected request model determine the sample. Tokenizer initialization verifies the local asset before any generation.
+- ProviderResult now carries its own metrics and usage. Canonical inclusive output counts, separately reported Gemini thoughts, Ollama aliases and consistent reported total-minus-input are normalized without double counting. Positive reported aliases beat zero placeholders; real zero survives when no positive alternative exists. Malformed/nonfinite counts cannot turn an accepted response into a costly retry. Partial SSE trailers retain valid earlier fields and nested reasoning, while valid later corrections replace instead of accumulating.
+- Streaming requests request include_usage, learn explicit 400/422 unsupported-option responses per endpoint, and pin an in-budget corrected retry. The five-attempt ceiling, 10/20/30/40 transient waits, short fast-fallback budget and other existing recovery rules remain unchanged. Updated provider methodology docs and allowlisted the new module/vocabulary in the image build context; no Docker build or supervisor change was performed.
+- Validation: parent independently ran 281 provider/telemetry/asset/packaging tests under isolated Python 3.14.4; all passed. New-file Ruff format, scoped Ruff lint and diff whitespace pass. Independent review reproduced and verified fixes for null/partial usage trailers, reasoning detail loss, downward corrections and JSON/SSE aliases; final alias-priority regressions also pass. Full merged application verification and footer/debug/version integration remain next; runtime dependencies and Screen have not been changed.
+
 ### 2026-09-09 — offline tokenizer preparation for per-response observability
 
 - Root approved only provider usage negotiation, per-call TTFT/TPS and reasoning-aware token counts, configurable Discord footers, message-scoped debug, and startup-frozen version reporting. The audited upstream search/profile/autonomy/presence changes are explicitly excluded. CONTEXT means input tokens; bare debug targets the latest measured message in that channel, while reply debug targets that exact message.

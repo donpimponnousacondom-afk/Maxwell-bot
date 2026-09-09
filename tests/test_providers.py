@@ -171,6 +171,7 @@ def test_openrouter_native_reasoning_and_sampling_defaults(model):
         "top_k": 20,
         "max_tokens": 8192,
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
 
 

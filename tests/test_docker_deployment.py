@@ -68,6 +68,14 @@ def test_image_uses_allowlisted_source_and_locked_dependencies():
     assert all("==" in line and ">" not in line for line in dependencies)
     assert "discord.py-self==2.1.0" in dependencies
     assert not any(line.startswith("discord.py==") for line in dependencies)
+    assert "provider_telemetry.py" in dockerfile.split()
+    assert "provider_telemetry.py" in allowed
+    assert "COPY assets/tokenizers/ ./assets/tokenizers/" in dockerfile
+    assert {
+        "assets/tokenizers/cl100k_base.tiktoken",
+        "assets/tokenizers/LICENSE",
+        "assets/tokenizers/README.md",
+    } <= set(allowed)
 
 
 def test_bot_template_keeps_operational_paths_consistent():

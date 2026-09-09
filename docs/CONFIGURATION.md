@@ -57,6 +57,20 @@ With a fallback configured, ordinary routing uses the primary for attempts 1–2
 
 Recognized JSON/+json and SSE response Content-Types determine HTTP 200 decoding; missing or other types retain requested-format parsing for gateway compatibility. Explicit JSON/SSE error envelopes fail even after partial output; diagnostics contain allowlisted error code/type, a message-derived category, and numeric framing information, never raw error bodies or message previews. Unknown error labels are reported as unknown. Unterminated SSE tails fail instead of silently losing output. Malformed JSON frames remain skippable with numeric diagnostics; this is not a full SSE framing rewrite.
 
+## Per-call provider measurements
+
+Streaming requests send `stream_options: {"include_usage": true}`. An explicit unsupported-option HTTP 400/422 teaches that endpoint to omit the option for this process. A corrected request stays on that endpoint and consumes a remaining attempt; it never adds an attempt or overrides the five-attempt ceiling. Non-streaming requests omit the option.
+
+Measurements travel with the returned response, not a shared provider's last-call record:
+
+- **TPS** is generated output tokens, including reasoning, divided by the **successful HTTP attempt's full elapsed seconds**, consistently for SSE and JSON. This is end-to-end request throughput, not server-side decode speed or a short arrival-burst rate. Failed attempts, backoff, other tool-loop calls and unrelated requests are not accumulated into this sample; the successful attempt number is retained.
+- **TTFT** starts when that request is sent and ends at its first observed generated text, reasoning, tool name or arguments. Roles, IDs, usage-only frames and opaque signatures do not start it. JSON/non-streaming cannot reveal first-token arrival: total response time is used as an explicitly estimated proxy. Parsing uses actual recognized response Content-Type rather than assuming the requested stream mode.
+- **Reported counts win.** Canonical OpenAI completion/output totals already include their reasoning breakdown; it is not added twice. Known separately reported Gemini candidate/thought counts, Ollama count aliases and consistent reported total-minus-input counts are recognized. Partial SSE usage trailers preserve earlier valid fields; later valid corrections replace rather than accumulate counts. An output count of zero despite observed generated output is treated as an unavailable placeholder, not a fabricated zero-throughput measurement.
+- **Missing counts use fixed CL100K estimates**, with pinned `tiktoken` and the verified local vocabulary in `assets/tokenizers/`. No tokenizer network download occurs during inference. Reasoning promoted into an answer and parsed custom-tool JSON are counted only once. If only reasoning is reported, visible output is estimated separately and provenance is marked mixed. Unreported hidden reasoning remains unknown.
+- Estimated input uses compact JSON framing for textual messages and tool schemas. It is a comparable local approximation, not the model's exact chat template; structured media payloads and opaque signatures are excluded, so unreported media token costs remain unknown. Input counts mean tokens for this request, not context-window capacity.
+
+Required tokenizer dependencies and vocabulary must be installed together. The local tokenizer is initialized before generation, so a missing or corrupt required asset fails before a paid request rather than retrying an otherwise successful completion.
+
 ## Reconfigure
 
 From a cloned checkout:
