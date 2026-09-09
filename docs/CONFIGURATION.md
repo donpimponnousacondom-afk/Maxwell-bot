@@ -49,6 +49,14 @@ OLLAMA_MODEL=the-loaded-model-name
 OLLAMA_API_KEY=
 ```
 
+## Provider retries
+
+`OLLAMA_RETRY_ATTEMPTS` defaults to **5 total attempts** (range 1–10), not five retries. Explicit environment values override this default. Transient failures wait **10, 20, 30, 40 seconds** before attempts 2–5; the delay is linear and also applies when switching endpoints. Deterministic request rejection/failover and corrected-payload retries do not use this backoff, but still consume the fixed attempt budget.
+
+With a fallback configured, ordinary routing uses the primary for attempts 1–2 and the fallback for later attempts; endpoint cooldown and caller-requested fast/preferred fallback still apply. Fast fallback retains its shorter two-attempt budget. `OLLAMA_EMPTY_RESPONSE_RETRIES` (default 2) reserves up to that many remaining attempts for non-streaming empty-content recovery; it never increases the total budget. Caller-specific deadlines remain unchanged and may cancel a request before all attempts and the default 100 seconds of backoff finish.
+
+Recognized JSON/+json and SSE response Content-Types determine HTTP 200 decoding; missing or other types retain requested-format parsing for gateway compatibility. Explicit JSON/SSE error envelopes fail even after partial output; diagnostics contain allowlisted error code/type, a message-derived category, and numeric framing information, never raw error bodies or message previews. Unknown error labels are reported as unknown. Unterminated SSE tails fail instead of silently losing output. Malformed JSON frames remain skippable with numeric diagnostics; this is not a full SSE framing rewrite.
+
 ## Reconfigure
 
 From a cloned checkout:

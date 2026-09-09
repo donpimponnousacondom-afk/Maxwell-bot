@@ -220,11 +220,11 @@ class Config:
     OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "").strip()
     OLLAMA_VISION_DISABLE_REASONING = _bool_env("OLLAMA_VISION_DISABLE_REASONING", True)
     OLLAMA_RETRY_ATTEMPTS = _int_env(
-        "OLLAMA_RETRY_ATTEMPTS", 3, min_value=1, max_value=10
+        "OLLAMA_RETRY_ATTEMPTS", 5, min_value=1, max_value=10
     )
-    # Extra bounded recovery attempts for HTTP 200 responses that contain
-    # neither assistant text nor tool calls. These use a different endpoint
-    # when available and a non-streaming request to bypass flaky SSE gateways.
+    # Up to this many remaining attempts can recover empty HTTP 200 content
+    # with a different endpoint and non-streaming request. The total attempt
+    # budget is not extended.
     OLLAMA_EMPTY_RESPONSE_RETRIES = _int_env(
         "OLLAMA_EMPTY_RESPONSE_RETRIES", 2, min_value=0, max_value=5
     )
