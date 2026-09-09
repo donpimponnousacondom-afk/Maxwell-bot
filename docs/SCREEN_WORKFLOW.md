@@ -111,6 +111,14 @@ The host bot and its Docker-backed tools are different layers. Docker-group acce
 
 ## Latest verified rollout
 
+Observability build `88e9ae3` started on 2026-09-09 at 12:45:20 +0200, after root approved installing the two pinned tokenizer dependencies and starting the bot. Preflight found the previous bot/flock absent and `152732.dame_curie` window 0 already at its foreground bash prompt; no interrupt was sent. Installed only `tiktoken==0.14.0` and `regex==2026.9.3` from predownloaded wheels, without dependency resolution/network access. Existing `requests==2.34.2` and Python 3.13.5 remained unchanged; an offline runtime smoke verified the local CL100K vocabulary/encoding.
+
+After confirming no matching bot, the expected idle Screen shell and a clean committed checkout, cleared pending input and sent one existing `flock -n /tmp/dame-curie-maxwell.lock ./run.sh` launch. Verified bot PID `2440945`, flock PID `2440944`, shared shell `152733`, matching foreground process group and this checkout as cwd. Sanitized post-launch Screen records confirm Discord login, two guilds, provider initialization and a natural successful request (9,736.1 ms). Another natural foreground request exhausted five attempts with the allowlisted upstream diagnostic `context_limit / context_length_exceeded`; no model/context settings were changed. Private snapshots were deleted; no extra live model probe or test Discord message was sent.
+
+Implementation verification was 1,842 passed, one unavailable-Chromium skip and one deliberate live-test deselection under isolated Python 3.14.4. Live command/visual acceptance is still for root to exercise with `!version`, a normal reply and reply-targeted `!debug`. The running process started from clean source commit `88e9ae3`; later documentation commits intentionally do not change its startup-frozen version. No supervisor/interpreter migration or second restart for these operational notes. Re-check PIDs before the next operation.
+
+### Previous verified rollout
+
 On 2026-09-09 at 08:47:58 +0200, root requested the shared-Screen restart after core fixes `bd1281e` and `5e9b5be`. The old bot/flock exited before replacement PID `2321644` started under flock PID `2321643` in the same attached `152732.dame_curie` window 0. The deployment's exact `OLLAMA_RETRY_ATTEMPTS` override was changed from 3 to 5; startup logged successful Discord login/guild connection and natural provider requests reported `attempt=1/5`. No duplicate bot, detached display or supervisor change. Re-check all PIDs and state before acting; see the latest `AGENTS.md` changelog for verification details.
 
 ## Historical snapshot for the original handoff
