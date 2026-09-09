@@ -2941,7 +2941,7 @@ class MaxwellBot(commands.Bot):
         self.rem_prompt_body = load_rem_defaults()["prompt"]
         self._rem_running = False
         self.tools = {}
-        self.plugin_manager = PluginManager(self)
+        self.plugin_manager = PluginManager(self, data_dir=self.config.DATA_DIR)
         # Bounded: a plain dict here kept one Lock alive per channel the bot
         # had ever seen, which across a few hundred servers only ever grows.
         #
