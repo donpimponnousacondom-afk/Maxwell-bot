@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Release acceptance before deployment (2026-09-10)
+
+- Final application source **`677d2e49c555f5a64bf904ed74a6bfbba9f9bc67`** passed the complete isolated Python3.14.4 suite: **2,139 passed, zero failures/errors/skips**, 95.041s, mandatory unsafe test excluded. Evidence `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/677d2e49c555-wouibxq_/{pytest.log,results.xml}`.
+- Built **`maxwell-app:677d2e4`**, image ID `sha256:4d718cad7e19f4ec84c4dbd3a7de71dbe09e8360221dee55ad58e20bf3d14b14`, from that Git archive only with frozen build metadata. Disposable acceptance used the actual image, no network/private mounts/real credentials, read-only application and private tmpfs state. Real bot construction/close passed; loaded debug worked before inference; mocked canonical image response uploaded once, empty response submitted once, keyless image config borrowed no chat key, and signed/queryless link suppression preserved labels/other previews. Evidence `/home/codexy/.cache/maxwell-image-repair.BcJpcl/{build.log,acceptance.py,acceptance.log}`.
+- Root approved rollout after these checks. Fresh rollback capture and controlled maintenance are next; production is still `99fd7fa` until the rollout entry below is superseded.
+
 ## Duplicate image preview — implementation checkpoint (2026-09-10)
 
 - Foreground Discord delivery now suppresses previews only for image links already delivered by successful image tools in that response's local `all_tool_results`. Inline/Markdown links remain clickable; other URLs, code spans, later turns and concurrent channels are unchanged. Discord attachment links match by host/path despite removed/changed signed queries; other resource URLs require exact matches. No second attachment existed in the final text path: this is targeted unfurl suppression, not message-wide `suppress_embeds` or a generation/delivery retry change.
