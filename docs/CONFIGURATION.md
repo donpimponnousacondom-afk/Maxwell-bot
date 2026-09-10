@@ -87,7 +87,7 @@ OLLAMA_EXTRA_HEADERS={}
 
 Keep the existing OpenRouter key in `OLLAMA_API_KEY`. Provider selection is a **body** field, not a header. Availability and account-level restrictions still apply; `only` does not override them. See [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection). The base slug `deepinfra` allows its variants; use `deepinfra/turbo` to target that endpoint specifically. `:nitro` prioritizes throughput among eligible endpoints; it is not itself a provider pin.
 
-To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. This is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level and leaves the model/provider default unchanged. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. For other models this is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level. DeepSeek V4.1 Flash is explicitly parameterized as described below. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
 For OpenRouter app attribution, set HTTP **headers**, not body fields:
 
@@ -105,6 +105,24 @@ Scope and precedence:
 - Runtime-owned `model`, `messages`, `temperature`, `top_p`, `top_k`, `max_tokens`, `stream`, `stream_options`, `tools` and `tool_choice` take precedence. Use their existing configuration/call arguments rather than extra-body overrides.
 - Each request gets its own copy of the extra body, preserving configured routing through retries without sharing mutable nested state. Existing retry/streaming/telemetry behavior remains authoritative.
 - Headers can contain credentials: keep them in private instance configuration, never source control or public files. Clear endpoint-specific options when changing the main endpoint.
+
+## DeepSeek V4.1 Flash reasoning controls
+
+Primary Discord commands use the configured prefix (`!` here). Anyone can report; existing bot administrators can change settings:
+
+| Command | Effect |
+| --- | --- |
+| `!reasoning` | Report requested/effective primary reasoning and exact wire fields |
+| `!reasoning low` / `high` / `max` | Persist the chosen hosted tier; apply to subsequent primary requests without restart |
+| `!reasoning off` | Explicitly disable reasoning on the verified hosted routes |
+| `!effort` | Report the tier's reference-encoder effort preset |
+| `!effort 50` / `75` / `100` | Exact aliases for `low` / `high` / `max`; no rounding |
+
+The [reference encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/encoding/README.md) supports numeric 1–100 internally, but that does not establish arbitrary numeric HTTP support. The [official hosted API](https://api-docs.deepseek.com/api/create-chat-completion) and current [OpenRouter model metadata](https://openrouter.ai/api/v1/models) document string tiers. Other numeric values are rejected with an unchanged-setting report, never silently rounded or passed as unsupported integers. OpenRouter currently advertises reasoning enabled by default, `high` effort, and `mandatory=false`; this hosted model permits off.
+
+For OpenRouter's `deepseek/deepseek-v4.1-flash`, every request explicitly includes `reasoning: {"enabled": true, "effort": "high"}` by default; off sends `{"enabled": false, "effort": "none"}`. Official DeepSeek `deepseek-flash` (including the documented transitional Flash aliases) instead receives `thinking: {"type": "enabled"}` and `reasoning_effort: "high"`; off explicitly sends `disabled`/`none`. A persisted `deepseek_reasoning` control overrides the configured primary baseline. Explicit per-call disable/enable overrides retain precedence, including auxiliary calls. Fallback/dedicated clients do not inherit the primary command override; matching DeepSeek calls still receive explicit parameters. Other models are unchanged.
+
+No dashboard UI was added. Commands report actual loaded primary configuration; environment changes still require the normal operator restart. Preserve custom routing and attribution when changing the baseline.
 
 ## Independent HD image configuration
 

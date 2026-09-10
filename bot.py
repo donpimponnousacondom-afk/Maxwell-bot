@@ -337,8 +337,10 @@ from context_budget import (  # noqa: E402
 from control_defaults import (  # noqa: E402
     DEAD_CONTROL_KEYS,
     DEFAULT_CONTROL,
+    DEEPSEEK_REASONING_EFFORTS,
     KNOWN_TOOLS,
     parse_bool,
+    update_deepseek_reasoning,
 )
 import guild_onboarding  # noqa: E402
 from email_inbox import EmailInboxPoller  # noqa: E402
@@ -354,6 +356,7 @@ from providers import (  # noqa: E402
     OllamaProvider,
     ProviderEmptyResponseError,
     ProviderUsageExhaustedError,
+    deepseek_reasoning_transport,
 )
 from rag_memory import RAGMemoryManager, RemEventLog, _parse_iso  # noqa: E402
 from jobs import BackgroundJobManager, SpawnBackgroundTool  # noqa: E402
@@ -3408,6 +3411,7 @@ class MaxwellBot(commands.Bot):
             api_key=self.config.OLLAMA_API_KEY,
             extra_headers=self.config.OLLAMA_EXTRA_HEADERS,
             extra_body=self.config.OLLAMA_EXTRA_BODY,
+            reasoning_control=lambda: self._control.get("deepseek_reasoning", ""),
             disable_reasoning=self.config.OLLAMA_DISABLE_REASONING,
             fallback_base_url=self.config.OLLAMA_FALLBACK_BASE_URL,
             fallback_model=self.config.OLLAMA_FALLBACK_MODEL,
@@ -7713,6 +7717,8 @@ class MaxwellBot(commands.Bot):
                     )
             elif cmd == "solo":
                 await self._handle_solo_command(message, args)
+            elif cmd in {"reasoning", "effort"}:
+                await self._handle_reasoning_command(message, args, numeric=cmd == "effort")
             elif cmd == "footer":
                 await self._handle_footer_command(message, args)
             elif cmd == "debug":
@@ -7738,6 +7744,8 @@ class MaxwellBot(commands.Bot):
                     "` ,guide [goal]` / `,guided-goal [goal]` - create a thread and ask 5 clarifying questions before building (use when request is vague)\n"
                     "` ,help` - show this list\n"
                     f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
+                    f"`{self.command_prefix}reasoning [low|high|max|off]` - DeepSeek V4.1 reasoning (admin to change)\n"
+                    f"`{self.command_prefix}effort [1..100]` - report/set exact hosted presets 50/75/100; other values unsupported (admin to change)\n"
                     f"`{self.command_prefix}debug` - loaded model/provider and measured bot reply (admin; reply to select)\n"
                     f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
@@ -7948,6 +7956,55 @@ class MaxwellBot(commands.Bot):
             )
             with contextlib.suppress(discord.Forbidden):
                 await message.channel.send("Something went wrong with that command.")
+
+    async def _handle_reasoning_command(self, message, args, numeric: bool = False):
+        action = (args or "").strip().lower()
+        reporting = action in {"", "status"}
+        provider = self.ai_provider
+        transport = deepseek_reasoning_transport(provider.base_url, provider.model)
+        if not reporting and not self._is_admin(message.author.id):
+            text = "not authorized"
+        elif not transport:
+            text = "These controls are verified only for DeepSeek V4.1 Flash on OpenRouter or the official DeepSeek API. Current model unchanged."
+        else:
+            presets = {str(value): key for key, value in DEEPSEEK_REASONING_EFFORTS.items()}
+            level = presets.get(action, "") if numeric else action
+            valid = level in {*DEEPSEEK_REASONING_EFFORTS, "off"}
+            if not reporting and valid:
+                await asyncio.to_thread(
+                    update_deepseek_reasoning,
+                    Path(self.config.DATA_DIR) / "bot_control.json",
+                    level,
+                )
+                self._load_control(force=True)
+            effective = provider.deepseek_reasoning_level(provider._endpoints[0])
+            requested = self._control.get("deepseek_reasoning", "") or "configured baseline"
+            effort = DEEPSEEK_REASONING_EFFORTS.get(effective)
+            wire_effort = "none" if effective == "off" else effective
+            wire = (
+                f"reasoning.enabled={str(effective != 'off').lower()}, reasoning.effort={wire_effort}"
+                if transport == "openrouter"
+                else f"thinking.type={'disabled' if effective == 'off' else 'enabled'}, reasoning_effort={wire_effort}"
+            )
+            text = (
+                f"DeepSeek V4.1 Flash ({transport}), primary model\n"
+                f"Requested: {requested}; effective reasoning: {effective}\n"
+            )
+            text += (
+                f"Effort: {effort}/100 reference preset (sent as a string tier)\n"
+                if effort is not None else "Effort: inactive\n"
+            )
+            text += f"Wire: {wire}\nPer-call overrides (including auxiliary disable) take precedence; other models/fallback unchanged."
+            if numeric:
+                text += "\nHosted presets: 50=low, 75=high, 100=max. Arbitrary 1..100 passthrough is unverified; other values are unsupported and never rounded."
+            if not reporting and not valid:
+                text = "Unsupported setting; unchanged.\n" + text
+                if not numeric:
+                    text += f"\nUsage: `{self.command_prefix}reasoning [low|high|max|off]`"
+        await send_command_response(
+            self, message.channel, text,
+            allowed_mentions=discord.AllowedMentions.none(), unmeasured=False,
+        )
 
     async def _handle_footer_command(self, message, args):
         parts = (args or "status").split(maxsplit=1)

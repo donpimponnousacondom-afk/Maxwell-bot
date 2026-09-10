@@ -8,11 +8,13 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import aiohttp
 
+from control_defaults import DEEPSEEK_REASONING_EFFORTS
 from provider_telemetry import (
     CallMetrics,
     ChatCompletionMessage,
@@ -1486,6 +1488,17 @@ def normalize_base_url(base_url: str) -> str:
     return f"{base}/v1"
 
 
+def deepseek_reasoning_transport(base_url: str, model: str) -> str:
+    host = urlsplit(base_url).hostname
+    if host == "openrouter.ai" and model == "deepseek/deepseek-v4.1-flash":
+        return "openrouter"
+    if host == "api.deepseek.com" and model in {
+        "deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp",
+    }:
+        return "deepseek"
+    return ""
+
+
 class OllamaProvider:
     """OpenAI-compatible LLM Provider with multimodal support using /v1/chat/completions"""
 
@@ -1512,8 +1525,10 @@ class OllamaProvider:
         top_k: int = 20,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, object] | None = None,
+        reasoning_control: Callable[[], str] | None = None,
     ):
         local_encoding()
+        self.reasoning_control = reasoning_control
         self.extra_headers = dict(extra_headers or {})
         self.extra_body = copy.deepcopy(extra_body or {})
         self.base_url = normalize_base_url(base_url)
@@ -1738,6 +1753,46 @@ class OllamaProvider:
             self._cooldown_seconds,
         )
 
+    def deepseek_reasoning_level(
+        self,
+        endpoint: ProviderEndpoint,
+        model: str | None = None,
+        disable_reasoning: bool | None = None,
+    ) -> str:
+        body = self.extra_body if endpoint.name == "primary" else {}
+        reasoning = body.get("reasoning") or {}
+        thinking = body.get("thinking") or {}
+        level = reasoning.get("effort", body.get("reasoning_effort", "high"))
+        disabled = (
+            endpoint.disable_reasoning
+            or reasoning.get("enabled") is False
+            or thinking.get("type") == "disabled"
+            or level == "none"
+        )
+        if (
+            self.reasoning_control is not None
+            and endpoint.name == "primary"
+            and (model or endpoint.model) == self.model
+        ):
+            requested = self.reasoning_control()
+            if requested not in ("", "off", *DEEPSEEK_REASONING_EFFORTS):
+                raise ValueError("DeepSeek reasoning control must be low, high, max, off, or blank")
+            if requested:
+                level = "high" if requested == "off" else requested
+                disabled = requested == "off"
+        if disable_reasoning is not None:
+            disabled = disable_reasoning
+        if disabled:
+            level = "off"
+        else:
+            aliases = {"none": "high"}
+            if urlsplit(endpoint.base_url).hostname == "api.deepseek.com":
+                aliases.update({"minimal": "low", "medium": "high", "xhigh": "high", "ultra": "max"})
+            level = aliases.get(level, level)
+            if level not in DEEPSEEK_REASONING_EFFORTS:
+                raise ValueError("DeepSeek hosted reasoning supports low, high, max; numeric effort passthrough is unverified")
+        return level
+
     def _request_payload(
         self,
         endpoint: ProviderEndpoint,
@@ -1799,7 +1854,20 @@ class OllamaProvider:
             else endpoint.disable_reasoning
         )
         is_openrouter = urlsplit(endpoint.base_url).hostname == "openrouter.ai"
-        if use_disable_reasoning:
+        deepseek_transport = deepseek_reasoning_transport(endpoint.base_url, data["model"])
+        if deepseek_transport:
+            level = self.deepseek_reasoning_level(endpoint, data["model"], disable_reasoning)
+            data.pop("reasoning_effort", None)
+            data.pop("thinking", None)
+            reasoning = data.pop("reasoning", {})
+            if deepseek_transport == "openrouter":
+                reasoning.pop("max_tokens", None)
+                reasoning.update({"enabled": level != "off", "effort": "none" if level == "off" else level})
+                data["reasoning"] = reasoning
+            else:
+                data["thinking"] = {"type": "disabled" if level == "off" else "enabled"}
+                data["reasoning_effort"] = "none" if level == "off" else level
+        elif use_disable_reasoning:
             if is_openrouter:
                 data.pop("reasoning_effort", None)
                 data.pop("thinking", None)
