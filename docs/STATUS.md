@@ -1,5 +1,12 @@
 # Current implementation and deployment status
 
+## TTS scratch repair — implementation checkpoint (2026-09-09)
+
+- `TtsTool.execute` now owns a per-call temporary directory for WAV/OGG synthesis, conversion and delivery. The application filesystem stays read-only; success, provider/send failure and awaited cancellation clean scratch. Provider order, voices, languages and cooldown are unchanged.
+- **60 focused isolated tests passed**, including 12 new lifecycle/path regressions. Both new read-only-write and partial-provider-cleanup regressions fail against the previous source. Scoped Ruff passes. Full exact-commit suite and new-image acceptance follow this checkpoint.
+- Actual old `maxwell-app:3229a84` reproduced the failure under read-only `/app`, using real local eSpeak audio and ffmpeg with a mocked Riva response and intercepted upload: `Read-only file system`, no delivery. Diagnostic artifacts are private under `/home/codexy/.cache/maxwell-tts-fix.F9BDBX/`.
+- NVIDIA key presence was checked without exposing values: present in the development checkout `.env`, absent from active instance `config/bot.env`. Root authorized TTS/NVIDIA repair and testing; only that key will be transferred, with synthetic speech and no Discord test send. No runtime changes at this implementation checkpoint.
+
 ## Implemented, not deployed — primary request options (2026-09-09)
 
 - Added `OLLAMA_EXTRA_BODY` and `OLLAMA_EXTRA_HEADERS` as strict JSON-object configuration for the main client's primary endpoint. Enables OpenRouter `provider.only` and explicit `reasoning.effort` without changing account/workspace-wide routing. Runtime fields and explicit reasoning-disable calls retain precedence; API-key Authorization wins case-insensitively.
