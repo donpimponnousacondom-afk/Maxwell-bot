@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+from urllib.parse import urlsplit
 
 from provider_telemetry import CallMetrics
 from utils import FileLock, _atomic_json_write_sync
@@ -95,6 +96,50 @@ def clean_message_content(bot, message, content: str | None = None) -> str:
     return strip_footer(text, self_authored=bool(own_id and author_id == own_id))
 
 
+def suppress_delivered_image_previews(text: str, tool_results: list[str]) -> str:
+    delivered = set()
+    for result in tool_results:
+        if result.startswith(
+            (
+                "Tool image_generator: Image sent to chat:",
+                "Tool hd_image: HD image generated successfully:",
+                "Tool hd_image: HD image edited successfully:",
+            )
+        ):
+            delivered.update(
+                re.findall(r"(?m)^(?:Image URL|Permanent URL): (https?://\S+)", result)
+            )
+
+    attachment_url = re.compile(
+        r"https?://(cdn\.discordapp\.com|media\.discordapp\.net)"
+        r"(/attachments/[^?#]+)(?:[?#].*)?",
+        re.IGNORECASE,
+    )
+    attachments = {
+        (match[1].lower(), match[2])
+        for url in delivered
+        if (match := attachment_url.fullmatch(url))
+    }
+
+    def hide_preview(match: re.Match[str]) -> str:
+        token = match[0]
+        if match["url"] is None:
+            return token
+        url = token if token in delivered else token.rstrip(".,!;)]}'\"")
+        attachment = attachment_url.fullmatch(url)
+        duplicate = url in delivered or (
+            attachment and (attachment[1].lower(), attachment[2]) in attachments
+        )
+        return f"<{url}>{token[len(url):]}" if duplicate else token
+
+    return re.sub(
+        r"(?P<code>`+).*?(?P=code)|<https?://[^\s<>]+>|(?P<url>https?://[^\s<>]+)",
+        hide_preview,
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def prepare_delivery(
     bot,
     text: str,
@@ -150,14 +195,20 @@ async def send_measured(bot, channel, text: str, metrics: CallMetrics | None) ->
 
 
 async def send_command_response(
-    bot, channel, text: str, *, allowed_mentions, code_block: bool = False
+    bot,
+    channel,
+    text: str,
+    *,
+    allowed_mentions,
+    code_block: bool = False,
+    unmeasured: bool = True,
 ) -> None:
     _, chunks = prepare_delivery(
         bot,
         text,
         None,
         getattr(bot, "_split_response", None),
-        unmeasured=True,
+        unmeasured=unmeasured,
         code_block=code_block,
     )
     for chunk in chunks:
@@ -216,6 +267,26 @@ def record_delivery(
         if registry is None:
             registry = bot._delivery_measurements = DeliveryMeasurements()
         registry.record(str(channel_id), str(message_id), metrics)
+
+
+def format_runtime_provider(provider) -> str:
+    lines = ["Loaded runtime configuration:"]
+    if provider is None:
+        lines.append("Provider not initialized.")
+    else:
+        for endpoint in provider._endpoints:
+            if endpoint.name in ("primary", "fallback"):
+                label = endpoint.name.capitalize()
+                lines.extend(
+                    [
+                        f"{label} model: {endpoint.model}",
+                        f"{label} provider: {urlsplit(endpoint.base_url).hostname or 'unknown'}",
+                    ]
+                )
+        lines.append(
+            "Per-request fallback/overrides may differ; see measurements below."
+        )
+    return "\n".join(lines)
 
 
 def format_debug(

@@ -216,7 +216,7 @@ def lifecycle(instance: Instance, action: str) -> None:
         instance.inventory()
         if action == "restart":
             instance.compose("restart", "--timeout", "45", "bot", "api")
-        elif action == "up":
+        elif action in {"up", "start"}:
             instance.compose("up", "-d", "--wait", "--wait-timeout", "300")
         else:
             instance.compose("logs", "--follow", "--tail", "100")
@@ -315,7 +315,7 @@ def restore(instance: Instance, source: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("instance")
-    parser.add_argument("action", choices=("up", "stop", "restart", "logs", "down", "backup", "restore"))
+    parser.add_argument("action", choices=("up", "start", "stop", "restart", "logs", "down", "backup", "restore"))
     parser.add_argument("archive", nargs="?", type=Path)
     args = parser.parse_args()
     if (args.action in {"backup", "restore"}) != (args.archive is not None):

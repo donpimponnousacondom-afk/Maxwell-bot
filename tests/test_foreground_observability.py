@@ -293,3 +293,126 @@ def test_multichar_prefix_commands_and_help_fit_discord(command):
         assert all(len(sent.content) <= 2000 for sent in message.channel.sent)
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("tool_name,prefix", [
+    ("image_generator", "Image sent to chat:"),
+    ("hd_image", "HD image generated successfully:"),
+    ("hd_image", "HD image edited successfully:"),
+])
+def test_foreground_image_link_has_one_upload_and_preserves_metrics_and_next_turn(
+    foreground_bot, measured_call, tool_name, prefix
+):
+    async def scenario():
+        bot, message = foreground_bot, Message()
+        url = "https://cdn.discordapp.com/attachments/100/200/generated_image.png"
+        text = f"Fresh shot: [generated_image.png]({url})\nhttps://example.com/article"
+        final_metrics = replace(measured_call, call_id="B", model="final-model")
+
+        async def dispatch(message, response, *, native_tool_calls=None, **kwargs):
+            results = []
+            if native_tool_calls:
+                await message.channel.send(file=object())
+                results = [f"Tool {tool_name}: {prefix} synthetic\nImage URL: {url}?ex=abc&hm=123"]
+            return str(response), results, []
+
+        bot._dispatch_tool_calls = AsyncMock(side_effect=dispatch)
+        bot._generate_response = AsyncMock(side_effect=[
+            ProviderResult("", tool_calls=[tool_call(tool_name, prompt="synthetic")], metrics=measured_call),
+            ProviderResult(text, metrics=final_metrics),
+            ProviderResult(text, metrics=measured_call),
+        ])
+        await MaxwellBot._handle_message(bot, message)
+        assert len(message.channel.sent) == 2
+        upload, final = message.channel.sent
+        assert upload.kwargs["file"] is not None
+        assert final.kwargs.get("file") is None
+        assert "suppress_embeds" not in final.kwargs
+        assert final.content.startswith(text.replace(f"({url})", f"(<{url}>)"))
+        assert final.content.endswith(FOOTER_MARKER)
+        assert bot._delivery_measurements.lookup("100", str(final.id))[1] is final_metrics
+        assert bot.add_message_to_memory.call_args.args[1]["content"] == text
+        assert bot._record_rem_event.call_args.args[2] == text
+        following = Message()
+        following.id = 8
+        following.channel = message.channel
+        await MaxwellBot._handle_message(bot, following)
+        assert len(message.channel.sent) == 3
+        assert message.channel.sent[-1].content.startswith(text)
+        assert f"<{url}>" not in message.channel.sent[-1].content
+
+    asyncio.run(scenario())
+
+
+def test_foreground_image_preview_suppression_is_not_shared_across_channels(
+    foreground_bot, measured_call
+):
+    async def scenario():
+        bot, first, other = foreground_bot, Message(), Message()
+        other.id, other.channel.id = 8, 200
+        url = "https://cdn.discordapp.com/attachments/100/200/generated_image.png"
+        ready, release = asyncio.Event(), asyncio.Event()
+
+        async def dispatch(message, response, *, native_tool_calls=None, **kwargs):
+            results = []
+            if native_tool_calls:
+                results = [f"Tool image_generator: Image sent to chat: synthetic\nImage URL: {url}?ex=abc"]
+                ready.set()
+                await release.wait()
+            return str(response), results, []
+
+        bot._dispatch_tool_calls = AsyncMock(side_effect=dispatch)
+        bot._generate_response = AsyncMock(side_effect=[
+            ProviderResult("", tool_calls=[tool_call("image_generator", prompt="synthetic")]),
+            ProviderResult(url, metrics=measured_call),
+            ProviderResult(url, metrics=measured_call),
+        ])
+        async with asyncio.TaskGroup() as tasks:
+            tasks.create_task(MaxwellBot._handle_message(bot, first))
+            await asyncio.wait_for(ready.wait(), timeout=1)
+            await MaxwellBot._handle_message(bot, other)
+            release.set()
+        assert other.channel.sent[-1].content.startswith(url + "\n")
+        assert first.channel.sent[-1].content.startswith(f"<{url}>\n")
+
+    asyncio.run(scenario())
+
+
+def test_foreground_image_link_progress_edit_uses_suppressed_target(
+    foreground_bot, measured_call, monkeypatch
+):
+    import bot as bot_module
+
+    async def scenario():
+        bot, message = foreground_bot, Message()
+        url = "https://cdn.discordapp.com/attachments/100/200/generated_image.png"
+        edited = []
+
+        async def transition(content, *, on_delivered):
+            sent = SimpleNamespace(id=900, channel=message.channel, content=content)
+            edited.append(sent)
+            on_delivered(sent)
+            return True
+
+        progress = SimpleNamespace(
+            start_defer=AsyncMock(), stop=AsyncMock(),
+            transition_to_final=AsyncMock(side_effect=transition),
+        )
+        monkeypatch.setattr(bot_module, "_make_tool_progress", lambda message: progress)
+        bot._progress_enabled = lambda guild: True
+        bot._dispatch_tool_calls = AsyncMock(side_effect=[
+            ("", [f"Tool image_generator: Image sent to chat: synthetic\nImage URL: {url}?ex=abc"], []),
+            (f"[shot]({url})", [], []),
+        ])
+        bot._generate_response = AsyncMock(side_effect=[
+            ProviderResult("", tool_calls=[tool_call("image_generator", prompt="synthetic")]),
+            ProviderResult(f"[shot]({url})", metrics=measured_call),
+        ])
+        await MaxwellBot._handle_message(bot, message)
+        assert not message.channel.sent
+        assert len(edited) == 1
+        assert edited[0].content.startswith(f"[shot](<{url}>)\n")
+        assert edited[0].content.endswith(FOOTER_MARKER)
+        assert bot._delivery_measurements.lookup("100", "900")[1] is measured_call
+
+    asyncio.run(scenario())

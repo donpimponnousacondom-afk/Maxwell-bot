@@ -71,6 +71,47 @@ OLLAMA_MODEL=the-loaded-model-name
 OLLAMA_API_KEY=
 ```
 
+## Custom request options and OpenRouter routing
+
+`OLLAMA_EXTRA_BODY` and `OLLAMA_EXTRA_HEADERS` accept JSON objects, defaulting to `{}`. Header values must be strings. Invalid JSON/non-object values stop startup rather than silently dropping routing restrictions. These options require an application image built from the updated source and a bot restart; changing only the production `.env` does not update an older image.
+
+For per-request DeepInfra routing without account/workspace-wide provider changes:
+
+```ini
+OLLAMA_BASE_URL=https://openrouter.ai/api/v1
+OLLAMA_MODEL=openai/gpt-oss-120b:nitro
+OLLAMA_DISABLE_REASONING=false
+OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]}}'
+OLLAMA_EXTRA_HEADERS={}
+```
+
+Keep the existing OpenRouter key in `OLLAMA_API_KEY`. Provider selection is a **body** field, not a header. Availability and account-level restrictions still apply; `only` does not override them. See [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection). The base slug `deepinfra` allows its variants; use `deepinfra/turbo` to target that endpoint specifically. `:nitro` prioritizes throughput among eligible endpoints; it is not itself a provider pin.
+
+To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. This is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level and leaves the model/provider default unchanged. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+
+For actual custom headers, for example `OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://your-domain.example","X-Title":"Curie"}'`. The configured API key takes precedence over any case variant of `Authorization`.
+
+Scope and precedence:
+
+- Options apply only to the main client's **primary endpoint**, including background/auxiliary calls that reuse that client and primary model overrides. They are not inherited by fallback, vision, or separately constructed autonomy/auxiliary clients—even on the same host. OpenRouter's `provider.only` does not disable Maxwell's separately configured fallback endpoint.
+- Runtime-owned `model`, `messages`, `temperature`, `top_p`, `top_k`, `max_tokens`, `stream`, `stream_options`, `tools` and `tool_choice` take precedence. Use their existing configuration/call arguments rather than extra-body overrides.
+- Each request gets its own copy of the extra body, preserving configured routing through retries without sharing mutable nested state. Existing retry/streaming/telemetry behavior remains authoritative.
+- Headers can contain credentials: keep them in private instance configuration, never source control or public files. Clear endpoint-specific options when changing the main endpoint.
+
+## Independent HD image configuration
+
+`hd_image` uses only `GEMINI_IMAGE_BASE_URL`, `GEMINI_IMAGE_API_KEY`, and `GEMINI_IMAGE_MODEL`. It never inherits `OLLAMA_*` chat configuration, credentials, routing options or model. A blank dedicated base URL returns a configuration error before fetching input images or making any generation request. A blank dedicated key sends no Authorization header, allowing explicitly configured keyless gateways. Merely adding a paid chat key must not enable paid HD image generation.
+
+```ini
+GEMINI_IMAGE_BASE_URL=
+GEMINI_IMAGE_API_KEY=
+GEMINI_IMAGE_MODEL=gemini-3.1-flash-image
+```
+
+Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content` (text or image-url parts) or `message.images[].image_url.url`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. Each tool invocation submits generation once: empty/unrecognized responses, timeouts and server errors do not trigger a second potentially billable request. This is not a cross-invocation deduplication policy. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
+
+Both tools remain registered under `ENABLE_IMAGE_GEN`; dashboard Runtime controls → Tools can disable `hd_image` independently. The no-inheritance behavior requires the updated application image, not only an environment edit. See [STATUS.md](STATUS.md) for deployed versus source-only state.
+
 ## Provider retries
 
 `OLLAMA_RETRY_ATTEMPTS` defaults to **5 total attempts** (range 1–10), not five retries. Explicit environment values override this default. Transient failures wait **10, 20, 30, 40 seconds** before attempts 2–5; the delay is linear and also applies when switching endpoints. Deterministic request rejection/failover and corrected-payload retries do not use this backoff, but still consume the fixed attempt budget.
@@ -80,6 +121,8 @@ With a fallback configured, ordinary routing uses the primary for attempts 1–2
 Recognized JSON/+json and SSE response Content-Types determine HTTP 200 decoding; missing or other types retain requested-format parsing for gateway compatibility. Explicit JSON/SSE error envelopes fail even after partial output; diagnostics contain allowlisted error code/type, a message-derived category, and numeric framing information, never raw error bodies or message previews. Unknown error labels are reported as unknown. Unterminated SSE tails fail instead of silently losing output. Malformed JSON frames remain skippable with numeric diagnostics; this is not a full SSE framing rewrite.
 
 ## Per-call provider measurements
+
+`!debug` (or the configured command prefix) shows the running client's loaded primary/fallback model and provider hostname before its process-local measured-reply section. No completion or provider probe is needed to inspect the loaded configuration. This is not a reread of edited environment files or a guarantee of the next request's route: fallback and per-call overrides can differ. Measurements still belong to their original response and disappear when the process restarts. The debug report uses fenced code blocks without an unmeasured TTFT/TPS footer; endpoint credentials, paths, query strings and raw request options are not displayed. Requires the updated image; see [STATUS.md](STATUS.md).
 
 Streaming requests send `stream_options: {"include_usage": true}`. An explicit unsupported-option HTTP 400/422 teaches that endpoint to omit the option for this process. A corrected request stays on that endpoint and consumes a remaining attempt; it never adds an attempt or overrides the five-attempt ceiling. Non-streaming requests omit the option.
 

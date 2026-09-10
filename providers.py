@@ -1510,8 +1510,12 @@ class OllamaProvider:
         empty_response_retries: int | None = None,
         top_p: float = 0.95,
         top_k: int = 20,
+        extra_headers: dict[str, str] | None = None,
+        extra_body: dict[str, object] | None = None,
     ):
         local_encoding()
+        self.extra_headers = dict(extra_headers or {})
+        self.extra_body = copy.deepcopy(extra_body or {})
         self.base_url = normalize_base_url(base_url)
         self.model = model
         self.max_tokens = max_tokens
@@ -1600,9 +1604,14 @@ class OllamaProvider:
 
     def _headers(self, endpoint: ProviderEndpoint = None) -> dict[str, str]:
         api_key = self.api_key if endpoint is None else endpoint.api_key
-        if not api_key:
-            return {}
-        return {"Authorization": f"Bearer {api_key}"}
+        extras = self.extra_headers if endpoint is None or endpoint.name == "primary" else {}
+        headers = {
+            key: value for key, value in extras.items()
+            if not api_key or key.lower() != "authorization"
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
 
     def _endpoint_named(self, name: str) -> ProviderEndpoint | None:
         for ep in self._endpoints:
@@ -1757,7 +1766,10 @@ class OllamaProvider:
         forced_temperature = self._endpoint_temperatures.get(endpoint.name)
         if forced_temperature is not None:
             effective_temperature = forced_temperature
-        data = {
+        data = copy.deepcopy(self.extra_body) if endpoint.name == "primary" else {}
+        for key in ("tools", "tool_choice", "stream_options"):
+            data.pop(key, None)
+        data.update({
             "model": (model or endpoint.model)
             if endpoint.name == "primary"
             else endpoint.model,
@@ -1766,7 +1778,7 @@ class OllamaProvider:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "stream": True,
-        }
+        })
         if endpoint.name not in self._stream_usage_unsupported:
             data["stream_options"] = {"include_usage": True}
         # Always include max_tokens from config or override
@@ -1789,6 +1801,8 @@ class OllamaProvider:
         is_openrouter = urlsplit(endpoint.base_url).hostname == "openrouter.ai"
         if use_disable_reasoning:
             if is_openrouter:
+                data.pop("reasoning_effort", None)
+                data.pop("thinking", None)
                 data["reasoning"] = {"enabled": False}
             else:
                 data["reasoning_effort"] = "none"

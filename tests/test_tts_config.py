@@ -135,7 +135,9 @@ def test_tts_spanish_falls_back_to_gtts_without_nvidia_key(monkeypatch, tmp_path
 
     assert calls == [("hola mundo", "es")]
     assert len(sent) == 1
-    assert sent[0].startswith("tts_") and sent[0].endswith(".ogg")
+    assert Path(sent[0]).is_absolute()
+    assert Path(sent[0]).name.startswith("tts_") and sent[0].endswith(".ogg")
+    assert not Path(sent[0]).parent.exists()
 
 
 def test_fish_tts_writes_audio_on_success(monkeypatch, tmp_path):
@@ -335,4 +337,6 @@ def test_tts_tool_prefers_fish_over_riva(monkeypatch, tmp_path):
     assert fish_calls[0][0] == "hello from fish"
     assert fish_calls[0][2] == "s2.1-pro-free"
     assert len(sent) == 1
-    assert sent[0].startswith("tts_") and sent[0].endswith(".ogg")
+    assert Path(sent[0]).is_absolute()
+    assert Path(sent[0]).name.startswith("tts_") and sent[0].endswith(".ogg")
+    assert not Path(sent[0]).parent.exists()

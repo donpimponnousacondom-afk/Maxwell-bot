@@ -1346,10 +1346,9 @@ class HDImageGeneratorTool(Tool):
 
     # Discord's own limit is 25MB; inputs get downscaled well below it.
     MAX_INPUT_BYTES = 20 * 1024 * 1024
-    # An empty response is usually a silent safety refusal, which repeats
-    # deterministically (6/6 in testing on a photo of a real person). Retry
-    # once for a genuinely flaky gateway, then stop burning ~20s a try.
-    MAX_ATTEMPTS = 2
+    # Generation can be billed even when its response is lost or unrecognized.
+    # Never automatically submit a second generation request.
+    MAX_ATTEMPTS = 1
     _DATA_URI_RE = re.compile(
         r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
     )
@@ -1367,16 +1366,10 @@ class HDImageGeneratorTool(Tool):
         )
 
     def _endpoint(self) -> tuple[str, str, str]:
-        """(chat_completions_url, api_key, model), inheriting the primary endpoint."""
+        """(chat_completions_url, api_key, model) from dedicated image settings."""
         cfg = self.bot.config
-        base = (
-            getattr(cfg, "GEMINI_IMAGE_BASE_URL", "")
-            or getattr(cfg, "OLLAMA_BASE_URL", "")
-            or ""
-        ).rstrip("/")
-        key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or getattr(
-            cfg, "OLLAMA_API_KEY", ""
-        )
+        base = (getattr(cfg, "GEMINI_IMAGE_BASE_URL", "") or "").strip().rstrip("/")
+        key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or ""
         model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or "gemini-3.1-flash-image"
         url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         return url, key, model
@@ -1498,7 +1491,7 @@ class HDImageGeneratorTool(Tool):
 
         api_url, api_key, model = self._endpoint()
         if not api_url or api_url == "/chat/completions":
-            return "Error: HD image generation is not configured (no GEMINI_IMAGE_BASE_URL or OLLAMA_BASE_URL)"
+            return "Error: HD image generation is not configured (set GEMINI_IMAGE_BASE_URL explicitly; chat settings are not used)"
 
         # Normalize the image param: a single ref, a list, or a
         # comma/newline-separated string all mean the same thing.
@@ -1549,18 +1542,16 @@ class HDImageGeneratorTool(Tool):
             loaded += 1
 
         payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         timeout_s = int(getattr(self.bot.config, "GEMINI_IMAGE_TIMEOUT", 300))
         session = await _get_shared_session()
 
-        # This model can spend its whole turn reasoning and return
-        # finish_reason=stop with empty content — no refusal text, no image.
-        # Editing a photo of a real person reproduces it every time; that is
-        # a safety refusal the gateway does not label. Retry once anyway, in
-        # case the gateway itself hiccuped.
+        no_retry = (
+            " The request may have been billed. It was not retried; "
+            "do not automatically repeat image generation."
+        )
         found: list[tuple[str, str]] = []
         said = ""
         last_error = ""
@@ -1580,11 +1571,11 @@ class HDImageGeneratorTool(Tool):
                         if "quota" in body.lower():
                             return (
                                 f"Error: the HD image model ({model}) has no quota "
-                                "right now. Use image_generator instead."
+                                "right now." + no_retry
                             )
                         last_error = (
                             "Error generating HD image: API returned status "
-                            f"{response.status}"
+                            f"{response.status}" + no_retry
                         )
                         if 500 <= response.status < 600:
                             continue
@@ -1593,26 +1584,33 @@ class HDImageGeneratorTool(Tool):
                         data = json.loads(body)
                     except Exception:
                         logger.error(f"HD image non-JSON response: {body[:300]}")
-                        return "Error: HD image endpoint returned a non-JSON response"
+                        return (
+                            "Error: HD image endpoint returned a non-JSON response"
+                            + no_retry
+                        )
             except asyncio.TimeoutError:
                 logger.warning(
                     f"HD image timed out after {timeout_s}s "
                     f"(attempt {attempt + 1}/{self.MAX_ATTEMPTS})"
                 )
-                last_error = f"Error: HD image generation timed out after {timeout_s}s"
+                last_error = (
+                    f"Error: HD image generation timed out after {timeout_s}s" + no_retry
+                )
                 continue
             except Exception as e:
                 logger.error(f"HD image generation request error: {e}")
-                return f"Error generating HD image: {e}"
+                return f"Error generating HD image: {e}" + no_retry
 
             choices = data.get("choices") or []
             if not choices:
                 logger.error(f"HD image response has no choices: {list(data.keys())}")
-                last_error = "Error: No image data in HD response"
+                last_error = "Error: No image data in HD response" + no_retry
                 continue
             msg = choices[0].get("message") or {}
             content = msg.get("content")
+            image_parts = msg.get("images") or []
             if isinstance(content, list):
+                image_parts = [*image_parts, *content]
                 # Some gateways hand back structured parts, not a string.
                 content = " ".join(
                     p.get("text", "") if isinstance(p, dict) else str(p)
@@ -1621,6 +1619,11 @@ class HDImageGeneratorTool(Tool):
             content = content or ""
 
             found = self._DATA_URI_RE.findall(content)
+            for part in image_parts:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    found.extend(
+                        self._DATA_URI_RE.findall(part["image_url"]["url"])
+                    )
             if found:
                 break
 
@@ -1630,26 +1633,17 @@ class HDImageGeneratorTool(Tool):
                 f"image. Text: {said[:200]!r}"
             )
             if said:
-                # Actual words back means a refusal or a misread instruction,
-                # not the empty-response glitch — retrying just repeats it.
                 return (
                     "Error: the HD image model returned text, not an image: "
-                    f"{said[:300]}"
+                    f"{said[:300]}" + no_retry
                 )
 
         if not found:
             if last_error:
                 return last_error
-            if loaded:
-                return (
-                    "Error: the HD image model returned no image. It silently "
-                    "refuses to edit photos of real people — say so if that is "
-                    "what was asked. Otherwise reword the edit, or use "
-                    "image_generator to make a fresh image."
-                )
             return (
-                "Error: the HD image model returned no image. Reword the prompt, "
-                "or use image_generator instead."
+                "Error: the HD image response contained no supported image data."
+                + no_retry
             )
 
         ext, b64 = found[0]
@@ -1657,7 +1651,7 @@ class HDImageGeneratorTool(Tool):
             image_bytes = base64.b64decode(b64)
         except Exception as e:
             logger.error(f"HD image base64 decode failed: {e}")
-            return "Error: HD image data was not decodable"
+            return "Error: HD image data was not decodable" + no_retry
 
         ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
         file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")
@@ -9556,281 +9550,277 @@ class TtsTool(Tool):
         fish_api_key = os.environ.get("FISH_API_KEY", "") or getattr(
             bot_config, "FISH_API_KEY", ""
         )
-        token = uuid.uuid4().hex[:12]
-        filename = f"tts_{token}.wav"
-        voice_filename = f"tts_{token}.ogg"
+        with tempfile.TemporaryDirectory(prefix="tts_") as temp_dir:
+            token = uuid.uuid4().hex[:12]
+            filename = os.path.join(temp_dir, f"tts_{token}.wav")
+            voice_filename = os.path.join(temp_dir, f"tts_{token}.ogg")
 
-        tts_source = None  # path to synthesized audio; drives fallback chain
+            tts_source = None  # path to synthesized audio; drives fallback chain
 
-        # Provider order: Fish (best quality, free tier, emotion tags) →
-        # Riva (NVIDIA, paid) → gTTS (free fallback). Each block only sets
-        # `tts_source` on success; failures fall through silently.
-        if not tts_source and fish_api_key:
-            fish_model = os.environ.get("TTS_FISH_MODEL", "s2.1-pro-free")
-            fish_ref = _fish_reference_id(voice)
-            fish_fmt = os.environ.get("TTS_FISH_FORMAT", "mp3")
-            fish_out = await _synthesize_fish_tts(
-                text,
-                filename,
-                api_key=fish_api_key,
-                model=fish_model,
-                reference_id=fish_ref,
-                fmt=fish_fmt,
-            )
-            if fish_out:
-                tts_source = fish_out
-                logger.info(
-                    "TTS provider: fish (model=%s, voice=%s)", fish_model, voice
+            # Provider order: Fish (best quality, free tier, emotion tags) →
+            # Riva (NVIDIA, paid) → gTTS (free fallback). Each block only sets
+            # `tts_source` on success; failures fall through silently.
+            if not tts_source and fish_api_key:
+                fish_model = os.environ.get("TTS_FISH_MODEL", "s2.1-pro-free")
+                fish_ref = _fish_reference_id(voice)
+                fish_fmt = os.environ.get("TTS_FISH_FORMAT", "mp3")
+                fish_out = await _synthesize_fish_tts(
+                    text,
+                    filename,
+                    api_key=fish_api_key,
+                    model=fish_model,
+                    reference_id=fish_ref,
+                    fmt=fish_fmt,
                 )
+                if fish_out:
+                    tts_source = fish_out
+                    logger.info(
+                        "TTS provider: fish (model=%s, voice=%s)", fish_model, voice
+                    )
 
-        if not tts_source:
-            try:
-                # Try NVIDIA Riva TTS
-                if not nvidia_api_key:
-                    raise RuntimeError("NVIDIA_API_KEY is not configured")
+            if not tts_source:
+                try:
+                    # Try NVIDIA Riva TTS
+                    if not nvidia_api_key:
+                        raise RuntimeError("NVIDIA_API_KEY is not configured")
 
-                import riva.client
-                from riva.client.proto import riva_audio_pb2
+                    import riva.client
+                    from riva.client.proto import riva_audio_pb2
 
-                function_id = os.environ.get(
-                    "TTS_RIVA_FUNCTION_ID", "877104f7-e885-42b9-8de8-f6e4c6303969"
-                )
-                auth = riva.client.Auth(
-                    use_ssl=True,
-                    uri="grpc.nvcf.nvidia.com:443",
-                    metadata_args=[
-                        ["function-id", function_id],
-                        ["authorization", f"Bearer {nvidia_api_key}"],
-                    ],
-                    options=cast(
-                        Any,
-                        [
-                            ("grpc.max_receive_message_length", 64 * 1024 * 1024),
-                            ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                    function_id = os.environ.get(
+                        "TTS_RIVA_FUNCTION_ID", "877104f7-e885-42b9-8de8-f6e4c6303969"
+                    )
+                    auth = riva.client.Auth(
+                        use_ssl=True,
+                        uri="grpc.nvcf.nvidia.com:443",
+                        metadata_args=[
+                            ["function-id", function_id],
+                            ["authorization", f"Bearer {nvidia_api_key}"],
                         ],
-                    ),
-                )
-                service = riva.client.SpeechSynthesisService(auth)
+                        options=cast(
+                            Any,
+                            [
+                                ("grpc.max_receive_message_length", 64 * 1024 * 1024),
+                                ("grpc.max_send_message_length", 64 * 1024 * 1024),
+                            ],
+                        ),
+                    )
+                    service = riva.client.SpeechSynthesisService(auth)
 
-                tts_voice_name, tts_language_code = _tts_riva_voice_config(language_key)
+                    tts_voice_name, tts_language_code = _tts_riva_voice_config(language_key)
 
-                # Use gRPC service synchronously (run in executor since it is synchronous gRPC)
-                def run_riva():
-                    return service.synthesize(
-                        text=text,
-                        voice_name=tts_voice_name,
-                        language_code=tts_language_code,
-                        sample_rate_hz=44100,
-                        encoding=cast(Any, riva_audio_pb2).AudioEncoding.LINEAR_PCM,
+                    # Use gRPC service synchronously (run in executor since it is synchronous gRPC)
+                    def run_riva():
+                        return service.synthesize(
+                            text=text,
+                            voice_name=tts_voice_name,
+                            language_code=tts_language_code,
+                            sample_rate_hz=44100,
+                            encoding=cast(Any, riva_audio_pb2).AudioEncoding.LINEAR_PCM,
+                        )
+
+                    loop = asyncio.get_running_loop()
+                    # Bound the gRPC call: a stalled Riva endpoint would hang this tool
+                    # and leak an executor thread otherwise.
+                    resp = await asyncio.wait_for(
+                        loop.run_in_executor(None, run_riva), timeout=30
+                    )
+                    logger.info(
+                        f"Riva TTS synthesized audio with voice={tts_voice_name!r}, language={tts_language_code!r}"
                     )
 
-                loop = asyncio.get_running_loop()
-                # Bound the gRPC call: a stalled Riva endpoint would hang this tool
-                # and leak an executor thread otherwise.
-                resp = await asyncio.wait_for(
-                    loop.run_in_executor(None, run_riva), timeout=30
+                    # Save the WAV file
+                    with wave.open(filename, "wb") as out_f:
+                        out_f.setnchannels(1)
+                        out_f.setsampwidth(2)
+                        out_f.setframerate(44100)
+                        # cast: the riva client returns an untyped stub object; the
+                        # synthesized audio bytes live on `.audio` at runtime.
+                        out_f.writeframesraw(cast(Any, resp).audio)
+                    tts_source = filename
+                    logger.info("TTS provider: riva")
+                except Exception as e:
+                    logger.warning(f"Riva TTS synthesis failed: {e}")
+
+            # Last-resort fallback: gTTS. Used when neither Fish nor Riva produced
+            # audio. Kept at the bottom of the provider chain so the comment above
+            # about quality (no voice selection / no emotion tags) still applies.
+            if not tts_source:
+                try:
+                    from gtts import gTTS
+
+                    def run_gtts():
+                        tts = gTTS(text=text, lang="es" if lang_is_spanish else "en")
+                        tts.save(filename)
+
+                    loop = asyncio.get_running_loop()
+                    await asyncio.wait_for(loop.run_in_executor(None, run_gtts), timeout=30)
+                    logger.warning(
+                        "TTS used gTTS fallback; voice selection/emotion is unavailable in fallback audio"
+                    )
+                    tts_source = filename
+                except Exception as fallback_err:
+                    return f"Error: all TTS providers failed (last error: {fallback_err})"
+
+            async def make_voice_ogg(source: str) -> str:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    source,
+                    "-vn",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "48000",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "32k",
+                    voice_filename,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-                logger.info(
-                    f"Riva TTS synthesized audio with voice={tts_voice_name!r}, language={tts_language_code!r}"
-                )
-
-                # Save the WAV file
-                with wave.open(filename, "wb") as out_f:
-                    out_f.setnchannels(1)
-                    out_f.setsampwidth(2)
-                    out_f.setframerate(44100)
-                    # cast: the riva client returns an untyped stub object; the
-                    # synthesized audio bytes live on `.audio` at runtime.
-                    out_f.writeframesraw(cast(Any, resp).audio)
-                tts_source = filename
-                logger.info("TTS provider: riva")
-            except Exception as e:
-                logger.warning(f"Riva TTS synthesis failed: {e}")
-
-        # Last-resort fallback: gTTS. Used when neither Fish nor Riva produced
-        # audio. Kept at the bottom of the provider chain so the comment above
-        # about quality (no voice selection / no emotion tags) still applies.
-        if not tts_source:
-            try:
-                from gtts import gTTS
-
-                def run_gtts():
-                    tts = gTTS(text=text, lang="es" if lang_is_spanish else "en")
-                    tts.save(filename)
-
-                loop = asyncio.get_running_loop()
-                await asyncio.wait_for(loop.run_in_executor(None, run_gtts), timeout=30)
+                try:
+                    _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    logger.warning("TTS OGG conversion timed out")
+                    return source
+                if proc.returncode == 0 and os.path.exists(voice_filename):
+                    return voice_filename
                 logger.warning(
-                    "TTS used gTTS fallback; voice selection/emotion is unavailable in fallback audio"
+                    f"Failed to convert TTS to voice OGG: {stderr.decode(errors='replace')[-300:]}"
                 )
-                tts_source = filename
-            except Exception as fallback_err:
-                return f"Error: all TTS providers failed (last error: {fallback_err})"
-
-        async def make_voice_ogg(source: str) -> str:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-i",
-                source,
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "48000",
-                "-c:a",
-                "libopus",
-                "-b:a",
-                "32k",
-                voice_filename,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.warning("TTS OGG conversion timed out")
                 return source
-            if proc.returncode == 0 and os.path.exists(voice_filename):
-                return voice_filename
-            logger.warning(
-                f"Failed to convert TTS to voice OGG: {stderr.decode(errors='replace')[-300:]}"
-            )
-            return source
 
-        async def get_audio_duration(source: str) -> float:
-            proc = await asyncio.create_subprocess_exec(
-                "ffprobe",
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                source,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return 1.0
-            if proc.returncode != 0:
-                return 1.0
-            try:
-                return max(0.1, float(stdout.decode().strip()))
-            except ValueError:
-                return 1.0
+            async def get_audio_duration(source: str) -> float:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    source,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return 1.0
+                if proc.returncode != 0:
+                    return 1.0
+                try:
+                    return max(0.1, float(stdout.decode().strip()))
+                except ValueError:
+                    return 1.0
 
-        async def make_waveform(source: str) -> str:
-            proc = await asyncio.create_subprocess_exec(
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                source,
-                "-f",
-                "s16le",
-                "-ac",
-                "1",
-                "-ar",
-                "8000",
-                "pipe:1",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return base64.b64encode(bytes([128] * 256)).decode("ascii")
-            if proc.returncode != 0 or len(stdout) < 2:
-                return base64.b64encode(bytes([128] * 256)).decode("ascii")
+            async def make_waveform(source: str) -> str:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    source,
+                    "-f",
+                    "s16le",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "8000",
+                    "pipe:1",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    return base64.b64encode(bytes([128] * 256)).decode("ascii")
+                if proc.returncode != 0 or len(stdout) < 2:
+                    return base64.b64encode(bytes([128] * 256)).decode("ascii")
 
-            sample_count = len(stdout) // 2
-            bucket_size = max(1, sample_count // 256)
-            waveform = bytearray()
-            for bucket_start in range(
-                0, min(sample_count, bucket_size * 256), bucket_size
-            ):
-                bucket_end = min(sample_count, bucket_start + bucket_size)
-                peak = 0
-                for sample_index in range(bucket_start, bucket_end):
-                    byte_index = sample_index * 2
-                    sample = int.from_bytes(
-                        stdout[byte_index : byte_index + 2], "little", signed=True
-                    )
-                    peak = max(peak, abs(sample))
-                waveform.append(min(255, int(peak / 32767 * 255)))
+                sample_count = len(stdout) // 2
+                bucket_size = max(1, sample_count // 256)
+                waveform = bytearray()
+                for bucket_start in range(
+                    0, min(sample_count, bucket_size * 256), bucket_size
+                ):
+                    bucket_end = min(sample_count, bucket_start + bucket_size)
+                    peak = 0
+                    for sample_index in range(bucket_start, bucket_end):
+                        byte_index = sample_index * 2
+                        sample = int.from_bytes(
+                            stdout[byte_index : byte_index + 2], "little", signed=True
+                        )
+                        peak = max(peak, abs(sample))
+                    waveform.append(min(255, int(peak / 32767 * 255)))
 
-            if len(waveform) < 256:
-                waveform.extend([0] * (256 - len(waveform)))
-            return base64.b64encode(bytes(waveform[:256])).decode("ascii")
+                if len(waveform) < 256:
+                    waveform.extend([0] * (256 - len(waveform)))
+                return base64.b64encode(bytes(waveform[:256])).decode("ascii")
 
-        async def send_discord_voice_message(source: str):
-            from discord.flags import MessageFlags
-            from discord.http import handle_message_parameters
+            async def send_discord_voice_message(source: str):
+                from discord.flags import MessageFlags
+                from discord.http import handle_message_parameters
 
-            class VoiceMessageFile(discord.File):
-                def __init__(self, fp, filename: str, duration: float, waveform: str):
-                    super().__init__(fp, filename=filename)
-                    self._duration = duration
-                    self._waveform = waveform
+                class VoiceMessageFile(discord.File):
+                    def __init__(self, fp, filename: str, duration: float, waveform: str):
+                        super().__init__(fp, filename=filename)
+                        self._duration = duration
+                        self._waveform = waveform
 
-                def to_dict(self, index: int):
-                    payload = super().to_dict(index)
-                    payload["duration_secs"] = self._duration
-                    payload["waveform"] = self._waveform
-                    return payload
+                    def to_dict(self, index: int):
+                        payload = super().to_dict(index)
+                        payload["duration_secs"] = self._duration
+                        payload["waveform"] = self._waveform
+                        return payload
 
-            channel = message.channel
-            state = getattr(channel, "_state", getattr(message, "_state", None))
-            if state is None or not hasattr(state, "http"):
-                raise RuntimeError("Discord message state is unavailable")
+                channel = message.channel
+                state = getattr(channel, "_state", getattr(message, "_state", None))
+                if state is None or not hasattr(state, "http"):
+                    raise RuntimeError("Discord message state is unavailable")
 
-            flags = MessageFlags._from_value(0)
-            flags.voice = True
-            duration = await get_audio_duration(source)
-            waveform = await make_waveform(source)
-            voice_file = VoiceMessageFile(
-                source,
-                filename="voice-message.ogg",
-                duration=duration,
-                waveform=waveform,
-            )
-            with handle_message_parameters(file=voice_file, flags=flags) as params:
-                await state.http.send_message(channel.id, params=params)
+                flags = MessageFlags._from_value(0)
+                flags.voice = True
+                duration = await get_audio_duration(source)
+                waveform = await make_waveform(source)
+                voice_file = VoiceMessageFile(
+                    source,
+                    filename="voice-message.ogg",
+                    duration=duration,
+                    waveform=waveform,
+                )
+                with handle_message_parameters(file=voice_file, flags=flags) as params:
+                    await state.http.send_message(channel.id, params=params)
 
-        # Send as voice-style audio. Telegram adapters use sendVoice; Discord needs a voice flag plus waveform metadata.
-        if os.path.exists(filename):
-            send_path = filename
-            try:
-                send_path = await make_voice_ogg(filename)
-                if hasattr(message, "send_voice_file"):
-                    await cast(Any, message).send_voice_file(send_path)
-                else:
-                    await send_discord_voice_message(send_path)
-                # Distinct from terminal no_response so TTS in a multi-tool batch
-                # does not abort follow-up / suppress other tool results.
-                return "__TTS_SENT__"
-            except Exception as discord_err:
-                return f"Error sending TTS voice message to channel: {discord_err}"
-            finally:
-                for path in {filename, voice_filename}:
-                    if os.path.exists(path):
-                        with contextlib.suppress(Exception):
-                            os.remove(path)
-        else:
-            return f"Error: Audio file {filename} was not generated"
+            # Send as voice-style audio. Telegram adapters use sendVoice; Discord needs a voice flag plus waveform metadata.
+            if os.path.exists(filename):
+                send_path = filename
+                try:
+                    send_path = await make_voice_ogg(filename)
+                    if hasattr(message, "send_voice_file"):
+                        await cast(Any, message).send_voice_file(send_path)
+                    else:
+                        await send_discord_voice_message(send_path)
+                    # Distinct from terminal no_response so TTS in a multi-tool batch
+                    # does not abort follow-up / suppress other tool results.
+                    return "__TTS_SENT__"
+                except Exception as discord_err:
+                    return f"Error sending TTS voice message to channel: {discord_err}"
+            else:
+                return f"Error: Audio file {filename} was not generated"
 
 
 def _is_voice_channel(ch) -> bool:

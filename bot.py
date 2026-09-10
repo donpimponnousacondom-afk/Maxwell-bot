@@ -31,10 +31,12 @@ from response_observability import (
     clean_message_content,
     footer_template_error,
     format_debug,
+    format_runtime_provider,
     prepare_delivery,
     record_delivery,
     send_command_response,
     send_measured,
+    suppress_delivered_image_previews,
     update_footer_control,
 )
 
@@ -1796,7 +1798,7 @@ def _sanitize_visible_reply(text: str, *, scrub_repeats: bool = True) -> str:
         raw,
         flags=re.DOTALL,
     )
-    response = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+.*?\]", "", response)
+    response = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+[^\]\n]*\](?!\()", "", response)
     response = TOOL_TRACE_LINE_RE.sub("", response)
     for marker in (
         "__NO_RESPONSE__",
@@ -3404,6 +3406,8 @@ class MaxwellBot(commands.Bot):
             top_p=self.config.OLLAMA_TOP_P,
             top_k=self.config.OLLAMA_TOP_K,
             api_key=self.config.OLLAMA_API_KEY,
+            extra_headers=self.config.OLLAMA_EXTRA_HEADERS,
+            extra_body=self.config.OLLAMA_EXTRA_BODY,
             disable_reasoning=self.config.OLLAMA_DISABLE_REASONING,
             fallback_base_url=self.config.OLLAMA_FALLBACK_BASE_URL,
             fallback_model=self.config.OLLAMA_FALLBACK_MODEL,
@@ -7720,7 +7724,12 @@ class MaxwellBot(commands.Bot):
                 else:
                     registry = getattr(self, "_delivery_measurements", None) or DeliveryMeasurements()
                     text = format_debug(registry, channel_id, target_id)
-                await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
+                text = format_runtime_provider(getattr(self, "ai_provider", None)) + "\n\n" + text
+                await send_command_response(
+                    self, message.channel, text,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    code_block=True, unmeasured=False,
+                )
             elif cmd == "version":
                 await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none(), code_block=True)
             elif cmd == "help":
@@ -7729,7 +7738,7 @@ class MaxwellBot(commands.Bot):
                     "` ,guide [goal]` / `,guided-goal [goal]` - create a thread and ask 5 clarifying questions before building (use when request is vague)\n"
                     "` ,help` - show this list\n"
                     f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
-                    f"`{self.command_prefix}debug` - measured bot reply in this channel (admin; reply to select)\n"
+                    f"`{self.command_prefix}debug` - loaded model/provider and measured bot reply (admin; reply to select)\n"
                     f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
                     "` ,prompt [text]` - view/set server prompt (admin)\n"
@@ -14568,7 +14577,11 @@ class MaxwellBot(commands.Bot):
                 response, send_stickers = self._extract_stickers_from_text(
                     response, message.guild
                 )
-                _, chunks = prepare_delivery(self, response, response_metrics, self._split_response)
+                delivery_response = (
+                    suppress_delivered_image_previews(response, all_tool_results)
+                    if platform == "discord" else response
+                )
+                _, chunks = prepare_delivery(self, delivery_response, response_metrics, self._split_response)
                 if not chunks and send_stickers:
                     chunks = [""]
                 # Fast-tool fix: try to transition the live progress message
