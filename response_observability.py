@@ -10,6 +10,7 @@ import platform
 import re
 import shutil
 import subprocess
+from urllib.parse import urlsplit
 
 from provider_telemetry import CallMetrics
 from utils import FileLock, _atomic_json_write_sync
@@ -150,14 +151,20 @@ async def send_measured(bot, channel, text: str, metrics: CallMetrics | None) ->
 
 
 async def send_command_response(
-    bot, channel, text: str, *, allowed_mentions, code_block: bool = False
+    bot,
+    channel,
+    text: str,
+    *,
+    allowed_mentions,
+    code_block: bool = False,
+    unmeasured: bool = True,
 ) -> None:
     _, chunks = prepare_delivery(
         bot,
         text,
         None,
         getattr(bot, "_split_response", None),
-        unmeasured=True,
+        unmeasured=unmeasured,
         code_block=code_block,
     )
     for chunk in chunks:
@@ -216,6 +223,26 @@ def record_delivery(
         if registry is None:
             registry = bot._delivery_measurements = DeliveryMeasurements()
         registry.record(str(channel_id), str(message_id), metrics)
+
+
+def format_runtime_provider(provider) -> str:
+    lines = ["Loaded runtime configuration:"]
+    if provider is None:
+        lines.append("Provider not initialized.")
+    else:
+        for endpoint in provider._endpoints:
+            if endpoint.name in ("primary", "fallback"):
+                label = endpoint.name.capitalize()
+                lines.extend(
+                    [
+                        f"{label} model: {endpoint.model}",
+                        f"{label} provider: {urlsplit(endpoint.base_url).hostname or 'unknown'}",
+                    ]
+                )
+        lines.append(
+            "Per-request fallback/overrides may differ; see measurements below."
+        )
+    return "\n".join(lines)
 
 
 def format_debug(

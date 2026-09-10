@@ -31,6 +31,7 @@ from response_observability import (
     clean_message_content,
     footer_template_error,
     format_debug,
+    format_runtime_provider,
     prepare_delivery,
     record_delivery,
     send_command_response,
@@ -7722,7 +7723,12 @@ class MaxwellBot(commands.Bot):
                 else:
                     registry = getattr(self, "_delivery_measurements", None) or DeliveryMeasurements()
                     text = format_debug(registry, channel_id, target_id)
-                await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
+                text = format_runtime_provider(getattr(self, "ai_provider", None)) + "\n\n" + text
+                await send_command_response(
+                    self, message.channel, text,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    code_block=True, unmeasured=False,
+                )
             elif cmd == "version":
                 await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none(), code_block=True)
             elif cmd == "help":
@@ -7731,7 +7737,7 @@ class MaxwellBot(commands.Bot):
                     "` ,guide [goal]` / `,guided-goal [goal]` - create a thread and ask 5 clarifying questions before building (use when request is vague)\n"
                     "` ,help` - show this list\n"
                     f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
-                    f"`{self.command_prefix}debug` - measured bot reply in this channel (admin; reply to select)\n"
+                    f"`{self.command_prefix}debug` - loaded model/provider and measured bot reply (admin; reply to select)\n"
                     f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
                     "` ,prompt [text]` - view/set server prompt (admin)\n"

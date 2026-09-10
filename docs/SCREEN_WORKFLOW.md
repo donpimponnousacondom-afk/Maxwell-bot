@@ -46,9 +46,10 @@ sudo -n /usr/local/bin/python3.14 /opt/maxwell/scripts/instance.py curie restart
 ```
 
 - `stop` quiesces bot/API before owned shell/sites/web/Ollama; state and containers remain.
-- `restart` reconnects bot/API to reload private configuration. Coordinate it; autonomous work can resume.
+- `up` starts the full stack, including Ollama. Use it after `stop` or when dependencies are not running.
+- `restart` reconnects **only bot/API** to reload private configuration; it does not start stopped Ollama/web dependencies. Do not use it to recover a fully stopped stack—use `up`. Coordinate it; autonomous work can resume.
 - `down` also removes owned containers/networks, not persistent state or the model volume. Shell packages outside its mounted workspace are disposable.
-- `logs` follows the last 100 Compose log lines. Restore the wrapped log command above when appropriate; do not start another bot to restore visibility.
+- `logs` first replays the last 100 Compose log lines, including earlier process failures, then follows new output. Compare failures with current container start times and actual embedding probes before concluding a recovered service is still broken. Restore the wrapped log command above when appropriate; do not start another bot to restore visibility.
 
 No host PM2 commands, rootful Docker fallback, direct host `python bot.py`, or duplicate deployments writing the same state. The wrapper verifies identity, private socket, source-path ownership labels and a per-instance operations lock. Do not mix it with concurrent direct Docker lifecycle commands.
 

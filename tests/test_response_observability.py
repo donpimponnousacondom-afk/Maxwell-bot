@@ -15,6 +15,7 @@ from response_observability import (
     clean_message_content,
     footer_template_error,
     format_debug,
+    format_runtime_provider,
     prepare_delivery,
     record_delivery,
     render_footer,
@@ -441,7 +442,8 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
         await MaxwellBot._handle_command(bot, message)
         assert "Running build:" in message.channel.sent[-1].content
         assert all(
-            sent.content.endswith("-# TTFT — | TPS —" + FOOTER_MARKER)
+            sent.content.startswith("```\n") and sent.content.endswith("\n```")
+            and FOOTER_MARKER not in sent.content
             for sent in message.channel.sent[:-1]
         )
         assert message.channel.sent[-1].content == (
@@ -455,6 +457,140 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
         message.author.id = 8
         await MaxwellBot._handle_command(bot, message)
         assert message.channel.sent[-1].content == "not authorized"
+
+    asyncio.run(scenario())
+
+
+@pytest.fixture
+def runtime_provider():
+    from providers import OllamaProvider
+
+    provider = OllamaProvider(
+        base_url="https://private-user:private-pass@loaded.example/secret-path?token=secret-query#secret-fragment",
+        model="loaded-model",
+        max_tokens=100,
+        temperature=0.6,
+        api_key="secret-api-key",
+        extra_headers={"X-Private": "secret-header"},
+        extra_body={"private": "secret-body"},
+    )
+    provider.initialize = AsyncMock(side_effect=AssertionError("unexpected probe"))
+    provider.generate_response = AsyncMock(side_effect=AssertionError("unexpected inference"))
+    return provider
+
+
+@pytest.mark.parametrize(
+    "base_url,hostname",
+    [
+        ("https://user:password@OPENROUTER.ai:443/api/v1?api_key=secret#private", "openrouter.ai"),
+        ("http://user:password@127.0.0.1:11434/v1?api_key=secret#private", "127.0.0.1"),
+        ("http://user:password@[::1]:11434/v1?api_key=secret#private", "::1"),
+    ],
+)
+def test_debug_runtime_provider_labels_only_expose_hostname(runtime_provider, base_url, hostname):
+    runtime_provider._endpoints[0] = replace(
+        runtime_provider._endpoints[0], base_url=base_url
+    )
+    text = format_runtime_provider(runtime_provider)
+    assert text.splitlines()[2] == f"Primary provider: {hostname}"
+    for secret in ("user", "password", "api_key", "secret", "private", "/v1", "11434"):
+        assert secret not in text
+
+
+@pytest.mark.parametrize("footer_enabled", [True, False])
+def test_debug_loaded_runtime_before_completion_without_config_reads(runtime_provider, footer_enabled):
+    from bot import MaxwellBot
+
+    class UnreadableConfig:
+        def __getattribute__(self, name):
+            raise AssertionError("debug must use the runtime provider, not Config")
+
+    async def scenario():
+        bot = fake_bot(
+            _is_admin=lambda uid: True, command_prefix="!",
+            _control={"footer_enabled": footer_enabled},
+            ai_provider=runtime_provider, config=UnreadableConfig(),
+        )
+        message = Message(content="!debug")
+        await MaxwellBot._handle_command(bot, message)
+        text = message.channel.sent[-1].content
+        assert text.startswith("```\nLoaded runtime configuration:\n")
+        assert text.endswith("\n```")
+        assert "Primary model: loaded-model" in text
+        assert "Primary provider: loaded.example" in text
+        assert "Fallback model:" not in text
+        assert "No measurements recorded by this process" in text
+        assert "TTFT" not in text and FOOTER_MARKER not in text
+        for secret in (
+            "private-user", "private-pass", "secret-path", "secret-query",
+            "secret-fragment", "secret-api-key", "X-Private", "secret-header", "secret-body",
+        ):
+            assert secret not in text
+        runtime_provider.initialize.assert_not_called()
+        runtime_provider.generate_response.assert_not_called()
+        assert runtime_provider._session is None
+        assert not bot._delivery_measurements.records
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("measured_endpoint", ["primary", "fallback", "vision"])
+def test_debug_separates_loaded_primary_from_last_request(runtime_provider, metrics, measured_endpoint):
+    from bot import MaxwellBot
+    from providers import ProviderEndpoint
+
+    async def scenario():
+        runtime_provider._endpoints.append(ProviderEndpoint(
+            "fallback", "https://fallback-user:fallback-pass@fallback.example/private?key=fallback-secret",
+            "loaded-fallback", "fallback-key",
+        ))
+        bot = fake_bot(
+            _is_admin=lambda uid: True, command_prefix="!", ai_provider=runtime_provider,
+            config=SimpleNamespace(OLLAMA_MODEL="stale-config-model", OLLAMA_BASE_URL="https://stale.example"),
+        )
+        message = Message(content="!debug")
+        measured = replace(metrics, model="old-request-override", provider="old.example", endpoint=measured_endpoint)
+        record_delivery(bot, message.channel, SimpleNamespace(id=999), measured)
+        await MaxwellBot._handle_command(bot, message)
+        text = message.channel.sent[-1].content
+        runtime, measurement = text.split("\n\n", 1)
+        assert "Primary model: loaded-model" in runtime
+        assert "Primary provider: loaded.example" in runtime
+        assert "Fallback model: loaded-fallback" in runtime
+        assert "Fallback provider: fallback.example" in runtime
+        assert "Per-request fallback/overrides may differ" in runtime
+        assert "Measured bot message: 999" in measurement
+        assert "Model: old-request-override" in measurement
+        assert f"Provider: old.example ({measured_endpoint})" in measurement
+        assert "TTFT: 125ms | TPS: 25.0 tok/s" in measurement
+        for absent in ("old-request-override", "old.example", "stale-config-model", "stale.example", "fallback-user", "fallback-pass", "fallback-secret", "fallback-key"):
+            assert absent not in runtime
+        assert FOOTER_MARKER not in text
+        assert bot._delivery_measurements.lookup("100")[1] is measured
+        runtime_provider.generate_response.assert_not_called()
+
+    asyncio.run(scenario())
+
+
+def test_debug_fences_every_chunk_and_neutralizes_embedded_fences(runtime_provider):
+    from bot import MaxwellBot
+
+    async def scenario():
+        runtime_provider._endpoints[0] = replace(
+            runtime_provider._endpoints[0], model="```embedded``` " * 300
+        )
+        bot = fake_bot(
+            _is_admin=lambda uid: True, command_prefix="!", ai_provider=runtime_provider,
+            _split_response=MaxwellBot._split_response,
+        )
+        message = Message(content="!debug")
+        await MaxwellBot._handle_command(bot, message)
+        assert len(message.channel.sent) > 1
+        for sent in message.channel.sent:
+            assert sent.content.startswith("```\n") and sent.content.endswith("\n```")
+            assert sent.content.count("```") == 2
+            assert len(sent.content) <= 2000
+            assert FOOTER_MARKER not in sent.content
 
     asyncio.run(scenario())
 

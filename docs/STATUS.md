@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Loaded-runtime debug — implementation checkpoint (2026-09-10)
+
+- `!debug` now reports loaded primary/fallback model and secret-safe provider hostnames from the running provider object, before any completion is needed. Measured replies remain a separate response-owned section and may represent a different fallback/override model. The complete report uses fenced code blocks, without a meaningless unmeasured footer. No configuration reread or inference/probe is performed.
+- **64 focused isolated tests passed**, including 9 new cases for no history, stale file config, different measured endpoints, credential-safe host labels, fencing/chunking and unchanged measured ownership. Python3.14.4, source-only/private-read/network isolation; evidence `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/debug-worktree-h3rzr1_l/`. Scoped observability/test Ruff passes; `bot.py` retains exactly its three pre-existing lint findings. Not deployed; combined full suite is pending.
+- Runbook now explicitly distinguishes full-stack `up` after `stop` from bot/API-only `restart`, and explains historical log replay. No lifecycle semantics or running services changed by that documentation.
+
 ## HD image separation — implementation checkpoint (2026-09-10)
 
 - Root requested that HD generation remain available but never borrow the main chat endpoint/key. `hd_image` now resolves only dedicated `GEMINI_IMAGE_*` settings; missing base returns a configuration error before downloads/HTTP. Blank dedicated key sends no Authorization header, preserving explicit keyless gateways. Pollinations and tool registration are unchanged. Native GPT Images routes are not implemented by the existing chat-completions adapter.

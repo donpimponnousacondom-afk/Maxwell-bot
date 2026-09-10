@@ -122,6 +122,8 @@ Recognized JSON/+json and SSE response Content-Types determine HTTP 200 decoding
 
 ## Per-call provider measurements
 
+`!debug` (or the configured command prefix) shows the running client's loaded primary/fallback model and provider hostname before its process-local measured-reply section. No completion or provider probe is needed to inspect the loaded configuration. This is not a reread of edited environment files or a guarantee of the next request's route: fallback and per-call overrides can differ. Measurements still belong to their original response and disappear when the process restarts. The debug report uses fenced code blocks without an unmeasured TTFT/TPS footer; endpoint credentials, paths, query strings and raw request options are not displayed. Requires the updated image; see [STATUS.md](STATUS.md).
+
 Streaming requests send `stream_options: {"include_usage": true}`. An explicit unsupported-option HTTP 400/422 teaches that endpoint to omit the option for this process. A corrected request stays on that endpoint and consumes a remaining attempt; it never adds an attempt or overrides the five-attempt ceiling. Non-streaming requests omit the option.
 
 Measurements travel with the returned response, not a shared provider's last-call record:
