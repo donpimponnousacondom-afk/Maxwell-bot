@@ -1,5 +1,12 @@
 # Current implementation and deployment status
 
+## Start alias installed; combined source suite passed (2026-09-10)
+
+- Exact source **`9ca15323a6e59dcceef289b61368f7267e79b404`** passed the complete isolated suite: **2,096 passed, zero failures/errors/skips**, 95.864s; the mandatory live-credential test was excluded. Python3.14.4, Git-archive source only, clean environment/disabled dotenv, isolated writable roots, private-read audit and loopback-only network namespace. Evidence `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/9ca15323a6e5-uqrquzdz/{pytest.log,results.xml}`. Includes HD independence/one-request parser repair, loaded-runtime debug, and start alias; does not include the subsequent duplicate-preview fix in progress.
+- Installed **only** the tested operator script at `/opt/maxwell/scripts/instance.py` under the instance operation lock, after confirming the existing script matched the expected two-line pre-alias baseline. Installed bytes match the tested snapshot; actual CLI help accepts `start`. All Compose container start epochs/restart counters stayed unchanged. Prior script: `/srv/maxwell-rollback/curie/start-alias-9ca1532/instance.py` (root-only).
+- `start`/`up` are now interchangeable in the operational command. **Application image remains `99fd7fa`**; source fixes for image billing/debug are not yet deployed and `hd_image` remains temporarily disabled. No configuration, persona, credentials or private memory was changed by script installation.
+- Artifact verification for the billed-image window found one retained 73,836-byte Pollinations image at 01:32:04.879 UTC and no HD persistence event. The HD tool retains no successful-but-unparsed response body, so the lost paid output cannot be recovered from its local storage. Root's two uploaded copies have identical SHA-256; the screenshot confirms attachment plus final-link preview. The final reply omitted the Discord URL's signed query, so preview suppression must recognize the same Discord attachment resource rather than rely on exact full-URL equality.
+
 ## Lifecycle start alias — implementation checkpoint (2026-09-10)
 
 - Root requested systemctl-style spelling without changing restart scope. `scripts/instance.py <id> start` now takes the exact same path as `up`: ownership inventory and private operation lock, then `compose up -d --wait --wait-timeout 300`. The older spelling remains supported. `restart` is unchanged: bot/API only, not dependency recovery or a full stop/start cycle.
