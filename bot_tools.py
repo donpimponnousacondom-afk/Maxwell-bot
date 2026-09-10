@@ -1346,10 +1346,9 @@ class HDImageGeneratorTool(Tool):
 
     # Discord's own limit is 25MB; inputs get downscaled well below it.
     MAX_INPUT_BYTES = 20 * 1024 * 1024
-    # An empty response is usually a silent safety refusal, which repeats
-    # deterministically (6/6 in testing on a photo of a real person). Retry
-    # once for a genuinely flaky gateway, then stop burning ~20s a try.
-    MAX_ATTEMPTS = 2
+    # Generation can be billed even when its response is lost or unrecognized.
+    # Never automatically submit a second generation request.
+    MAX_ATTEMPTS = 1
     _DATA_URI_RE = re.compile(
         r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
     )
@@ -1549,11 +1548,10 @@ class HDImageGeneratorTool(Tool):
         timeout_s = int(getattr(self.bot.config, "GEMINI_IMAGE_TIMEOUT", 300))
         session = await _get_shared_session()
 
-        # This model can spend its whole turn reasoning and return
-        # finish_reason=stop with empty content — no refusal text, no image.
-        # Editing a photo of a real person reproduces it every time; that is
-        # a safety refusal the gateway does not label. Retry once anyway, in
-        # case the gateway itself hiccuped.
+        no_retry = (
+            " The request may have been billed. It was not retried; "
+            "do not automatically repeat image generation."
+        )
         found: list[tuple[str, str]] = []
         said = ""
         last_error = ""
@@ -1573,11 +1571,11 @@ class HDImageGeneratorTool(Tool):
                         if "quota" in body.lower():
                             return (
                                 f"Error: the HD image model ({model}) has no quota "
-                                "right now. Use image_generator instead."
+                                "right now." + no_retry
                             )
                         last_error = (
                             "Error generating HD image: API returned status "
-                            f"{response.status}"
+                            f"{response.status}" + no_retry
                         )
                         if 500 <= response.status < 600:
                             continue
@@ -1586,26 +1584,33 @@ class HDImageGeneratorTool(Tool):
                         data = json.loads(body)
                     except Exception:
                         logger.error(f"HD image non-JSON response: {body[:300]}")
-                        return "Error: HD image endpoint returned a non-JSON response"
+                        return (
+                            "Error: HD image endpoint returned a non-JSON response"
+                            + no_retry
+                        )
             except asyncio.TimeoutError:
                 logger.warning(
                     f"HD image timed out after {timeout_s}s "
                     f"(attempt {attempt + 1}/{self.MAX_ATTEMPTS})"
                 )
-                last_error = f"Error: HD image generation timed out after {timeout_s}s"
+                last_error = (
+                    f"Error: HD image generation timed out after {timeout_s}s" + no_retry
+                )
                 continue
             except Exception as e:
                 logger.error(f"HD image generation request error: {e}")
-                return f"Error generating HD image: {e}"
+                return f"Error generating HD image: {e}" + no_retry
 
             choices = data.get("choices") or []
             if not choices:
                 logger.error(f"HD image response has no choices: {list(data.keys())}")
-                last_error = "Error: No image data in HD response"
+                last_error = "Error: No image data in HD response" + no_retry
                 continue
             msg = choices[0].get("message") or {}
             content = msg.get("content")
+            image_parts = msg.get("images") or []
             if isinstance(content, list):
+                image_parts = [*image_parts, *content]
                 # Some gateways hand back structured parts, not a string.
                 content = " ".join(
                     p.get("text", "") if isinstance(p, dict) else str(p)
@@ -1614,6 +1619,11 @@ class HDImageGeneratorTool(Tool):
             content = content or ""
 
             found = self._DATA_URI_RE.findall(content)
+            for part in image_parts:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    found.extend(
+                        self._DATA_URI_RE.findall(part["image_url"]["url"])
+                    )
             if found:
                 break
 
@@ -1623,26 +1633,17 @@ class HDImageGeneratorTool(Tool):
                 f"image. Text: {said[:200]!r}"
             )
             if said:
-                # Actual words back means a refusal or a misread instruction,
-                # not the empty-response glitch — retrying just repeats it.
                 return (
                     "Error: the HD image model returned text, not an image: "
-                    f"{said[:300]}"
+                    f"{said[:300]}" + no_retry
                 )
 
         if not found:
             if last_error:
                 return last_error
-            if loaded:
-                return (
-                    "Error: the HD image model returned no image. It silently "
-                    "refuses to edit photos of real people — say so if that is "
-                    "what was asked. Otherwise reword the edit, or use "
-                    "image_generator to make a fresh image."
-                )
             return (
-                "Error: the HD image model returned no image. Reword the prompt, "
-                "or use image_generator instead."
+                "Error: the HD image response contained no supported image data."
+                + no_retry
             )
 
         ext, b64 = found[0]
@@ -1650,7 +1651,7 @@ class HDImageGeneratorTool(Tool):
             image_bytes = base64.b64decode(b64)
         except Exception as e:
             logger.error(f"HD image base64 decode failed: {e}")
-            return "Error: HD image data was not decodable"
+            return "Error: HD image data was not decodable" + no_retry
 
         ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
         file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")

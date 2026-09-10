@@ -108,7 +108,7 @@ GEMINI_IMAGE_API_KEY=
 GEMINI_IMAGE_MODEL=gemini-3.1-flash-image
 ```
 
-Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
+Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content` (text or image-url parts) or `message.images[].image_url.url`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. Each tool invocation submits generation once: empty/unrecognized responses, timeouts and server errors do not trigger a second potentially billable request. This is not a cross-invocation deduplication policy. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
 
 Both tools remain registered under `ENABLE_IMAGE_GEN`; dashboard Runtime controls → Tools can disable `hd_image` independently. The no-inheritance behavior requires the updated application image, not only an environment edit. See [STATUS.md](STATUS.md) for deployed versus source-only state.
 

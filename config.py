@@ -462,7 +462,7 @@ class Config:
     # a blank key permits keyless endpoints. Neither inherits OLLAMA_*.
     #
     # This adapter uses /chat/completions and expects base64 image data-URIs
-    # in message.content. Native /images/generations or /images/edits APIs
+    # in message.content or message.images. Native /images/generations or /images/edits APIs
     # need a different adapter, not merely a different model name.
     GEMINI_IMAGE_BASE_URL = os.getenv("GEMINI_IMAGE_BASE_URL", "").strip()
     GEMINI_IMAGE_API_KEY = os.getenv("GEMINI_IMAGE_API_KEY", "").strip()
