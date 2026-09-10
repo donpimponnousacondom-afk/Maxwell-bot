@@ -59,7 +59,8 @@ Dashboard: `http://localhost:8081/admin/`, using the original dashboard username
 - Private runtime configuration: `/srv/maxwell/curie/config/bot.env`.
 - Live personality/server prompts: `/srv/maxwell/curie/config/prompts/`.
 - Memory and runtime state: `/srv/maxwell/curie/data/`.
-- Source-frozen application/web images: `maxwell-app:3229a84`, `maxwell-web:01e8cbb`.
+- Source-frozen application/web images: `maxwell-app:99fd7fa`, `maxwell-web:01e8cbb`.
+- Edit `/srv/maxwell/curie/config/bot.env`, not the development checkout `.env`, for live credentials/provider settings. Bot/API restart is required. The TTS repair transferred only the NVIDIA key; original dashboard credentials and chat settings are unchanged.
 
 Do not paste credentials, process environments, raw memory, or container environment arrays into diagnostics. Generated-site public URLs remain loopback-only until root configures an approved TLS origin.
 

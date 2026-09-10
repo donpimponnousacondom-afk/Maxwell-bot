@@ -29,7 +29,7 @@ Bot and API share one private data directory: communication is SQLite WAL plus J
 
 The config directory is mounted read-only with the `config/prompts` subtree mounted writable. API/runtime controls remain in `data/bot_control.json`; API and tools can edit supported prompts. Writable prompts do not imply an API for editing environment secrets. Environment changes take effect on bot/API restart. The source defaults remain in the image; use the configured prompt override mechanism instead of bind-mounting source code.
 
-Generated-site state and plugin/email/X state live under `data`; generated public pages and permanent images live under `sites`. Voice scratch uses tmpfs at `/app/temp`; other scratch uses `/tmp`. Container logs use Docker's bounded local log driver. Neither scratch nor logs are included in state backups.
+Generated-site state and plugin/email/X state live under `data`; generated public pages and permanent images live under `sites`. Voice-channel scratch uses tmpfs at `/app/temp`; the `tts` tool uses a per-call temporary directory under `/tmp` and cleans its WAV/OGG artifacts after synthesis/delivery, including failures. Container logs use Docker's bounded local log driver. Neither scratch nor logs are included in state backups.
 
 ## Host prerequisites and provisioning
 
