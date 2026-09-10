@@ -1189,11 +1189,11 @@ def _persist_public_image(
 
 
 class ImageGeneratorTool(Tool):
-    """Fast image generation using Pollinations (SDXL-Lightning)."""
+    """Image generation using the configured fast image provider."""
 
     def get_description(self):
         return (
-            "Generate an AI image (~2-5s) — the DEFAULT image tool, text-to-image only. "
+            "Generate an AI image using the configured normal profile — the DEFAULT image tool, text-to-image only. "
             "It CANNOT take an input image: to edit/modify/restyle an existing image, use hd_image. "
             "Params: prompt (required). Posts the image to chat with a CDN URL you can reuse in sites."
         )
@@ -1203,18 +1203,45 @@ class ImageGeneratorTool(Tool):
     ) -> str:
         if not prompt:
             return "Error: prompt parameter is required"
-        # Pollinations is the primary generator — keyless, fast, always up.
-        # The long-dead NVIDIA Flux route was dropped (it hung ~6 min per
-        # request before timing out).
-        return await self._pollinations_generate(message, prompt)
+        protocol = getattr(self.bot.config, "IMAGE_GEN_PROTOCOL", "pollinations")
+        if protocol == "images":
+            result = await self._native_generate(message, prompt)
+        elif protocol == "pollinations":
+            result = await self._pollinations_generate(message, prompt)
+        else:
+            result = "Error: unsupported IMAGE_GEN_PROTOCOL; use pollinations or images"
+        return result
+
+    async def _native_generate(self, message: Message, prompt: str) -> str:
+        cfg = self.bot.config
+        base = (getattr(cfg, "IMAGE_GEN_BASE_URL", "") or "").strip().rstrip("/")
+        if not base:
+            return (
+                "Error: image generation is not configured "
+                "(set IMAGE_GEN_BASE_URL explicitly; chat settings are not used)"
+            )
+        image_bytes, ext, error = await _native_image_request(
+            base,
+            getattr(cfg, "IMAGE_GEN_API_KEY", "") or "",
+            getattr(cfg, "IMAGE_GEN_MODEL", "") or "gpt-image-2",
+            prompt,
+            quality=getattr(cfg, "IMAGE_GEN_QUALITY", "low"),
+            timeout_s=int(getattr(cfg, "IMAGE_GEN_TIMEOUT", 300)),
+        )
+        if error:
+            return error
+        return await self._deliver_generated_image(
+            message, prompt, image_bytes, prefix="image", ext=ext
+        )
 
     async def _deliver_generated_image(
-        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str
+        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str,
+        ext: str = "png",
     ) -> str:
         local_path, perm_url = _persist_public_image(
-            self.bot, image_bytes, prefix=prefix
+            self.bot, image_bytes, prefix=prefix, ext=f".{ext}"
         )
-        file = File(BytesIO(image_bytes), filename="generated_image.png")
+        file = File(BytesIO(image_bytes), filename=f"generated_image.{ext}")
         sent_msg = None
         self._signal_streaming(message)
         try:
@@ -1336,27 +1363,105 @@ _IMAGE_FETCH_UA = (
 )
 
 
-class HDImageGeneratorTool(Tool):
-    """HD image generation and editing via the Gemini image model.
+_IMAGE_DATA_URI_RE = re.compile(
+    r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
+)
 
-    Talks to the OpenAI-compatible chat endpoint rather than
-    /images/generations: only the chat route accepts an input image, so
-    generate and edit are the same call with or without an `image` part.
-    """
+
+def _decode_image_response(data: dict, *, native: bool) -> tuple[bytes, str]:
+    if native:
+        image_bytes = base64.b64decode(data["data"][0]["b64_json"], validate=True)
+        ext = _sniff_image_mime(image_bytes).removeprefix("image/")
+    else:
+        msg = data["choices"][0].get("message") or {}
+        content = msg.get("content")
+        image_parts = msg.get("images") or []
+        if isinstance(content, list):
+            image_parts = [*image_parts, *content]
+            content = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        found = _IMAGE_DATA_URI_RE.findall(content or "")
+        for part in image_parts:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                found.extend(_IMAGE_DATA_URI_RE.findall(part["image_url"]["url"]))
+        ext, b64 = found[0]
+        image_bytes = base64.b64decode(b64)
+        ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
+    if not image_bytes:
+        raise ValueError("empty image data")
+    return image_bytes, "jpg" if ext == "jpeg" else ext
+
+
+async def _image_generation_request(
+    api_url: str, api_key: str, payload: dict, *, timeout_s: int, native: bool,
+) -> tuple[bytes, str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    no_retry = (
+        " The request may have been billed. It was not retried; "
+        "do not automatically repeat image generation."
+    )
+    label = "image" if native else "HD image"
+    image_bytes, ext, error = b"", "png", ""
+    session = await _get_shared_session()
+    try:
+        async with session.post(
+            api_url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            allow_redirects=False,
+        ) as response:
+            body = await response.text()
+            if response.status != 200:
+                error = f"Error: {label} API returned status {response.status}"
+                if "quota" in body.lower():
+                    error += f"; the image model ({payload['model']}) has no quota right now."
+                return b"", ext, error + no_retry
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                return b"", ext, f"Error: {label} endpoint returned a non-JSON response" + no_retry
+        image_bytes, ext = _decode_image_response(data, native=native)
+    except asyncio.TimeoutError:
+        error = f"Error: {label} generation timed out after {timeout_s}s"
+    except Exception:
+        error = f"Error: {label} request failed or returned unsupported image data."
+    return image_bytes, ext, error + no_retry if error else ""
+
+
+async def _native_image_request(
+    base: str, api_key: str, model: str, prompt: str, *, quality: str,
+    timeout_s: int, images: tuple[str, ...] | list[str] = (),
+) -> tuple[bytes, str, str]:
+    base = base.removesuffix("/images/generations").removesuffix("/images/edits")
+    action = "edits" if images else "generations"
+    payload = {
+        "model": model, "prompt": prompt, "quality": quality,
+        "output_format": "png", "response_format": "b64_json", "n": 1,
+    }
+    if images:
+        payload["images"] = [{"image_url": image} for image in images]
+    return await _image_generation_request(
+        f"{base}/images/{action}", api_key, payload, timeout_s=timeout_s, native=True,
+    )
+
+
+class HDImageGeneratorTool(Tool):
+    """HD generation and editing through dedicated image provider settings."""
 
     # Discord's own limit is 25MB; inputs get downscaled well below it.
     MAX_INPUT_BYTES = 20 * 1024 * 1024
-    # Generation can be billed even when its response is lost or unrecognized.
-    # Never automatically submit a second generation request.
-    MAX_ATTEMPTS = 1
-    _DATA_URI_RE = re.compile(
-        r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
-    )
+    _DATA_URI_RE = _IMAGE_DATA_URI_RE
     _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
     def get_description(self):
         return (
-            "Generate OR edit an HD AI image with Gemini (~10-30s). Use for high quality/HD/HQ "
+            "Generate OR edit an AI image using the configured HD/edit profile. "
+            "Actual quality and dimensions depend on the provider. Use for high quality/HD/HQ "
             "requests, and for ANY edit of an existing image ('make the car red', 'add a hat', "
             "'remove the background', 'combine these'). "
             "Params: prompt (required — for an edit, describe the change, not the whole scene); "
@@ -1366,12 +1471,16 @@ class HDImageGeneratorTool(Tool):
         )
 
     def _endpoint(self) -> tuple[str, str, str]:
-        """(chat_completions_url, api_key, model) from dedicated image settings."""
+        """(image_endpoint_url, api_key, model) from dedicated image settings."""
         cfg = self.bot.config
         base = (getattr(cfg, "GEMINI_IMAGE_BASE_URL", "") or "").strip().rstrip("/")
         key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or ""
-        model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or "gemini-3.1-flash-image"
-        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+        native = getattr(cfg, "GEMINI_IMAGE_PROTOCOL", "chat_completions") == "images"
+        default_model = "gpt-image-2" if native else "gemini-3.1-flash-image"
+        model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or default_model
+        url = base
+        if not native and not base.endswith("/chat/completions"):
+            url = f"{base}/chat/completions"
         return url, key, model
 
     def _shrink(self, raw: bytes) -> tuple[bytes, str]:
@@ -1489,6 +1598,9 @@ class HDImageGeneratorTool(Tool):
         if not prompt:
             return "Error: prompt parameter is required"
 
+        protocol = getattr(self.bot.config, "GEMINI_IMAGE_PROTOCOL", "chat_completions")
+        if protocol not in ("chat_completions", "images"):
+            return "Error: unsupported GEMINI_IMAGE_PROTOCOL; use chat_completions or images"
         api_url, api_key, model = self._endpoint()
         if not api_url or api_url == "/chat/completions":
             return "Error: HD image generation is not configured (set GEMINI_IMAGE_BASE_URL explicitly; chat settings are not used)"
@@ -1530,7 +1642,10 @@ class HDImageGeneratorTool(Tool):
             if raw is None:
                 logger.warning(f"hd_image input rejected: {err}")
                 return f"Error: {err}"
-            shrunk, mime = self._shrink(raw)
+            shrunk, mime = (
+                (raw, _sniff_image_mime(raw))
+                if protocol == "images" else self._shrink(raw)
+            )
             parts.append(
                 {
                     "type": "image_url",
@@ -1541,119 +1656,26 @@ class HDImageGeneratorTool(Tool):
             )
             loaded += 1
 
-        payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
         timeout_s = int(getattr(self.bot.config, "GEMINI_IMAGE_TIMEOUT", 300))
-        session = await _get_shared_session()
-
-        no_retry = (
-            " The request may have been billed. It was not retried; "
-            "do not automatically repeat image generation."
-        )
-        found: list[tuple[str, str]] = []
-        said = ""
-        last_error = ""
-        for attempt in range(self.MAX_ATTEMPTS):
-            try:
-                async with session.post(
-                    api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout_s),
-                ) as response:
-                    body = await response.text()
-                    if response.status != 200:
-                        logger.error(
-                            f"HD image API error: {response.status} - {body[:500]}"
-                        )
-                        if "quota" in body.lower():
-                            return (
-                                f"Error: the HD image model ({model}) has no quota "
-                                "right now." + no_retry
-                            )
-                        last_error = (
-                            "Error generating HD image: API returned status "
-                            f"{response.status}" + no_retry
-                        )
-                        if 500 <= response.status < 600:
-                            continue
-                        return last_error
-                    try:
-                        data = json.loads(body)
-                    except Exception:
-                        logger.error(f"HD image non-JSON response: {body[:300]}")
-                        return (
-                            "Error: HD image endpoint returned a non-JSON response"
-                            + no_retry
-                        )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"HD image timed out after {timeout_s}s "
-                    f"(attempt {attempt + 1}/{self.MAX_ATTEMPTS})"
-                )
-                last_error = (
-                    f"Error: HD image generation timed out after {timeout_s}s" + no_retry
-                )
-                continue
-            except Exception as e:
-                logger.error(f"HD image generation request error: {e}")
-                return f"Error generating HD image: {e}" + no_retry
-
-            choices = data.get("choices") or []
-            if not choices:
-                logger.error(f"HD image response has no choices: {list(data.keys())}")
-                last_error = "Error: No image data in HD response" + no_retry
-                continue
-            msg = choices[0].get("message") or {}
-            content = msg.get("content")
-            image_parts = msg.get("images") or []
-            if isinstance(content, list):
-                image_parts = [*image_parts, *content]
-                # Some gateways hand back structured parts, not a string.
-                content = " ".join(
-                    p.get("text", "") if isinstance(p, dict) else str(p)
-                    for p in content
-                )
-            content = content or ""
-
-            found = self._DATA_URI_RE.findall(content)
-            for part in image_parts:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    found.extend(
-                        self._DATA_URI_RE.findall(part["image_url"]["url"])
-                    )
-            if found:
-                break
-
-            said = re.sub(r"\s+", " ", str(content)).strip()
-            logger.warning(
-                f"HD image attempt {attempt + 1}/{self.MAX_ATTEMPTS} returned no "
-                f"image. Text: {said[:200]!r}"
+        if protocol == "images":
+            image_bytes, ext, error = await _native_image_request(
+                api_url, api_key, model, prompt,
+                quality=getattr(self.bot.config, "GEMINI_IMAGE_QUALITY", "high"),
+                timeout_s=timeout_s,
+                images=[part["image_url"]["url"] for part in parts[1:]],
             )
-            if said:
-                return (
-                    "Error: the HD image model returned text, not an image: "
-                    f"{said[:300]}" + no_retry
-                )
-
-        if not found:
-            if last_error:
-                return last_error
-            return (
-                "Error: the HD image response contained no supported image data."
-                + no_retry
+        else:
+            payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
+            image_bytes, ext, error = await _image_generation_request(
+                api_url, api_key, payload, timeout_s=timeout_s, native=False,
             )
+        if error:
+            return error
+        return await self._deliver_generated_image(message, prompt, image_bytes, ext, loaded)
 
-        ext, b64 = found[0]
-        try:
-            image_bytes = base64.b64decode(b64)
-        except Exception as e:
-            logger.error(f"HD image base64 decode failed: {e}")
-            return "Error: HD image data was not decodable" + no_retry
-
-        ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
+    async def _deliver_generated_image(
+        self, message: Message, prompt: str, image_bytes: bytes, ext: str, loaded: int,
+    ) -> str:
         file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")
         sent_msg = None
         # Step aside for the live progress message — the HD image is
@@ -12052,182 +12074,101 @@ class ChessResignTool(Tool):
 
 
 class UsageTool(Tool):
-    """Query the usage/quota endpoint (z3ki.dev/v2/usage) with the API key in env."""
+    """Report OpenRouter usage for the loaded primary chat key."""
 
     def get_description(self):
         return (
-            "Fetch current API usage and remaining quota from the provider "
-            "(z3ki.dev/v2/usage) using the API key already configured in env. "
-            "Returns usage percentages, reset times, and account counts so you "
-            "can report how much budget is left."
+            "Fetch OpenRouter per-key spending from its fixed /api/v1/key endpoint "
+            "using the loaded primary OpenRouter chat key. Returns USD credit usage "
+            "for all time and the current UTC day/week/month, separate external "
+            "BYOK usage, and the key's spending cap, remaining cap and reset schedule. "
+            "Covers all callers sharing that key, not necessarily this bot alone. "
+            "Not account/workspace balance, token counts or cache ratios. "
+            "Unavailable when the primary provider is not HTTPS OpenRouter."
         )
 
-    def _url(self) -> str:
-        return (
-            os.environ.get("MAXWELL_USAGE_URL", "") or ""
-        ).strip() or "https://z3ki.dev/v2/usage"
-
-    def _api_key(self) -> str:
-        return (
-            os.environ.get("OLLAMA_API_KEY", "")
-            or os.environ.get("OPENAI_COMPAT_API_KEY", "")
-            or ""
-        ).strip()
+    def summarize(self, data: dict) -> str:
+        lines = [
+            "OpenRouter primary-key usage (USD):",
+            "Windows: current UTC day, week (Monday–Sunday), and month.",
+        ]
+        fields = (
+            ("usage", "OpenRouter credits used — all time"),
+            ("usage_daily", "OpenRouter credits used — day"),
+            ("usage_weekly", "OpenRouter credits used — week"),
+            ("usage_monthly", "OpenRouter credits used — month"),
+            ("byok_usage", "External BYOK usage — all time"),
+            ("byok_usage_daily", "External BYOK usage — day"),
+            ("byok_usage_weekly", "External BYOK usage — week"),
+            ("byok_usage_monthly", "External BYOK usage — month"),
+            ("limit", "Key spending cap"),
+            ("limit_remaining", "Key remaining cap"),
+        )
+        for field, label in fields:
+            value = data.get(field)
+            rendered = "unknown"
+            if type(value) in (int, float) and -float("inf") < value < float("inf"):
+                rendered = f"${value:.6f}".rstrip("0").rstrip(".")
+            elif field in ("limit", "limit_remaining") and field in data and value is None:
+                rendered = "no key cap"
+            lines.append(f"{label}: {rendered}")
+        reset = data.get("limit_reset", "unknown")
+        if reset not in ("daily", "weekly", "monthly", None):
+            reset = "unknown"
+        lines.append(f"Key cap reset: {'none' if reset is None else reset}")
+        lines.append("Scheduled resets occur at 00:00 UTC; weeks start Monday.")
+        byok = data.get("include_byok_in_limit")
+        included = "yes" if byok is True else "no" if byok is False else "unknown"
+        lines.append(f"External BYOK counts toward key cap: {included}")
+        lines.append(
+            "External BYOK usage is separate from OpenRouter credit usage. "
+            "Scope: all callers sharing the loaded primary key, not necessarily bot-only. "
+            "This is not an account/workspace balance or a guarantee requests can run; "
+            "token counts and cache ratios are not provided."
+        )
+        return "\n".join(lines)
 
     async def execute(self, message: Message, **kwargs) -> str:
-        url = self._url()
-        key = self._api_key()
-        if not key:
-            return "Error: no API key configured (OLLAMA_API_KEY or OPENAI_COMPAT_API_KEY)."
-        session = await _get_shared_session()
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        }
+        provider = getattr(self.bot, "ai_provider", None)
         try:
+            base = urlparse(getattr(provider, "base_url", ""))
+            if not (
+                base.scheme == "https"
+                and base.hostname == "openrouter.ai"
+                and base.port in (None, 443)
+                and base.username is None
+                and base.password is None
+                and not base.query
+                and not base.fragment
+            ):
+                return (
+                    "Error: usage unavailable for this primary provider; "
+                    "only a loaded HTTPS OpenRouter primary is supported."
+                )
+            key = getattr(provider, "api_key", "").strip()
+            if not key:
+                return "Error: usage unavailable; the loaded OpenRouter primary has no API key."
+            session = await _get_shared_session()
             async with session.get(
-                url,
-                headers=headers,
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
             ) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    return f"Error: usage endpoint returned HTTP {resp.status}: {body[:400]}"
-        except asyncio.TimeoutError:
-            return "Error: usage endpoint timed out."
-        except Exception as exc:
-            return f"Error: could not reach usage endpoint: {exc}"
-
-        # Condense to a concise summary the model can read at a glance, with
-        # the raw payload appended (truncated) only if the shape is unfamiliar.
-        try:
-            data = json.loads(body)
-        except ValueError:
-            return f"API usage from {url}:\n{body[:4000]}"
-
-        lines: list[str] = [f"API usage from {url}:"]
-        accounts = data.get("accounts")
-        if accounts is not None:
-            lines.append(f"Accounts: {accounts}")
-        combined = data.get("combined") or {}
-        if isinstance(combined, dict):
-            for family, limits in combined.items():
-                if not isinstance(limits, dict):
-                    continue
-                parts: list[str] = []
-                for window in ("5h", "weekly"):
-                    info = limits.get(window)
-                    if not isinstance(info, dict):
-                        continue
-                    pct = info.get("remaining_pct")
-                    reset = str(info.get("reset_time", ""))[:16]
-                    name = info.get("display_name", window)
-                    if pct is not None:
-                        parts.append(f"{window}: {pct:.1f}% left (resets {reset})")
-                    else:
-                        parts.append(f"{window}: {name} (resets {reset})")
-                if parts:
-                    lines.append(f"- {family}: " + " · ".join(parts))
-        # Antigravity pooled accounts: summarize rate-limited models WITHOUT leaking emails.
-        # Previously the raw payload included per_account[].email and rate_limited[].email
-        # which the LLM then echoed into the channel, exposing owner addresses.
-        # We now redact emails and only show counts / anonymized summaries.
-        rate_limited = data.get("rate_limited")
-        # Filter to *active* limits only — antigravity-manager keeps stale entries for ~1m after expiry
-        # and marks weekly 0% as rate_limited even when 5h is 100% (not actually blocked for 5h). That was
-        # the "one acc always marked as rate limited" false positive (zequielwolf weekly 0% but 5h 100%).
-        active_limited = []
-        stale_count = 0
-        if isinstance(rate_limited, list) and rate_limited:
-            now_ts = int(time.time())
-            for entry in rate_limited:
-                if not isinstance(entry, dict):
-                    continue
-                until = entry.get("until")
-                # until is epoch seconds; if in the past it's stale, ignore
-                try:
-                    until_int = int(until) if until is not None else 0
-                except (ValueError, TypeError):
-                    until_int = 0
-                if until_int and until_int < now_ts - 5:
-                    stale_count += 1
-                    continue
-                active_limited.append(entry)
-        if active_limited:
-            from collections import Counter
-
-            models = Counter()
-            for entry in active_limited:
-                m = str(entry.get("model") or entry.get("reason") or "unknown")
-                models[m] += 1
-            summary = ", ".join(
-                f"{model} x{cnt}" if cnt > 1 else model for model, cnt in models.items()
-            )
-            lines.append(
-                f"Rate-limited models (pooled, {len(active_limited)} active): {summary}"
-            )
-            lines.append(
-                "Note: single-model QuotaExhausted on one pooled account is NOT global exhaustion — other accounts still serve."
-            )
-            if stale_count:
-                lines.append(
-                    f"({stale_count} stale/expired rate-limit entries ignored)"
-                )
-        elif isinstance(rate_limited, list) and rate_limited:
-            # All entries were stale/weekly-only — not actually rate limited for current window
-            if stale_count:
-                lines.append(
-                    f"Rate-limited: none (currently) — {stale_count} stale entry expired, pooled quota still available"
-                )
+                status = resp.status
+                if status == 200:
+                    payload = json.loads(await resp.text())
+            if status != 200:
+                result = f"Error: OpenRouter key usage returned HTTP {status}; no usage data available."
+            elif not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+                result = "Error: OpenRouter key usage returned an unsupported response; no usage data available."
             else:
-                lines.append("Rate-limited: none")
-        else:
-            lines.append("Rate-limited: none")
-        # Per-account remainings are useful but must not expose emails. Anonymize to Account 1..N.
-        per_account = data.get("per_account")
-        if isinstance(per_account, list) and per_account:
-            lines.append(
-                f"Per-account pools: {len(per_account)} accounts (emails redacted)"
-            )
-            # Optionally show anonymized quota spread without emails
-            for idx, acct in enumerate(per_account[:5], start=1):
-                if not isinstance(acct, dict):
-                    continue
-                tier = acct.get("tier", "")
-                live = acct.get("live_limited") or []
-                lim_str = f" live_limited={live}" if live else ""
-                # Show only remaining %s anonymized
-                rem = acct.get("remaining") or {}
-                parts = []
-                if isinstance(rem, dict):
-                    for k, v in list(rem.items())[:2]:
-                        if isinstance(v, dict) and "remaining_pct" in v:
-                            parts.append(f"{k}:{v['remaining_pct']:.0f}%")
-                extra = " " + " ".join(parts) if parts else ""
-                lines.append(f"  - Account {idx} ({tier}){lim_str}{extra}")
-            if len(per_account) > 5:
-                lines.append(f"  … +{len(per_account) - 5} more")
-
-        # Build a sanitized copy for the raw payload fallback — strip every email field recursively
-        def _sanitize(obj):
-            if isinstance(obj, dict):
-                out = {}
-                for k, v in obj.items():
-                    if k.lower() == "email":
-                        out[k] = f"redacted_{hash(str(v)) % 10000:04d}@redacted.local"
-                    else:
-                        out[k] = _sanitize(v)
-                return out
-            if isinstance(obj, list):
-                return [_sanitize(x) for x in obj]
-            return obj
-
-        sanitized = _sanitize(data)
-        rendered = json.dumps(sanitized, indent=2, ensure_ascii=False)
-        if len(rendered) > 2500:
-            rendered = rendered[:2500] + "\n… [truncated, emails redacted]"
-        lines.append("\nSanitized payload (emails redacted):" + rendered)
-        return "\n".join(lines)
+                result = self.summarize(payload["data"])
+        except asyncio.TimeoutError:
+            result = "Error: OpenRouter key usage timed out; no usage data available."
+        except Exception:
+            result = "Error: OpenRouter key usage could not be read; no usage data available."
+        return result
 
 
 class ManagePluginTool(Tool):

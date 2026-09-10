@@ -124,19 +124,35 @@ For OpenRouter's `deepseek/deepseek-v4.1-flash`, every request explicitly includ
 
 No dashboard UI was added. Commands report actual loaded primary configuration; environment changes still require the normal operator restart. Preserve custom routing and attribution when changing the baseline.
 
-## Independent HD image configuration
+## Independent normal and HD image configuration
 
-`hd_image` uses only `GEMINI_IMAGE_BASE_URL`, `GEMINI_IMAGE_API_KEY`, and `GEMINI_IMAGE_MODEL`. It never inherits `OLLAMA_*` chat configuration, credentials, routing options or model. A blank dedicated base URL returns a configuration error before fetching input images or making any generation request. A blank dedicated key sends no Authorization header, allowing explicitly configured keyless gateways. Merely adding a paid chat key must not enable paid HD image generation.
+The two image profiles never inherit `OLLAMA_*` chat credentials/model/routing or one another's key. Normal `IMAGE_GEN_PROTOCOL=pollinations` retains the keyless legacy generator; `images` explicitly selects native `/images/generations`. HD `GEMINI_IMAGE_PROTOCOL=chat_completions` retains the existing Gemini-compatible adapter; `images` selects native generation and JSON `/images/edits` with `images[].image_url` references. Native responses use `data[0].b64_json`. Existing names are retained for compatibility; a GPT image model belongs on the native protocol, not the chat-completions route.
+
+Curie's intended local-proxy profiles (set both dedicated keys privately, not in source):
 
 ```ini
-GEMINI_IMAGE_BASE_URL=
+IMAGE_GEN_PROTOCOL=images
+IMAGE_GEN_BASE_URL=http://192.168.241.2:8317/v1
+IMAGE_GEN_API_KEY=
+IMAGE_GEN_MODEL=gpt-image-2.5-flare
+IMAGE_GEN_QUALITY=low
+IMAGE_GEN_TIMEOUT=300
+
+GEMINI_IMAGE_PROTOCOL=images
+GEMINI_IMAGE_BASE_URL=http://192.168.241.2:8317/v1
 GEMINI_IMAGE_API_KEY=
-GEMINI_IMAGE_MODEL=gemini-3.1-flash-image
+GEMINI_IMAGE_MODEL=gpt-image-2.5-sunburst
+GEMINI_IMAGE_QUALITY=max
+GEMINI_IMAGE_TIMEOUT=600
 ```
 
-Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content` (text or image-url parts) or `message.images[].image_url.url`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. Each tool invocation submits generation once: empty/unrecognized responses, timeouts and server errors do not trigger a second potentially billable request. This is not a cross-invocation deduplication policy. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
+Flare/low expresses the speed-oriented request and Sunburst/max the maximum-quality request supported by [OpenAI's documented model family](https://developers.openai.com/api/docs/guides/image-prompting). **The current local proxy does not demonstrate that distinction:** both live probes returned `quality=low`, roughly 1.57 megapixels and similar latency, and the updated local toolkit's broader measurements report ignored quality/size/format/count settings and no observable difference among 2.5 aliases. No actual slower/higher-quality execution, chosen canvas, or transparent output is promised. These fields are still sent explicitly; changing Curie's labels cannot unlock a capability the gateway ignores.
 
-Both tools remain registered under `ENABLE_IMAGE_GEN`; dashboard Runtime controls → Tools can disable `hd_image` independently. The no-inheritance behavior requires the updated application image, not only an environment edit. See [STATUS.md](STATUS.md) for deployed versus source-only state.
+A blank dedicated base rejects requests before image fetching/generation. A blank key permits deliberately keyless gateways; it does not borrow chat auth. Native generation submits exactly one POST with redirects disabled. Timeout, HTTP failure, unrecognized/empty result or decode failure never triggers another generation or silent provider fallback. Native HD references preserve original bytes; only the legacy chat adapter uses `GEMINI_IMAGE_MAX_INPUT_EDGE` shrinking. Existing Discord delivery, permanent image persistence and same-turn preview suppression remain intact.
+
+The configured proxy address is private, not host loopback inside a container. Host port8317 remains bound only to127.0.0.1. The rootful proxy's extra internal bridge `maxwell-curie-cpa` uses `192.168.241.0/29` and fixed proxy address192.168.241.2, avoiding Curie's independent rootless172.17 routes. It exposes no Docker socket to Curie. After **recreating** `cli-proxy-api` (an ordinary restart retains attachment), reattach the existing private network using `sudo docker network connect --ip 192.168.241.2 maxwell-curie-cpa cli-proxy-api` and verify reachability/authentication before image use. Do not publish the proxy publicly or disable rootless host-loopback isolation.
+
+Both tools remain under `ENABLE_IMAGE_GEN` and independently disableable runtime tool controls. Native support requires the updated image; see [STATUS.md](STATUS.md) for source versus deployed evidence.
 
 ## Provider retries
 

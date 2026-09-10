@@ -435,9 +435,15 @@ class Config:
     )
     CAPTCHA_FALLBACK_USER_ID = os.getenv("CAPTCHA_FALLBACK_USER_ID", "").strip()
 
-    # image_generator runs on Pollinations. SDXL-Lightning is fast (~1-2s) and
-    # high quality; the old default (flux) was both slower and less consistent.
     POLLINATIONS_MODEL = os.getenv("POLLINATIONS_MODEL", "MarcosFRG/sdxl-lightning")
+    IMAGE_GEN_PROTOCOL = os.getenv("IMAGE_GEN_PROTOCOL", "pollinations").strip().lower()
+    IMAGE_GEN_BASE_URL = os.getenv("IMAGE_GEN_BASE_URL", "").strip()
+    IMAGE_GEN_API_KEY = os.getenv("IMAGE_GEN_API_KEY", "").strip()
+    IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "gpt-image-2").strip()
+    IMAGE_GEN_QUALITY = os.getenv("IMAGE_GEN_QUALITY", "low").strip()
+    IMAGE_GEN_TIMEOUT = _int_env(
+        "IMAGE_GEN_TIMEOUT", 300, min_value=30, max_value=900
+    )
 
     NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
     NVIDIA_IMAGE_URL = os.getenv(
@@ -457,13 +463,10 @@ class Config:
     GPT_IMAGE_URL = os.getenv("GPT_IMAGE_URL", "")
     GPT_IMAGE_API_KEY = os.getenv("GPT_IMAGE_API_KEY", "")
 
-    # hd_image: Gemini image model on an explicitly configured, dedicated
-    # OpenAI-compatible endpoint. A blank base disables HD image requests;
-    # a blank key permits keyless endpoints. Neither inherits OLLAMA_*.
-    #
-    # This adapter uses /chat/completions and expects base64 image data-URIs
-    # in message.content or message.images. Native /images/generations or /images/edits APIs
-    # need a different adapter, not merely a different model name.
+    GEMINI_IMAGE_PROTOCOL = os.getenv(
+        "GEMINI_IMAGE_PROTOCOL", "chat_completions"
+    ).strip().lower()
+    GEMINI_IMAGE_QUALITY = os.getenv("GEMINI_IMAGE_QUALITY", "high").strip()
     GEMINI_IMAGE_BASE_URL = os.getenv("GEMINI_IMAGE_BASE_URL", "").strip()
     GEMINI_IMAGE_API_KEY = os.getenv("GEMINI_IMAGE_API_KEY", "").strip()
     GEMINI_IMAGE_MODEL = (

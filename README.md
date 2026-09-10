@@ -566,10 +566,19 @@ restart. Deps: `python-chess` + `pillow` (already in `requirements.txt`).
 
 ## Usage
 
-The `usage` tool queries the provider quota endpoint (`z3ki.dev/v2/usage`)
-with the API key already in the environment (`OLLAMA_API_KEY`, falling back to
-`OPENAI_COMPAT_API_KEY`), returning remaining percentage and reset times.
-Override the URL with `MAXWELL_USAGE_URL`.
+The `usage` tool reports **OpenRouter spending for the loaded primary chat key**
+through its fixed HTTPS `/api/v1/key` endpoint. The ordinary chat key is sufficient;
+no management/workspace credential is needed. It reports USD credit usage for all
+time and the current UTC day/week/month, the key's spending cap/remaining cap/reset
+schedule, and external BYOK usage separately. These figures cover every caller
+sharing that key—not necessarily Curie alone—and are not workspace balance,
+token counts or cache-hit ratios.
+
+A non-OpenRouter primary returns unavailable without sending its credential.
+Redirects are disabled; key labels, identifiers, raw responses and errors are not
+forwarded to chat. The old z3ki adapter and `MAXWELL_USAGE_URL` override are no
+longer used. Rotating the primary key and restarting updates both inference and
+reporting; the new key's history is separate. See [OpenRouter's current-key API](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key).
 
 ## Memory and RAG
 
