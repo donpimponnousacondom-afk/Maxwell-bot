@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Lifecycle start alias — implementation checkpoint (2026-09-10)
+
+- Root requested systemctl-style spelling without changing restart scope. `scripts/instance.py <id> start` now takes the exact same path as `up`: ownership inventory and private operation lock, then `compose up -d --wait --wait-timeout 300`. The older spelling remains supported. `restart` is unchanged: bot/API only, not dependency recovery or a full stop/start cycle.
+- **59 focused isolated operations tests passed**, including 10 new parameterized cases for CLI acceptance, identical health wait, lock handling, failed ownership, archive-argument rejection and unchanged restart command. Python3.14.4, synthetic/mocked operations only; Ruff clean. Evidence `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/start-worktree-llrr22pr/`.
+- Source and runbooks updated. Full combined validation and installation of the operator script at `/opt/maxwell/scripts/instance.py` are pending; no actual lifecycle operation was invoked for these tests.
+
 ## Duplicate image billing — traced and fixed in source (2026-09-10)
 
 - Root's OpenRouter CSV identified two pairs of billed Gemini image requests at 01:30:40/49 UTC and 01:31:44/53 UTC. Sanitized production logs show HD attempt 1/2 reporting empty parsed content at **01:30:49.568358** and **01:31:53.329785**, immediately before each second billed request. Persisted tool traces show **one HD invocation per pair**, not two model tool calls. Both invocations returned errors and posted no HD image.

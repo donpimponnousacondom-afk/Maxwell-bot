@@ -11,7 +11,7 @@ import stat
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call, mock_open
 
 import pytest
 
@@ -146,13 +146,82 @@ def test_down_stops_all_writers_before_removing_managed_containers(tmp_path):
     assert events[-1] == ("compose", "down", "--timeout", "45")
 
 
-def test_up_waits_for_live_service_health(tmp_path):
+@pytest.mark.parametrize("action", ["up", "start"])
+def test_up_waits_for_live_service_health(tmp_path, action):
     app = instance(tmp_path)
     app.inventory = Mock(return_value=[])
     app.compose = Mock()
-    ops.lifecycle(app, "up")
+    ops.lifecycle(app, action)
     app.inventory.assert_called_once_with()
     app.compose.assert_called_once_with("up", "-d", "--wait", "--wait-timeout", "300")
+
+
+@pytest.mark.parametrize("action", ["up", "start"])
+def test_start_alias_rejects_failed_inventory(tmp_path, action):
+    app = instance(tmp_path)
+    app.inventory = Mock(side_effect=ValueError("foreign ownership"))
+    app.compose = Mock()
+    with pytest.raises(ValueError, match="foreign ownership"):
+        ops.lifecycle(app, action)
+    app.compose.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["up", "start"])
+@pytest.mark.parametrize("lock_busy", [False, True])
+def test_start_alias_cli_uses_same_operation_lock_and_health_wait(monkeypatch, action, lock_busy):
+    events = Mock()
+    app = SimpleNamespace(path=Path("/synthetic/curie"), inventory=events.inventory, compose=events.compose)
+    account = object()
+    service_account = Mock(return_value=account)
+    constructor = Mock(return_value=app)
+    file_open = mock_open()
+    file_open.return_value.fileno.return_value = 123
+    file_api = SimpleNamespace(
+        open=Mock(return_value=123), fdopen=file_open,
+        O_CREAT=os.O_CREAT, O_RDWR=os.O_RDWR, O_NOFOLLOW=os.O_NOFOLLOW,
+    )
+    monkeypatch.setattr(ops.sys, "argv", ["instance.py", "curie", action])
+    monkeypatch.setattr(ops, "service_account", service_account)
+    monkeypatch.setattr(ops, "Instance", constructor)
+    monkeypatch.setattr(ops, "os", file_api)
+    monkeypatch.setattr(ops.fcntl, "flock", events.flock)
+    if lock_busy:
+        events.flock.side_effect = BlockingIOError("operation busy")
+        with pytest.raises(BlockingIOError, match="operation busy"):
+            ops.main()
+    else:
+        ops.main()
+    service_account.assert_called_once_with("curie")
+    constructor.assert_called_once_with("curie", account)
+    file_api.open.assert_called_once_with(
+        app.path / ".operations.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600
+    )
+    file_open.assert_called_once_with(123, "w")
+    expected = [call.flock(123, ops.fcntl.LOCK_EX | ops.fcntl.LOCK_NB)]
+    if not lock_busy:
+        expected += [call.inventory(), call.compose("up", "-d", "--wait", "--wait-timeout", "300")]
+    assert events.mock_calls == expected
+
+
+@pytest.mark.parametrize("action", ["up", "start"])
+def test_start_alias_cli_rejects_archive_before_identity_lookup(monkeypatch, capsys, action):
+    service_account = Mock(side_effect=AssertionError("identity must not be inspected"))
+    monkeypatch.setattr(ops, "service_account", service_account)
+    monkeypatch.setattr(ops.sys, "argv", ["instance.py", "curie", action, "/synthetic/archive.tar"])
+    with pytest.raises(SystemExit) as error:
+        ops.main()
+    assert error.value.code == 2
+    assert "backup/restore require an archive path; other commands do not" in capsys.readouterr().err
+    service_account.assert_not_called()
+
+
+def test_restart_remains_bot_api_only(tmp_path):
+    app = instance(tmp_path)
+    app.inventory = Mock(return_value=[])
+    app.compose = Mock()
+    ops.lifecycle(app, "restart")
+    app.inventory.assert_called_once_with()
+    app.compose.assert_called_once_with("restart", "--timeout", "45", "bot", "api")
 
 
 def test_helper_mounts_only_state_and_no_network(tmp_path):

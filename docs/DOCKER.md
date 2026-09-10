@@ -136,8 +136,8 @@ Run the wrapper as host root or as the corresponding service user. Root drops to
 ./scripts/instance.sh curie down
 ```
 
-- `up`: create/start the Compose services; runtime reconciles owned backends.
-- `restart`: restart bot and API to reload config, without replacing the images.
+- `start` / `up`: exact aliases; create/start the Compose services and wait for health (`--wait --wait-timeout 300`); runtime reconciles owned backends. Both perform the same inventory/ownership checks and acquire the same per-instance operation lock. Use either after a full `stop`.
+- `restart`: restart only bot and API to reload config, without replacing the images or starting stopped dependencies. Healthy Ollama, web and dynamic shell/site containers are left running. This is not a full `stop` → `start` cycle.
 - `logs`: follow the last 100 lines of Compose logs; logs may contain private conversations.
 - `stop`: stop bot/API first, then managed shell/site containers and web; retain containers and state.
 - `down`: stop all writers, remove owned managed shell/site containers, then tear down Compose. Persistent directories survive. **Shell-installed packages outside `/home/maxwell` do not.**

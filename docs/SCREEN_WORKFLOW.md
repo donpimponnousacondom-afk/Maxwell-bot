@@ -41,12 +41,12 @@ Use another terminal, or stop the log follower with Ctrl-c before typing in Scre
 
 ```sh
 sudo -n /usr/local/bin/python3.14 /opt/maxwell/scripts/instance.py curie stop
-sudo -n /usr/local/bin/python3.14 /opt/maxwell/scripts/instance.py curie up
+sudo -n /usr/local/bin/python3.14 /opt/maxwell/scripts/instance.py curie start
 sudo -n /usr/local/bin/python3.14 /opt/maxwell/scripts/instance.py curie restart
 ```
 
 - `stop` quiesces bot/API before owned shell/sites/web/Ollama; state and containers remain.
-- `up` starts the full stack, including Ollama. Use it after `stop` or when dependencies are not running.
+- `start` and `up` are exact aliases: same full Compose startup, including Ollama, same ownership/operation-lock checks, same health wait. Either works after `stop` or when dependencies are not running.
 - `restart` reconnects **only bot/API** to reload private configuration; it does not start stopped Ollama/web dependencies. Do not use it to recover a fully stopped stack—use `up`. Coordinate it; autonomous work can resume.
 - `down` also removes owned containers/networks, not persistent state or the model volume. Shell packages outside its mounted workspace are disposable.
 - `logs` first replays the last 100 Compose log lines, including earlier process failures, then follows new output. Compare failures with current container start times and actual embedding probes before concluding a recovered service is still broken. Restore the wrapped log command above when appropriate; do not start another bot to restore visibility.
