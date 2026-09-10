@@ -36,6 +36,7 @@ from response_observability import (
     record_delivery,
     send_command_response,
     send_measured,
+    suppress_delivered_image_previews,
     update_footer_control,
 )
 
@@ -1797,7 +1798,7 @@ def _sanitize_visible_reply(text: str, *, scrub_repeats: bool = True) -> str:
         raw,
         flags=re.DOTALL,
     )
-    response = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+.*?\]", "", response)
+    response = re.sub(r"\[/?(?:TOOL_CALL:)?[\w-]+[^\]\n]*\](?!\()", "", response)
     response = TOOL_TRACE_LINE_RE.sub("", response)
     for marker in (
         "__NO_RESPONSE__",
@@ -14576,7 +14577,11 @@ class MaxwellBot(commands.Bot):
                 response, send_stickers = self._extract_stickers_from_text(
                     response, message.guild
                 )
-                _, chunks = prepare_delivery(self, response, response_metrics, self._split_response)
+                delivery_response = (
+                    suppress_delivered_image_previews(response, all_tool_results)
+                    if platform == "discord" else response
+                )
+                _, chunks = prepare_delivery(self, delivery_response, response_metrics, self._split_response)
                 if not chunks and send_stickers:
                     chunks = [""]
                 # Fast-tool fix: try to transition the live progress message

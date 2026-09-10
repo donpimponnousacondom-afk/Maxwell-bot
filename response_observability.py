@@ -96,6 +96,50 @@ def clean_message_content(bot, message, content: str | None = None) -> str:
     return strip_footer(text, self_authored=bool(own_id and author_id == own_id))
 
 
+def suppress_delivered_image_previews(text: str, tool_results: list[str]) -> str:
+    delivered = set()
+    for result in tool_results:
+        if result.startswith(
+            (
+                "Tool image_generator: Image sent to chat:",
+                "Tool hd_image: HD image generated successfully:",
+                "Tool hd_image: HD image edited successfully:",
+            )
+        ):
+            delivered.update(
+                re.findall(r"(?m)^(?:Image URL|Permanent URL): (https?://\S+)", result)
+            )
+
+    attachment_url = re.compile(
+        r"https?://(cdn\.discordapp\.com|media\.discordapp\.net)"
+        r"(/attachments/[^?#]+)(?:[?#].*)?",
+        re.IGNORECASE,
+    )
+    attachments = {
+        (match[1].lower(), match[2])
+        for url in delivered
+        if (match := attachment_url.fullmatch(url))
+    }
+
+    def hide_preview(match: re.Match[str]) -> str:
+        token = match[0]
+        if match["url"] is None:
+            return token
+        url = token if token in delivered else token.rstrip(".,!;)]}'\"")
+        attachment = attachment_url.fullmatch(url)
+        duplicate = url in delivered or (
+            attachment and (attachment[1].lower(), attachment[2]) in attachments
+        )
+        return f"<{url}>{token[len(url):]}" if duplicate else token
+
+    return re.sub(
+        r"(?P<code>`+).*?(?P=code)|<https?://[^\s<>]+>|(?P<url>https?://[^\s<>]+)",
+        hide_preview,
+        text,
+        flags=re.DOTALL,
+    )
+
+
 def prepare_delivery(
     bot,
     text: str,
