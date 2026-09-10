@@ -89,7 +89,15 @@ Keep the existing OpenRouter key in `OLLAMA_API_KEY`. Provider selection is a **
 
 To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. This is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level and leaves the model/provider default unchanged. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
-For actual custom headers, for example `OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://your-domain.example","X-Title":"Curie"}'`. The configured API key takes precedence over any case variant of `Authorization`.
+For OpenRouter app attribution, set HTTP **headers**, not body fields:
+
+```ini
+OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://council.zombiedawn.net/","X-OpenRouter-Title":"Dame Curie: Always Teasing"}'
+```
+
+`HTTP-Referer` is the app's URL/unique identifier; `X-OpenRouter-Title` sets its display name. OpenRouter still accepts `X-Title`, but the title alone does not create an app entry. Attribution opts the app into public rankings/analytics; see [OpenRouter app attribution](https://openrouter.ai/docs/app-attribution). Use your own app URL/title for another identity.
+
+Merge these into any existing `OLLAMA_EXTRA_HEADERS` object; leave `OLLAMA_EXTRA_BODY`, routing, model and credentials unchanged. The configured API key takes precedence over any case variant of `Authorization`. For the current Curie deployment, edit private `/srv/maxwell/curie/config/bot.env`, not the development checkout `.env`, then coordinate a bot/API `restart` through the [instance operator](SCREEN_WORKFLOW.md#stop-start-restart). The deployed image already supports these options; no image rebuild is needed.
 
 Scope and precedence:
 
