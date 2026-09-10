@@ -1,5 +1,12 @@
 # Current implementation and deployment status
 
+## HD image separation — implementation checkpoint (2026-09-10)
+
+- Root requested that HD generation remain available but never borrow the main chat endpoint/key. `hd_image` now resolves only dedicated `GEMINI_IMAGE_*` settings; missing base returns a configuration error before downloads/HTTP. Blank dedicated key sends no Authorization header, preserving explicit keyless gateways. Pollinations and tool registration are unchanged. Native GPT Images routes are not implemented by the existing chat-completions adapter.
+- **19 focused isolated tests passed** (16 new HD cases, 3 existing Pollinations); 10 new cases fail on the prior source. Mocked HTTP/delivery only, Python3.14.4, private-read/network barriers. Scoped Ruff passes. Evidence: `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/hd-image-uncommitted-5vp_fsqf/`. Full combined-suite verification and deployment remain pending.
+- Immediate authorized containment: `hd_image` added to the persisted runtime disabled-tools list through the authenticated API; `image_generator` and every other control preserved. The earlier control file is backed up under `/srv/maxwell-rollback/curie/image-optout-*/`. This is temporary until safe source is deployed; the tool is not being removed.
+- Current image remains `99fd7fa`. The reported `ollama` DNS failures were real but before the current bot/API startup (01:55:50 UTC); Ollama started at 01:50:51 UTC. Both containers now resolve its name and pass actual finite/nonzero 1024-dimensional embedding probes. No DNS or embedding-breaker errors in the current process epoch. Latest read-only counts: 872 total, 838 trusted embeddings, 34 eligible unembedded, zero stale/invalid; new embeddings progressed but historical backlog remains. No re-embedding, model switch, service restart or image generation was performed in this investigation.
+
 ## Current deployment — TTS repair (2026-09-10)
 
 **Curie is running `maxwell-app:99fd7fa`**, frozen source `99fd7fa4bcd4083653cbd29402840edc7b4bc97f`, Python3.14.4. Web remains `maxwell-web:01e8cbb`; private engine, loopback dashboard and original identity are unchanged. This release also deploys the primary request options below, without changing chat model/routing/reasoning settings.

@@ -98,6 +98,20 @@ Scope and precedence:
 - Each request gets its own copy of the extra body, preserving configured routing through retries without sharing mutable nested state. Existing retry/streaming/telemetry behavior remains authoritative.
 - Headers can contain credentials: keep them in private instance configuration, never source control or public files. Clear endpoint-specific options when changing the main endpoint.
 
+## Independent HD image configuration
+
+`hd_image` uses only `GEMINI_IMAGE_BASE_URL`, `GEMINI_IMAGE_API_KEY`, and `GEMINI_IMAGE_MODEL`. It never inherits `OLLAMA_*` chat configuration, credentials, routing options or model. A blank dedicated base URL returns a configuration error before fetching input images or making any generation request. A blank dedicated key sends no Authorization header, allowing explicitly configured keyless gateways. Merely adding a paid chat key must not enable paid HD image generation.
+
+```ini
+GEMINI_IMAGE_BASE_URL=
+GEMINI_IMAGE_API_KEY=
+GEMINI_IMAGE_MODEL=gemini-3.1-flash-image
+```
+
+Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
+
+Both tools remain registered under `ENABLE_IMAGE_GEN`; dashboard Runtime controls → Tools can disable `hd_image` independently. The no-inheritance behavior requires the updated application image, not only an environment edit. See [STATUS.md](STATUS.md) for deployed versus source-only state.
+
 ## Provider retries
 
 `OLLAMA_RETRY_ATTEMPTS` defaults to **5 total attempts** (range 1–10), not five retries. Explicit environment values override this default. Transient failures wait **10, 20, 30, 40 seconds** before attempts 2–5; the delay is linear and also applies when switching endpoints. Deterministic request rejection/failover and corrected-payload retries do not use this backoff, but still consume the fixed attempt budget.

@@ -1367,16 +1367,10 @@ class HDImageGeneratorTool(Tool):
         )
 
     def _endpoint(self) -> tuple[str, str, str]:
-        """(chat_completions_url, api_key, model), inheriting the primary endpoint."""
+        """(chat_completions_url, api_key, model) from dedicated image settings."""
         cfg = self.bot.config
-        base = (
-            getattr(cfg, "GEMINI_IMAGE_BASE_URL", "")
-            or getattr(cfg, "OLLAMA_BASE_URL", "")
-            or ""
-        ).rstrip("/")
-        key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or getattr(
-            cfg, "OLLAMA_API_KEY", ""
-        )
+        base = (getattr(cfg, "GEMINI_IMAGE_BASE_URL", "") or "").strip().rstrip("/")
+        key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or ""
         model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or "gemini-3.1-flash-image"
         url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
         return url, key, model
@@ -1498,7 +1492,7 @@ class HDImageGeneratorTool(Tool):
 
         api_url, api_key, model = self._endpoint()
         if not api_url or api_url == "/chat/completions":
-            return "Error: HD image generation is not configured (no GEMINI_IMAGE_BASE_URL or OLLAMA_BASE_URL)"
+            return "Error: HD image generation is not configured (set GEMINI_IMAGE_BASE_URL explicitly; chat settings are not used)"
 
         # Normalize the image param: a single ref, a list, or a
         # comma/newline-separated string all mean the same thing.
@@ -1549,10 +1543,9 @@ class HDImageGeneratorTool(Tool):
             loaded += 1
 
         payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         timeout_s = int(getattr(self.bot.config, "GEMINI_IMAGE_TIMEOUT", 300))
         session = await _get_shared_session()
 
