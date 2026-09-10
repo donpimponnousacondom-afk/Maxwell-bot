@@ -60,8 +60,8 @@ Dashboard: `http://localhost:8081/admin/`, using the original dashboard username
 - Private runtime configuration: `/srv/maxwell/curie/config/bot.env`.
 - Live personality/server prompts: `/srv/maxwell/curie/config/prompts/`.
 - Memory and runtime state: `/srv/maxwell/curie/data/`.
-- Source-frozen application/web images: `maxwell-app:99fd7fa`, `maxwell-web:01e8cbb`.
-- Edit `/srv/maxwell/curie/config/bot.env`, not the development checkout `.env`, for live credentials/provider settings. Bot/API restart is required. The TTS repair transferred only the NVIDIA key; original dashboard credentials and chat settings are unchanged.
+- Source-frozen application/web images: `maxwell-app:677d2e4`, `maxwell-web:01e8cbb`.
+- Edit `/srv/maxwell/curie/config/bot.env`, not the development checkout `.env`, for live credentials/provider settings. Bot/API restart is required while dependencies are running; after a full stop use `start`/`up`. Rollouts preserve root's current settings; historical provider snapshots are not configuration authority.
 
 Do not paste credentials, process environments, raw memory, or container environment arrays into diagnostics. Generated-site public URLs remain loopback-only until root configures an approved TLS origin.
 
@@ -69,7 +69,8 @@ Do not paste credentials, process environments, raw memory, or container environ
 
 The tested same-identity restore procedure is in [DOCKER.md](DOCKER.md#backup-and-restore). It requires all owned containers removed and four **empty** target state directories; never overwrite a running/nonempty target. Reapply mapped-site ACLs and verify health after restoration.
 
-- Ready pre-login state: `/srv/maxwell-backups/curie/pre-login-01e8cbb.tar` (mode 0600, credentials included).
+- Latest pre-image-repair state: `/srv/maxwell-backups/curie/pre-images-677d2e4.tar`; current pre-rollout config/control and source: `/srv/maxwell-rollback/curie/images-677d2e4/` (private). Prior app `99fd7fa` is retained, but disable HD before reverting to its unsafe image routing/retry behavior. See the current ledger for exact acceptance and preserved configuration.
+- Historical pre-login state: `/srv/maxwell-backups/curie/pre-login-01e8cbb.tar` (mode 0600, credentials included).
 - Original private state/config and starting source: `/srv/maxwell-rollback/curie/pre-cutover/` (root-only). Deployment image/settings are recorded separately there because normal state backups exclude `deploy.env`.
 - Original host data, configuration and Python 3.13.5 venv remain in place. Do **not** run the new Python 3.14 source with that old venv. A host-native rollback requires deliberately restoring the matching archived source after stopping Compose; it is not an automatic fallback.
 - The complete previous Screen contract and dated PIDs remain in Git at `96b4803:docs/SCREEN_WORKFLOW.md`. Those PIDs are historical, never stop targets.
