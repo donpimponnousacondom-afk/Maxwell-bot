@@ -410,8 +410,12 @@ def test_footer_commands_auth_validation_and_static_replies(
         )
         assert all(
             sent.content.endswith("-# — —" + FOOTER_MARKER)
-            for sent in message.channel.sent[2:]
+            and not sent.content.startswith("```")
+            for sent in message.channel.sent[2:-1]
         )
+        assert message.channel.sent[-1].content.startswith("```\nFooter: on\n")
+        assert message.channel.sent[-1].content.endswith("— —" + FOOTER_MARKER + "\n```")
+        assert message.channel.sent[-1].content.count("```") == 2
         assert bot._delivery_measurements.lookup("100")[0] == "999"
         assert len(writes) == 3
 

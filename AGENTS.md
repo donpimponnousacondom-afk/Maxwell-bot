@@ -55,6 +55,13 @@ Do not amend/rebase/squash root's or another agent's commits without explicit ap
 - `api/`, `web/`, `docker/Caddyfile`: authenticated API and dashboard.
 - `docker_runtime.py`, `site_server.py`, `scripts/instance.py`, `scripts/migrate_instance.py`, `compose.yaml`: instance ownership, generated backends, operations and migration.
 
+## Discord command readability
+
+- **Dense command reports belong in fenced code blocks.** Status/configuration dumps, diagnostics, key-value reports and plain-text tables must use opening and closing triple backticks on their own lines. Use a plain fence without a language tag for ordinary reports; never put the first data line on the opening-fence line.
+- Reuse `send_command_response(..., code_block=True)` for these reports. It preserves balanced fences when splitting messages, handles embedded backticks and respects Discord's 2,000-character limit including footers. Do not hand-wrap a long report and then split through its fences.
+- Use judgement: short acknowledgements/errors stay plain; deliberately rich help, clickable links and headings can remain outside the block. Single backticks are **inline code**, suitable for individual commands/paths, not a replacement for a multiline fenced report. Do not apply command formatting indiscriminately to conversational replies or model-facing tool results.
+- Test the **actual emitted Discord content**, not only the values inside it: balanced fences, readable line breaks, safe embedded fences, message-length limits and unchanged short replies. Readability is part of command acceptance, not a second pass left for root to discover in Discord. Apply this rule whenever adding or modifying commands.
+
 ## Documentation rules
 
 `CONTEXT_MEMORY_ANALYSIS.md` and `RELIABILITY_RESEARCH.md` are historical. The portable HTML guides remain reference copies, not live status reports. Prefer current code/tests plus `docs/STATUS.md`; correct stale operational instructions when their behavior changes. Keep historical evidence dated rather than blending it with current claims.

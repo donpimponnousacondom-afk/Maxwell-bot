@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Discord command readability — source accepted, rollout pending (2026-09-10)
+
+- Root requested fenced code blocks for dense Discord command reports, a permanent documentation rule, and deployment/restart. `AGENTS.md` now requires plain triple-backtick fences, safe per-message splitting and emitted-content tests; terse replies, deliberate rich help and clickable links stay normal.
+- Reasoning/effort reports, footer status, X/VC status, REM/autonomy status, context listings, REM audits and autonomy logs now reuse `send_command_response(..., code_block=True)`. VC settings are one field per line rather than a dense bold pipe-separated sentence. No command/control/provider behavior changes; no new placeholder footers on previously raw reports. Short denial/error/empty results remain plain. Existing debug/version fences and rich help are preserved.
+- **143 focused tests passed**, zero failures/errors/skips, in the guarded Python3.14.4 source-only environment. Tests inspect actual emitted fence boundaries, embedded-backtick neutralization, chunks within 2,000 characters, report footer behavior and unchanged short replies. Evidence: `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/eca97e960f39-tj9pwlpj/`. Full suite, built-image acceptance and live rollout remain pending; application still `maxwell-app:36122a4` at this source milestone.
+
 ## Reasoning, native images and OpenRouter usage — deployed (2026-09-10)
 
 - **Live application: `maxwell-app:36122a4`**, frozen source `36122a48e240baa61d40813dd0a0aebfa436eec7`, image ID `sha256:46abbd7482c4d45527e92002866c36d5bdf8c3e038c4d74df9d08fb1aa5c878e`; web remains `maxwell-web:01e8cbb`. Root authorized rollout/restarts. The same Discord identity is online once; bot/API use read-only roots, zero restart counts, healthy API/web/Ollama and successful provider initialization. Both previously running managed containers (site and shell) are restored. Existing attached `152732.dame_curie` Screen session is retained.

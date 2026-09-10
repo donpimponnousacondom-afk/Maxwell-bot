@@ -7962,11 +7962,13 @@ class MaxwellBot(commands.Bot):
         reporting = action in {"", "status"}
         provider = self.ai_provider
         transport = deepseek_reasoning_transport(provider.base_url, provider.model)
+        code_block = False
         if not reporting and not self._is_admin(message.author.id):
             text = "not authorized"
         elif not transport:
             text = "These controls are verified only for DeepSeek V4.1 Flash on OpenRouter or the official DeepSeek API. Current model unchanged."
         else:
+            code_block = True
             presets = {str(value): key for key, value in DEEPSEEK_REASONING_EFFORTS.items()}
             level = presets.get(action, "") if numeric else action
             valid = level in {*DEEPSEEK_REASONING_EFFORTS, "off"}
@@ -8000,10 +8002,11 @@ class MaxwellBot(commands.Bot):
             if not reporting and not valid:
                 text = "Unsupported setting; unchanged.\n" + text
                 if not numeric:
-                    text += f"\nUsage: `{self.command_prefix}reasoning [low|high|max|off]`"
+                    text += f"\nUsage: {self.command_prefix}reasoning [low|high|max|off]"
         await send_command_response(
             self, message.channel, text,
-            allowed_mentions=discord.AllowedMentions.none(), unmeasured=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+            code_block=code_block, unmeasured=False,
         )
 
     async def _handle_footer_command(self, message, args):
@@ -8036,7 +8039,11 @@ class MaxwellBot(commands.Bot):
                 self._load_control(force=True)
         else:
             text = f"usage: `{self.command_prefix}footer on|off|enable|disable|format <text>|status`"
-        await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
+        await send_command_response(
+            self, message.channel, text,
+            allowed_mentions=discord.AllowedMentions.none(),
+            code_block=action in {"status", ""},
+        )
 
     async def _handle_solo_command(self, message, args):
         """`,solo` — lock a server to one channel, or unlock it.
@@ -8158,9 +8165,12 @@ class MaxwellBot(commands.Bot):
         try:
             if sub in {"status", ""}:
                 budget = await client.budget.check()
-                await message.channel.send(
+                await send_command_response(
+                    self, message.channel,
                     f"X: {client.status()}\n"
-                    + (f"budget: {budget}" if budget else "budget: room to post")
+                    + (f"budget: {budget}" if budget else "budget: room to post"),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    code_block=True, unmeasured=False,
                 )
             elif sub == "budget":
                 blocked = await client.budget.check()
@@ -8222,8 +8232,15 @@ class MaxwellBot(commands.Bot):
             chan = getattr(getattr(vc, "channel", None), "name", None) or str(
                 getattr(getattr(vc, "channel", None), "id", "none")
             )
-            await message.channel.send(
-                f"connected: **{connected}** | channel: **{chan}** | listening: **{listening}** | reply_mode: **{self._control.get('vc_reply_mode', 'voice')}** | response_mode: **{self._control.get('vc_response_mode', 'addressed')}** | rms: **{self._control.get('vc_rms_threshold', 500)}** | pause: **{self._control.get('vc_pause_seconds', 0.9)}s**"
+            await send_command_response(
+                self, message.channel,
+                f"connected: {connected}\nchannel: {chan}\nlistening: {listening}\n"
+                f"reply_mode: {self._control.get('vc_reply_mode', 'voice')}\n"
+                f"response_mode: {self._control.get('vc_response_mode', 'addressed')}\n"
+                f"rms: {self._control.get('vc_rms_threshold', 500)}\n"
+                f"pause: {self._control.get('vc_pause_seconds', 0.9)}s",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if sub == "join":
@@ -8958,8 +8975,11 @@ class MaxwellBot(commands.Bot):
                 f"{e.get('content')}"
                 for e in entries[:20]
             )
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
 
         if not arg:
             entries = await self.memory.get_relevant_shared_context(
@@ -9942,12 +9962,15 @@ class MaxwellBot(commands.Bot):
         arg = (args or "").strip().lower()
         if not arg:
             status = await self._rem_status()
-            await message.channel.send(
+            await send_command_response(
+                self, message.channel,
                 "REM status\n"
                 f"enabled: {status['enabled']} running: {status['running']}\n"
                 f"interval: {status['interval_s']}s model: {status['model']}\n"
                 f"last run: {status['last_run'] or 'never'} events: {status['events_buffered']}\n"
-                f"audit: {status['last_audit_preview'] or '-'}"
+                f"audit: {status['last_audit_preview'] or '-'}",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if arg == "now":
@@ -9982,8 +10005,11 @@ class MaxwellBot(commands.Bot):
                 f"{r.get('ts', '?')} turns={r.get('turns_used', 0)} events={r.get('events', 0)} {str(r.get('audit', ''))[:500]}"
                 for r in runs
             ]
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
             return
         if arg == "fix":
             enabled = self.rem_enabled
@@ -10026,7 +10052,8 @@ class MaxwellBot(commands.Bot):
                     floor_line += " (enforcement OFF)"
             except Exception:
                 floor_line = "floor: unavailable"
-            await message.channel.send(
+            await send_command_response(
+                self, message.channel,
                 "Autonomy status\n"
                 f"enabled: {enabled} interval: {interval}s\n"
                 f"last tick: {last_tick or 'never'}\n"
@@ -10035,7 +10062,9 @@ class MaxwellBot(commands.Bot):
                 f"{floor_line}\n"
                 f"last reflection: {last_reflect}\n"
                 f"blacklists — channels: {', '.join(ab_ch) or '(none)'} servers: {', '.join(ab_sv) or '(none)'}\n"
-                f"thought: {thought}"
+                f"thought: {thought}",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if arg == "on":
@@ -10085,8 +10114,11 @@ class MaxwellBot(commands.Bot):
                 f"{e.get('content_summary', '')[:80]} -> {e.get('result', '?')}"
                 for e in recent
             ]
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
             return
         if arg.startswith("interval"):
             parts = arg.split()

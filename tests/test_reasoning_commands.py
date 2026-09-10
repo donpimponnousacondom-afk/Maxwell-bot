@@ -56,6 +56,8 @@ def command(bot, content):
 def test_reports_show_explicit_effective_defaults_without_writing(tmp_path, name, admin, direct):
     bot = reasoning_bot(tmp_path, admin=admin, direct=direct)
     text = command(bot, f"!{name}")
+    assert text.startswith("```\nDeepSeek V4.1 Flash")
+    assert text.endswith("\n```") and text.count("```") == 2
     assert "effective reasoning: high" in text
     assert "75/100 reference preset" in text
     assert "reasoning_effort=high" in text if direct else "reasoning.effort=high" in text
@@ -74,6 +76,8 @@ def test_admin_changes_persist_only_requested_key_and_apply_immediately(tmp_path
     _atomic_json_write_sync(path, {"footer_enabled": False, "unrelated": "keep"})
     bot = reasoning_bot(tmp_path, direct=direct)
     text = command(bot, "!" + setting)
+    assert text.startswith("```\n") and text.endswith("\n```")
+    assert text.count("```") == 2
     assert f"effective reasoning: {expected}" in text
     assert json.loads(path.read_text()) == {"footer_enabled": False, "unrelated": "keep", "deepseek_reasoning": expected}
     assert bot._control["footer_enabled"] is False
@@ -95,7 +99,8 @@ def test_nonadmins_cannot_change_settings(tmp_path, setting):
 def test_unsupported_numeric_effort_is_not_rounded_or_saved(tmp_path, number):
     bot = reasoning_bot(tmp_path)
     text = command(bot, "!effort " + number)
-    assert "Unsupported setting; unchanged." in text
+    assert text.startswith("```\nUnsupported setting; unchanged.\n")
+    assert text.endswith("\n```") and text.count("```") == 2
     assert "effective reasoning: high" in text
     assert "other values are unsupported and never rounded" in text
     assert not (tmp_path / "bot_control.json").exists()
@@ -105,7 +110,8 @@ def test_unsupported_numeric_effort_is_not_rounded_or_saved(tmp_path, number):
 def test_unknown_tier_does_not_mutate_settings(tmp_path, level):
     bot = reasoning_bot(tmp_path)
     text = command(bot, "!reasoning " + level)
-    assert "Unsupported setting; unchanged." in text
+    assert text.startswith("```\nUnsupported setting; unchanged.\n")
+    assert text.endswith("\n```") and text.count("```") == 2
     assert "!reasoning [low|high|max|off]" in text
     assert not (tmp_path / "bot_control.json").exists()
 
