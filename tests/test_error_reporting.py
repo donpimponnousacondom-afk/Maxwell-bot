@@ -491,6 +491,70 @@ def test_warnings_require_exc_info_or_an_active_exception(tmp_path):
     assert store.get(3) is None
 
 
+def test_normal_cancellation_is_not_an_incident_and_still_propagates(tmp_path):
+    store = configure_incident_store(tmp_path / "history.json")
+    logger = logging.Logger("synthetic.cancel", logging.DEBUG)
+    logger.addHandler(IncidentLoggingHandler())
+
+    async def interrupted():
+        try:
+            raise asyncio.CancelledError("synthetic user interrupt")
+        except asyncio.CancelledError as exception:
+            logger.warning("memory write cancelled")
+            logger.warning("cancelled with exc_info", exc_info=True)
+            logger.error("cancelled error log", extra={"incident_exception": exception})
+            assert capture_incident("boundary", "cancelled", exception=exception) is None
+            raise
+
+    with pytest.raises(asyncio.CancelledError, match="synthetic user interrupt"):
+        asyncio.run(interrupted())
+    assert store.get(0) is None
+    assert store.last_error is None
+
+
+@pytest.mark.parametrize("explicit_cause", [False, True])
+def test_cleanup_failure_keeps_full_cancellation_chain(tmp_path, explicit_cause):
+    store = configure_incident_store(tmp_path / "history.json")
+    logger = logging.Logger("synthetic.cleanup", logging.WARNING)
+    logger.addHandler(IncidentLoggingHandler())
+    try:
+        try:
+            raise asyncio.CancelledError("synthetic cancellation context")
+        except asyncio.CancelledError as cancellation:
+            if explicit_cause:
+                raise RuntimeError("synthetic cleanup failure") from cancellation
+            raise RuntimeError("synthetic cleanup failure")
+    except RuntimeError as exception:
+        first = capture_incident("cleanup", "cleanup actually failed", exception=exception)
+        logger.warning("cleanup failed without exc_info")
+    incident = store.get(0)
+    assert first == incident.incident_id
+    assert "CancelledError: synthetic cancellation context" in incident.traceback
+    assert "RuntimeError: synthetic cleanup failure" in incident.traceback
+    assert "test_cleanup_failure_keeps_full_cancellation_chain" in incident.traceback
+    assert store.get(1) is None
+
+
+def test_prior_true_failure_can_be_captured_while_cancellation_is_active(tmp_path):
+    store = configure_incident_store(tmp_path / "history.json")
+    try:
+        raise asyncio.CancelledError("stop requested")
+    except asyncio.CancelledError:
+        incident_id = capture_incident("provider", "prior 503 response", details="status=503 full prior response body")
+    incident = store.get(0)
+    assert incident.incident_id == incident_id
+    assert incident.details == "status=503 full prior response body"
+    assert incident.traceback == ""
+
+
+def test_cleanup_exception_group_with_cancellation_is_not_suppressed(tmp_path):
+    store = configure_incident_store(tmp_path / "history.json")
+    exception = BaseExceptionGroup("cleanup group", [asyncio.CancelledError("cancelled"), RuntimeError("cleanup failed")])
+    assert capture_incident("cleanup", "group failure", exception=exception)
+    report = store.get(0).format_report()
+    assert "CancelledError: cancelled" in report and "RuntimeError: cleanup failed" in report
+
+
 def test_explicit_incident_exception_captures_without_mutating_record(tmp_path):
     store = configure_incident_store(tmp_path / "history.json")
     handler = IncidentLoggingHandler()

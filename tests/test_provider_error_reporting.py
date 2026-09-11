@@ -626,6 +626,299 @@ def test_production_handler_keeps_concurrent_retry_groups_separate(production_ha
     assert "request A" not in second.format_report()
 
 
+def test_cancelled_http_backoff_retains_complete_prior_failure(production_handler, monkeypatch):
+    body = "complete 503 explanation " + "x" * 3000 + " CANCELLATION BODY TAIL"
+    response = Response(body.encode(), 503, headers={"X-Request-ID": "cancelled-http-request"})
+    provider = provider_for([response], retry_attempts=3)
+
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        waits = []
+
+        async def pause_backoff(delay):
+            waits.append(delay)
+            blocked.set()
+            await release.wait()
+
+        monkeypatch.setattr(providers.asyncio, "sleep", pause_backoff)
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        task.cancel("synthetic cancellation")
+        with pytest.raises(asyncio.CancelledError, match="synthetic cancellation"):
+            await task
+        assert waits == [10]
+
+    asyncio.run(run())
+    incident = production_handler.get(0)
+    assert production_handler.get(1) is None
+    assert body in incident.details
+    assert '"status": 503' in incident.details
+    assert '"attempt": "1/3"' in incident.details
+    assert '"response_body_complete": true' in incident.details
+    assert "cancelled-http-request" in incident.details
+    assert "https://primary.example.test/v1/chat/completions" in incident.details
+    assert "CancelledError" not in incident.format_report()
+    assert len(provider._session.requests) == response.text_calls == 1
+
+
+@pytest.mark.parametrize("error_type", [TimeoutError, RuntimeError, aiohttp.ClientConnectionError])
+def test_cancellation_inside_exception_handler_retry_keeps_existing_group(error_type, production_handler, monkeypatch):
+    errors = [error_type("first real failure"), error_type("second real failure " + "x" * 3000 + " PRIOR EXCEPTION TAIL")]
+    provider = provider_for([Response(error=error) for error in errors], retry_attempts=3)
+
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        waits = []
+
+        async def pause_second_backoff(delay):
+            waits.append(delay)
+            if len(waits) == 2:
+                blocked.set()
+                await release.wait()
+
+        monkeypatch.setattr(providers.asyncio, "sleep", pause_second_backoff)
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        existing_id = production_handler.get(0).incident_id
+        assert errors[0].incident_id == errors[1].incident_id == existing_id
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert waits == [10, 20]
+        return existing_id
+
+    incident_id = asyncio.run(run())
+    incident = production_handler.get(0)
+    assert incident.incident_id == incident_id
+    assert production_handler.get(1) is None
+    assert "first real failure" in incident.format_report()
+    assert "PRIOR EXCEPTION TAIL" in incident.format_report()
+    assert '"attempt": "2/3"' in incident.details
+    assert "CancelledError" not in incident.format_report()
+    assert len(provider._session.requests) == 2
+
+
+def test_cancellation_in_next_attempt_preserves_prior_http_failure(production_handler):
+    body = b"prior complete HTTP failure " + b"x" * 3000 + b" PRIOR HTTP TAIL"
+
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class PendingStream(Response):
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"healthy partial content"}}]}\n\n'
+                blocked.set()
+                await release.wait()
+
+        provider = provider_for([
+            Response(body, 503), PendingStream(headers={"Content-Type": "text/event-stream"}),
+        ], retry_attempts=3)
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(provider._session.requests) == 2
+
+    asyncio.run(run())
+    report = production_handler.get(0)
+    assert body.decode() in report.details
+    assert '"attempt": "2/3"' in report.details
+    assert "healthy partial content" not in report.details
+    assert "CancelledError" not in report.format_report()
+    assert production_handler.get(1) is None
+
+
+def test_cancellation_after_malformed_sse_preserves_received_frame(production_handler):
+    body = b"data: {malformed private stream " + b"x" * 3000 + b" STREAM TAIL}\n\n"
+
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class PendingMalformedStream(Response):
+            async def iter_any(self):
+                yield body
+                blocked.set()
+                await release.wait()
+
+        response = PendingMalformedStream(headers={"Content-Type": "text/event-stream"})
+        provider = provider_for([response], retry_attempts=3)
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(provider._session.requests) == 1
+        assert response.text_calls == 0
+
+    asyncio.run(run())
+    incident = production_handler.get(0)
+    assert body.decode() in incident.details
+    assert "JSONDecodeError" in incident.format_report()
+    assert "CancelledError" not in incident.format_report()
+    assert production_handler.get(1) is None
+
+
+@pytest.mark.parametrize("endpoint", ["chat", "models"])
+def test_cancelled_non200_body_read_retains_status_without_unread_body(endpoint, production_handler):
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class PendingBody(Response):
+            async def text(self):
+                self.text_calls += 1
+                blocked.set()
+                await release.wait()
+                return self.raw_body.decode()
+
+        response = PendingBody(b"unread upstream body must not be claimed", 503)
+        provider = provider_for([response], retry_attempts=3)
+        request = provider.initialize() if endpoint == "models" else provider.generate_response(MESSAGES)
+        task = asyncio.create_task(request)
+        await blocked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert response.text_calls == len(provider._session.requests) == 1
+
+    asyncio.run(run())
+    incident = production_handler.get(0)
+    assert '"status": 503' in incident.details
+    assert '"response_body_complete": false' in incident.details
+    assert "unread upstream body" not in incident.format_report()
+    assert "CancelledError" not in incident.format_report()
+    assert production_handler.get(1) is None
+
+
+@pytest.mark.parametrize("phase", ["headers", "sse"])
+def test_pristine_cancellation_does_not_create_incident(phase, production_handler):
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class PristineResponse(Response):
+            async def __aenter__(self):
+                if phase == "headers":
+                    blocked.set()
+                    await release.wait()
+                return self
+
+            async def iter_any(self):
+                yield b'data: {"choices":[{"delta":{"content":"healthy partial"}}]}\n\n'
+                blocked.set()
+                await release.wait()
+
+        provider = provider_for([PristineResponse(headers={"Content-Type": "text/event-stream"})])
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert len(provider._session.requests) == 1
+        logging.getLogger("synthetic.outer").error(
+            "Pristine cancellation propagated", exc_info=(type(caught.value), caught.value, caught.value.__traceback__),
+        )
+
+    asyncio.run(run())
+    assert production_handler.get(0) is None
+
+
+def test_cancellation_during_context_exit_does_not_duplicate_completed_capture(production_handler):
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        class PendingExit(Response):
+            async def __aexit__(self, exc_type, exc, tb):
+                blocked.set()
+                await release.wait()
+                return False
+
+        provider = provider_for([
+            Response(b"real prior failure", 503), PendingExit(success().raw_body),
+        ], retry_attempts=2)
+        task = asyncio.create_task(provider.generate_response(MESSAGES))
+        await blocked.wait()
+        recorded_id = production_handler.get(0).incident_id
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(provider._session.requests) == 2
+        return recorded_id
+
+    recorded_id = asyncio.run(run())
+    assert production_handler.get(0).incident_id == recorded_id
+    assert production_handler.get(1) is None
+    assert "real prior failure" in production_handler.get(0).details
+
+
+@pytest.mark.parametrize("recovered", [False, True])
+def test_handled_caller_cancellation_does_not_flush_normal_provider_attempts(recovered, production_handler, monkeypatch):
+    responses = [Response(b"first real HTTP failure", 503), Response(b"second real HTTP failure", 503), success()] if recovered else [success()]
+    provider = provider_for(responses, retry_attempts=len(responses))
+    waits = []
+
+    async def verify_backoff(delay):
+        waits.append(delay)
+        assert production_handler.get(0) is None
+
+    async def run():
+        try:
+            raise asyncio.CancelledError("already handled caller cancellation")
+        except asyncio.CancelledError:
+            return await provider.generate_response(MESSAGES)
+
+    monkeypatch.setattr(providers.asyncio, "sleep", verify_backoff)
+    assert asyncio.run(run()) == "ok"
+    assert len(provider._session.requests) == len(responses)
+    if recovered:
+        assert waits == [10, 20]
+        incident = production_handler.get(0)
+        assert incident.summary == "Provider request recovered after upstream failures"
+        assert "first real HTTP failure" in incident.details
+        assert "second real HTTP failure" in incident.details
+        assert '"attempt": "3/3"' in incident.details
+        assert production_handler.get(1) is None
+    else:
+        assert waits == []
+        assert production_handler.get(0) is None
+
+
+def test_new_cancellation_inside_handled_caller_cancellation_flushes_prior_failure(production_handler, monkeypatch):
+    provider = provider_for([Response(b"prior real HTTP failure", 503)], retry_attempts=3)
+
+    async def run():
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pause_backoff(delay):
+            blocked.set()
+            await release.wait()
+
+        async def caller():
+            try:
+                raise asyncio.CancelledError("already handled cancellation")
+            except asyncio.CancelledError:
+                return await provider.generate_response(MESSAGES)
+
+        monkeypatch.setattr(providers.asyncio, "sleep", pause_backoff)
+        task = asyncio.create_task(caller())
+        await blocked.wait()
+        task.cancel("new actual cancellation")
+        with pytest.raises(asyncio.CancelledError, match="new actual cancellation"):
+            await task
+
+    asyncio.run(run())
+    assert len(provider._session.requests) == 1
+    assert "prior real HTTP failure" in production_handler.get(0).details
+    assert production_handler.get(1) is None
+
+
 def test_failed_models_probe_captures_body_without_new_requests(captured):
     body = b"synthetic initialization rejection " + b"x" * 405
     provider = provider_for([Response(body, 401)])

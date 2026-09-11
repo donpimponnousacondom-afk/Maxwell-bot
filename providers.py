@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
 from collections.abc import Callable
@@ -672,6 +673,9 @@ class _ProviderDiagnostics:
             } or key.lower().startswith(("x-ratelimit-", "ratelimit-"))
             or key.lower().endswith(("-request-id", "-trace-id"))
         }
+        if resp.status != 200:
+            self.current["response_body_complete"] = False
+            self.failure(f"HTTP {resp.status}")
 
     def json_response(self, resp, result: object):
         cached_body = getattr(resp, "_body", None)
@@ -706,7 +710,7 @@ class _ProviderDiagnostics:
             record = json.dumps(self.current, ensure_ascii=False, indent=2, default=str)
             if self.current.get("failures"):
                 body = self.response_text or self.body.decode(self.body_encoding, errors="replace")
-                record += "\nReceived response body (complete received text):\n" + body
+                record += "\nReceived response body (observed text only):\n" + body
             if exceptions:
                 record += "\nUnderlying exception context:\n" + "\n".join(exceptions)
             self.attempts.append(record)
@@ -2033,6 +2037,7 @@ class OllamaProvider:
         for endpoint in self._endpoints:
             incident = _ProviderDiagnostics()
             incident.begin(endpoint, "models", 1, 1, {}, 10)
+            attempt_exception = sys.exception()
             try:
                 async with session.get(
                     f"{endpoint.base_url}/models",
@@ -2046,8 +2051,8 @@ class OllamaProvider:
                             f"Provider endpoint initialized: {endpoint.name} ({endpoint.model})"
                         )
                     else:
-                        incident.failure(f"HTTP {resp.status}")
                         incident.response_text = await resp.text()
+                        incident.current["response_body_complete"] = True
                         logger.warning(
                             f"Provider endpoint {endpoint.name} /models returned {resp.status}"
                         )
@@ -2059,6 +2064,10 @@ class OllamaProvider:
                 )
             else:
                 incident.capture("Provider initialization failed")
+            finally:
+                active_exception = sys.exception()
+                if active_exception is not attempt_exception and isinstance(active_exception, asyncio.CancelledError) and incident.current:
+                    incident.capture("Provider initialization failures before cancellation")
         self.available = initialized
         return initialized
 
@@ -2333,6 +2342,7 @@ class OllamaProvider:
                 "has_media": has_media, "custom_tool_calls": custom_tool_calls,
                 "empty_response_recoveries": empty_response_recoveries,
             }
+            attempt_exception = sys.exception()
             try:
                 async with session.post(
                     f"{endpoint.base_url}/chat/completions",
@@ -2345,7 +2355,7 @@ class OllamaProvider:
                     if resp.status in (500, 502, 503, 504):
                         error_text = await resp.text()
                         incident.response_text = error_text
-                        incident.failure(f"HTTP {resp.status}")
+                        incident.current["response_body_complete"] = True
                         logger.warning(
                             "Provider timing status endpoint=%s status=%s headers_ms=%.1f body_chars=%s",
                             endpoint.name,
@@ -2369,7 +2379,7 @@ class OllamaProvider:
                     if resp.status == 429:
                         error_text = await resp.text()
                         incident.response_text = error_text
-                        incident.failure(f"HTTP {resp.status}")
+                        incident.current["response_body_complete"] = True
                         logger.warning(
                             "Provider timing status endpoint=%s status=%s headers_ms=%.1f body_chars=%s",
                             endpoint.name,
@@ -2411,7 +2421,7 @@ class OllamaProvider:
                     if resp.status != 200:
                         error_text = await resp.text()
                         incident.response_text = error_text
-                        incident.failure(f"HTTP {resp.status}")
+                        incident.current["response_body_complete"] = True
                         if (
                             resp.status in (400, 422)
                             and "stream_options" in data
@@ -3010,6 +3020,10 @@ class OllamaProvider:
                 failure.__cause__ = e
                 incident.capture("Provider transport or response failure", failure)
                 raise failure from e
+            finally:
+                active_exception = sys.exception()
+                if active_exception is not attempt_exception and isinstance(active_exception, asyncio.CancelledError) and incident.current:
+                    incident.capture("Provider failures before request cancellation")
         if last_usage_error:
             incident.capture("Provider usage exhausted", last_usage_error)
             raise last_usage_error

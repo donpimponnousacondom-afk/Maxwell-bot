@@ -10,6 +10,7 @@ import tempfile
 import threading
 import traceback
 import weakref
+from asyncio import CancelledError
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -329,7 +330,7 @@ def capture_incident(
 ) -> str | None:
     store = get_incident_store()
     incident_id = None
-    if store is not None and not _capturing.get():
+    if store is not None and not _capturing.get() and not isinstance(exception, CancelledError):
         token = _capturing.set(True)
         try:
             incident_id = store.record(source, summary, exception=exception, details=details, context=context)
@@ -367,6 +368,8 @@ class IncidentLoggingHandler(logging.Handler):
         if exception is None:
             attached_exception = getattr(record, "incident_exception", None)
             exception = attached_exception if isinstance(attached_exception, BaseException) else active_exception
+        if isinstance(exception, CancelledError):
+            return
         token = _capturing.set(True)
         try:
             copied = copy.copy(record)
