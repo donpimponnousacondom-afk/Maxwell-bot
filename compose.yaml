@@ -168,8 +168,8 @@ services:
           create_host_path: false
       - *app-docker
     command: ["python", "bot.py"]
-    mem_limit: 2g
-    cpus: 2
+    mem_limit: 4g
+    cpus: 4
     pids_limit: 256
 
   api:
