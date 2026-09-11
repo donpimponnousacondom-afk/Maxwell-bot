@@ -447,7 +447,7 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
         assert "must be in this channel" in message.channel.sent[-1].content
         message.content = "!version"
         await MaxwellBot._handle_command(bot, message)
-        assert "Running build:" in message.channel.sent[-1].content
+        assert "Checkout at boot:" in message.channel.sent[-1].content
         assert all(
             sent.content.startswith("```\n") and sent.content.endswith("\n```")
             and FOOTER_MARKER not in sent.content

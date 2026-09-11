@@ -40,6 +40,23 @@ def test_private_socket_and_no_host_privilege():
     assert socket_mount["source"].startswith("${ENGINE_SOCKET:?")
 
 
+def test_only_bot_receives_private_live_git_socket_directory():
+    services = deployment()["services"]
+    mounts = {item["target"]: item for item in services["bot"]["volumes"]}
+    assert mounts["/run/maxwell-checkout"] == {
+        "type": "bind", "source": "/run/maxwell-checkout-${INSTANCE_ID}",
+        "target": "/run/maxwell-checkout", "read_only": True,
+        "bind": {"create_host_path": False},
+    }
+    assert services["bot"]["environment"]["MAXWELL_STARTUP_GIT_SOCKET"] == "/run/maxwell-checkout/snapshot.sock"
+    for name, service in services.items():
+        assert all("/home/" not in item["source"] and ".git" not in item["source"] for item in service.get("volumes", []))
+        if name != "bot":
+            assert "MAXWELL_STARTUP_GIT_SOCKET" not in service.get("environment", {})
+            assert all(item["target"] != "/run/maxwell-checkout" for item in service.get("volumes", []))
+    assert set(services["api"]["environment"]).issubset(services["bot"]["environment"])
+
+
 def test_web_only_mounts_public_sites_and_binds_loopback():
     web = deployment()["services"]["web"]
     assert len(web["volumes"]) == 1

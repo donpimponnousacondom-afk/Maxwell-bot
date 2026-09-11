@@ -20,11 +20,9 @@ def image_metadata(monkeypatch):
     return values
 
 
-@pytest.mark.parametrize(
-    "dirty,expected", [("true", True), ("false", False), ("unknown", None)]
-)
-def test_container_build_snapshot_uses_build_args_without_git(
-    image_metadata, monkeypatch, tmp_path, dirty, expected
+@pytest.mark.parametrize("dirty", ["true", "false", "unknown"])
+def test_image_metadata_is_never_reported_as_checkout_state(
+    image_metadata, monkeypatch, tmp_path, dirty
 ):
     monkeypatch.setenv("MAXWELL_BUILD_DIRTY", dirty)
     monkeypatch.setattr(
@@ -34,11 +32,10 @@ def test_container_build_snapshot_uses_build_args_without_git(
     )
     snapshot = observability.capture_running_build(tmp_path)
     report = snapshot.format()
-    assert snapshot.commit == image_metadata["COMMIT"]
-    assert snapshot.branch == image_metadata["BRANCH"]
-    assert snapshot.subject == image_metadata["SUBJECT"]
-    assert snapshot.date == "2026-09-08T23:30:00+00:00"
-    assert snapshot.dirty is expected
+    assert snapshot.commit == snapshot.branch == snapshot.subject == snapshot.date == "unknown"
+    assert snapshot.dirty is None
+    assert "Checkout at boot:" in report
+    assert image_metadata["COMMIT"] not in report
     assert snapshot.started_at.endswith("+00:00")
     monkeypatch.setenv("MAXWELL_BUILD_COMMIT", "b" * 40)
     assert snapshot.format() == report

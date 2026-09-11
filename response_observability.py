@@ -9,7 +9,9 @@ import os
 import platform
 import re
 import shutil
+import socket
 import subprocess
+import time
 from urllib.parse import urlsplit
 
 from provider_telemetry import CallMetrics
@@ -383,7 +385,7 @@ class RunningBuild:
         dirty = "unknown" if self.dirty is None else "yes" if self.dirty else "no"
         return "\n".join(
             [
-                f"Running build: {self.commit[:12]} ({self.commit})",
+                f"Checkout at boot: {self.commit[:12]} ({self.commit})",
                 f"Branch: {self.branch} | dirty at startup: {dirty}",
                 f"Commit date: {self.date}",
                 f"Subject: {self.subject}",
@@ -393,8 +395,46 @@ class RunningBuild:
         )
 
 
+def read_startup_git_snapshot(path: str) -> dict[str, str | bool]:
+    deadline = time.monotonic() + 10
+    body = bytearray()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(5)
+        connection.connect(path)
+        while len(body) <= 65536:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("startup Git snapshot timed out")
+            connection.settimeout(remaining)
+            chunk = connection.recv(min(4096, 65537 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+    if len(body) > 65536:
+        raise ValueError("startup Git snapshot exceeds 64 KiB")
+    snapshot = json.loads(body)
+    fields = {"commit", "branch", "date", "subject", "dirty"}
+    if not isinstance(snapshot, dict) or snapshot.keys() != fields:
+        raise ValueError("invalid startup Git snapshot fields")
+    if type(snapshot["dirty"]) is not bool or any(
+        not isinstance(snapshot[field], str) for field in fields - {"dirty"}
+    ):
+        raise ValueError("invalid startup Git snapshot types")
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", snapshot["commit"]) or not snapshot["branch"]:
+        raise ValueError("invalid startup Git commit or branch")
+    date = datetime.fromisoformat(snapshot["date"])
+    if date.tzinfo is None:
+        raise ValueError("startup Git date has no timezone")
+    snapshot["date"] = date.astimezone(timezone.utc).isoformat()
+    return snapshot
+
+
 def capture_running_build(root: Path) -> RunningBuild:
     started_at = datetime.now(timezone.utc).isoformat()
+    socket_path = os.getenv("MAXWELL_STARTUP_GIT_SOCKET", "").strip()
+    if socket_path:
+        snapshot = read_startup_git_snapshot(socket_path)
+        return RunningBuild(**snapshot, started_at=started_at, python=platform.python_version())
     commit = branch = date = subject = "unknown"
     dirty = None
     git = shutil.which("git")
@@ -424,16 +464,6 @@ def capture_running_build(root: Path) -> RunningBuild:
         )
         if result.returncode == 0:
             dirty = bool(result.stdout.strip())
-    else:
-        commit = os.getenv("MAXWELL_BUILD_COMMIT", "").strip() or "unknown"
-        branch = os.getenv("MAXWELL_BUILD_BRANCH", "").strip() or "unknown"
-        date = os.getenv("MAXWELL_BUILD_DATE", "").strip() or "unknown"
-        subject = os.getenv("MAXWELL_BUILD_SUBJECT", "").strip() or "unknown"
-        dirty = {"true": True, "false": False}.get(
-            os.getenv("MAXWELL_BUILD_DIRTY", "").strip().lower()
-        )
-        if date != "unknown":
-            date = datetime.fromisoformat(date).astimezone(timezone.utc).isoformat()
     return RunningBuild(
         commit, branch, date, subject, dirty, started_at, platform.python_version()
     )

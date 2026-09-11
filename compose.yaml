@@ -19,7 +19,7 @@ x-app: &app
     - no-new-privileges:true
   cap_drop:
     - ALL
-  environment:
+  environment: &app-environment
     MAXWELL_ENV_FILE: /config/bot.env
     MAXWELL_CONTAINER_MODE: "true"
     MAXWELL_INSTANCE_ID: ${INSTANCE_ID}
@@ -27,33 +27,39 @@ x-app: &app
     MAXWELL_BACKEND_NETWORK: maxwell-${INSTANCE_ID}-backends
     DOCKER_HOST: unix:///run/maxwell/docker.sock
   volumes:
-    - type: bind
+    - &app-config
+      type: bind
       source: ${INSTANCE_DIR}/config
       target: /config
       read_only: true
       bind:
         create_host_path: false
-    - type: bind
+    - &app-prompts
+      type: bind
       source: ${INSTANCE_DIR}/config/prompts
       target: /config/prompts
       bind:
         create_host_path: false
-    - type: bind
+    - &app-data
+      type: bind
       source: ${INSTANCE_DIR}/data
       target: /state/data
       bind:
         create_host_path: false
-    - type: bind
+    - &app-sites
+      type: bind
       source: ${INSTANCE_DIR}/sites
       target: /state/sites
       bind:
         create_host_path: false
-    - type: bind
+    - &app-shell
+      type: bind
       source: ${INSTANCE_DIR}/shell
       target: /state/shell
       bind:
         create_host_path: false
-    - type: bind
+    - &app-docker
+      type: bind
       source: ${ENGINE_SOCKET:?Set the private rootless ENGINE_SOCKET}
       target: /run/maxwell/docker.sock
       bind:
@@ -145,6 +151,22 @@ services:
 
   bot:
     <<: *app
+    environment:
+      <<: *app-environment
+      MAXWELL_STARTUP_GIT_SOCKET: /run/maxwell-checkout/snapshot.sock
+    volumes:
+      - *app-config
+      - *app-prompts
+      - *app-data
+      - *app-sites
+      - *app-shell
+      - type: bind
+        source: /run/maxwell-checkout-${INSTANCE_ID}
+        target: /run/maxwell-checkout
+        read_only: true
+        bind:
+          create_host_path: false
+      - *app-docker
     command: ["python", "bot.py"]
     mem_limit: 2g
     cpus: 2
