@@ -291,7 +291,7 @@ def test_rendered_unit_names_match_accept_yes_and_preserve_boundary():
     socket_name, service_name = names.values()
     assert service_name == socket_name.removesuffix(".socket") + "@.service"
     socket_unit = rendered[socket_name]["Socket"]
-    assert socket_unit["ListenStream"] == "/run/maxwell-checkout-curie/snapshot.sock"
+    assert socket_unit["ListenStream"] == "/srv/maxwell-checkout/curie/snapshot.sock"
     assert socket_unit["SocketUser"] == socket_unit["SocketGroup"] == "maxwell-curie"
     assert socket_unit["SocketMode"] == "0600"
     assert socket_unit["DirectoryMode"] == "0711"

@@ -161,7 +161,7 @@ services:
       - *app-sites
       - *app-shell
       - type: bind
-        source: /run/maxwell-checkout-${INSTANCE_ID}
+        source: /srv/maxwell-checkout/${INSTANCE_ID}
         target: /run/maxwell-checkout
         read_only: true
         bind:

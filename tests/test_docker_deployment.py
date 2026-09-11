@@ -44,7 +44,7 @@ def test_only_bot_receives_private_live_git_socket_directory():
     services = deployment()["services"]
     mounts = {item["target"]: item for item in services["bot"]["volumes"]}
     assert mounts["/run/maxwell-checkout"] == {
-        "type": "bind", "source": "/run/maxwell-checkout-${INSTANCE_ID}",
+        "type": "bind", "source": "/srv/maxwell-checkout/${INSTANCE_ID}",
         "target": "/run/maxwell-checkout", "read_only": True,
         "bind": {"create_host_path": False},
     }
