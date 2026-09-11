@@ -27,12 +27,15 @@ from urllib.parse import urljoin, urlparse
 
 from response_observability import (
     DeliveryMeasurements,
+    FOOTER_MARKER,
     capture_running_build,
     clean_message_content,
     footer_template_error,
     format_debug,
     format_runtime_provider,
+    latest_delivered_footer,
     prepare_delivery,
+    record_delivered_footer,
     record_delivery,
     send_command_response,
     send_measured,
@@ -4561,7 +4564,7 @@ class MaxwellBot(commands.Bot):
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         rendered = render_discord_context_text(
             parent,
-            clean_message_content(self, parent),
+            str(getattr(parent, "content", "") or "").replace(FOOTER_MARKER, ""),
             known_users=(getattr(self, "_recent_users", None) or {}).get(
                 channel_id, {}
             ),
@@ -6475,6 +6478,8 @@ class MaxwellBot(commands.Bot):
 
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         author = getattr(message, "author", None)
+        if MaxwellBot._author_is_self(self, message):
+            record_delivered_footer(self, message.channel, message, replace=True)
         update_users = getattr(self, "_update_recent_users", None)
         if author is not None:
             if callable(update_users):
@@ -6754,6 +6759,7 @@ class MaxwellBot(commands.Bot):
             self._update_recent_users(channel_id, u)
 
         if self.user and message.author.id == self.user.id:
+            record_delivered_footer(self, message.channel, message, replace=True)
             if (
                 message.content or has_attachment or has_embed or has_sticker
             ) and self._control.get("store_memory", True):
@@ -9167,7 +9173,7 @@ class MaxwellBot(commands.Bot):
             )
         )
         ref_content = render_discord_context_text(
-            ref, clean_message_content(self, ref), known_users=self._recent_users.get(ch_id, {})
+            ref, str(getattr(ref, "content", "") or "").replace(FOOTER_MARKER, ""), known_users=self._recent_users.get(ch_id, {})
         )
         if ref.attachments:
             ref_content = (ref_content + " [media attached]").strip()
@@ -17432,6 +17438,9 @@ class MaxwellBot(commands.Bot):
                 + f". Mentions Dame Curie: {'yes' if mentions_maxwell else 'no'}."
             )
         user_parts.extend(self._reply_parent_context_lines(message))
+        delivered_footer = latest_delivered_footer(self, channel_id)
+        if delivered_footer:
+            user_parts.append(delivered_footer)
         if media_summary:
             user_parts.append(media_summary)
         elif has_media:

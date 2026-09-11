@@ -38,7 +38,7 @@ import discord
 from discord import Activity, File, Message, Status
 from tools import Tool
 from error_reporting import PUBLIC_ERROR_TEXT, capture_incident, register_secrets
-from response_observability import clean_message_content, prepare_delivery, record_delivery, strip_footer
+from response_observability import FOOTER_MARKER, clean_message_content, discord_message_excerpt, prepare_delivery, record_delivery, strip_footer
 from captcha_solver import CaptchaSolveError
 from control_defaults import parse_bool
 import site_backend
@@ -2006,8 +2006,8 @@ class EditMessageTool(Tool):
             content = strip_footer(content, self_authored=True)
             platform = str(getattr(message, "tool_platform", "discord") or "discord")
             _, chunks = prepare_delivery(self.bot, content, metrics, SendMessageTool._chunks, platform=platform, limit=2000)
-            await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
-            record_delivery(self.bot, message.channel, msg, metrics, platform=platform, replace=True)
+            edited = await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
+            record_delivery(self.bot, message.channel, edited, metrics, platform=platform, replace=True)
             return f"Message {message_id} edited successfully"
         except discord.NotFound:
             return f"Error: Message {message_id} not found"
@@ -3053,10 +3053,7 @@ class SearchMessagesTool(Tool):
             if not clean_query:
                 if chan and hasattr(chan, "history"):
                     async for msg in chan.history(limit=search_limit):
-                        content = clean_message_content(self.bot, msg)
-                        snippet = content[:150] + (
-                            "..." if len(content) > 150 else ""
-                        )
+                        snippet = discord_message_excerpt(msg)
                         results.append(
                             f"[{msg.id}] {msg.author.display_name}: {snippet}"
                         )
@@ -3069,11 +3066,9 @@ class SearchMessagesTool(Tool):
             if chan and hasattr(chan, "history"):
                 try:
                     async for msg in chan.history(limit=100):
-                        content = clean_message_content(self.bot, msg)
+                        content = str(getattr(msg, "content", "") or "").replace(FOOTER_MARKER, "")
                         if clean_query in content.lower():
-                            snippet = content[:150] + (
-                                "..." if len(content) > 150 else ""
-                            )
+                            snippet = discord_message_excerpt(msg)
                             results.append(
                                 f"[#{getattr(chan, 'name', 'chat')} - {msg.id}] {msg.author.display_name}: {snippet}"
                             )
@@ -3100,11 +3095,9 @@ class SearchMessagesTool(Tool):
                         break
                     try:
                         async for msg in c.history(limit=50):
-                            content = clean_message_content(self.bot, msg)
+                            content = str(getattr(msg, "content", "") or "").replace(FOOTER_MARKER, "")
                             if clean_query in content.lower():
-                                snippet = content[:150] + (
-                                    "..." if len(content) > 150 else ""
-                                )
+                                snippet = discord_message_excerpt(msg)
                                 results.append(
                                     f"[#{c.name} - {msg.id}] {msg.author.display_name}: {snippet}"
                                 )

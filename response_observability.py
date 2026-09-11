@@ -89,6 +89,28 @@ def strip_footer(text: str, *, self_authored: bool) -> str:
     return text
 
 
+def footer_text(text: str) -> str:
+    if strip_footer(text, self_authored=True) == text:
+        return ""
+    body = text[:-4] if text.startswith("```\n") and text.endswith("\n```") else text
+    return body.rpartition("\n")[2].removesuffix(FOOTER_MARKER).removeprefix("-# ")
+
+
+def discord_message_excerpt(message, limit: int = 150) -> str:
+    text = str(getattr(message, "content", "") or "")
+    body = strip_footer(text, self_authored=True).replace(FOOTER_MARKER, "")
+    excerpt = body[:limit] + ("..." if len(body) > limit else "")
+    footer = footer_text(text)
+    return excerpt + (f"\n[Message footer: {footer}]" if footer else "")
+
+
+def latest_delivered_footer(bot, channel_id: str) -> str:
+    for (cid, mid), text in reversed(getattr(bot, "_delivered_footers", {}).items()):
+        if cid == str(channel_id):
+            return f"[Runtime-added footer on your Discord message {mid}: {text}]"
+    return ""
+
+
 def clean_message_content(bot, message, content: str | None = None) -> str:
     text = str(getattr(message, "content", "") or "") if content is None else content
     own_id = str(getattr(getattr(bot, "user", None), "id", "") or "")
@@ -212,7 +234,8 @@ async def send_command_response(
         code_block=code_block,
     )
     for chunk in chunks:
-        await channel.send(chunk, allowed_mentions=allowed_mentions)
+        sent = await channel.send(chunk, allowed_mentions=allowed_mentions)
+        record_delivery(bot, channel, sent, None)
 
 
 class MeasuredActions(list[dict]):
@@ -244,6 +267,25 @@ class DeliveryMeasurements:
         return None
 
 
+def record_delivered_footer(bot, channel, sent_message, *, replace: bool = False) -> None:
+    message_id = getattr(sent_message, "id", None)
+    channel_id = getattr(channel, "id", None)
+    if message_id is None or channel_id is None:
+        return
+    key = (str(channel_id), str(message_id))
+    footers = getattr(bot, "_delivered_footers", None)
+    if replace and footers is not None:
+        footers.pop(key, None)
+    delivered_footer = footer_text(str(getattr(sent_message, "content", "") or ""))
+    if delivered_footer:
+        if footers is None:
+            footers = bot._delivered_footers = OrderedDict()
+        footers[key] = delivered_footer
+        footers.move_to_end(key)
+        while len(footers) > 1024:
+            footers.popitem(last=False)
+
+
 def record_delivery(
     bot,
     channel,
@@ -255,6 +297,8 @@ def record_delivery(
 ) -> None:
     message_id = getattr(sent_message, "id", None)
     channel_id = getattr(channel, "id", None)
+    if platform == "discord":
+        record_delivered_footer(bot, channel, sent_message, replace=replace)
     registry = getattr(bot, "_delivery_measurements", None)
     if replace and registry is not None and platform == "discord":
         registry.records.pop((str(channel_id), str(message_id)), None)

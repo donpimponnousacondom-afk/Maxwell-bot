@@ -1,5 +1,12 @@
 # Current implementation and deployment status
 
+## Delivered footer visibility — priority release under validation (2026-09-11)
+
+- Root corrected a missed requirement: the runtime-added footer was still removed from model context after the earlier error/forward rollout. This is now a separate priority release; unfinished boot-time Git provenance infrastructure must not delay it.
+- Actual successfully delivered footer text is retained in a bounded channel/message-keyed transient cache and supplied to the next model turn. It is not regenerated from a subsequently changed footer template. Own-message events and edits refresh only that transient footer state; provider measurements remain independent. Direct reply context exposes the actual raw parent footer, including fetched messages from before restart, without invisible runtime markers. Message search returns complete footer text even beyond its usual body excerpt.
+- Persisted message content and stored reply metadata remain footer-free; no old memories, embeddings or caches are rewritten or deleted. Generic error notices never acquire fabricated footers. SDK edit handling now uses the returned newly edited Message, rather than reading stale content from the original object.
+- Combined working candidate754eaf390840 passed303 focused tests including actual model-facing payloads and all3368 isolated tests. This footer-only release excludes the pending boot-version changes and will receive separate exact-source/image acceptance before deployment. Live remainsc010a37 until that cutover. No live settings or state changed during implementation.
+
 ## Numeric OpenRouter effort and private operator commands — deployed (2026-09-11)
 
 - Root explicitly rejected the local three-preset restriction and authorized sending every integer1–100 to the configured DeepSeek **V4.1 Flash** OpenRouter route, regardless of advertised enum schemas. `!effort N` now persists the integer and emits `reasoning.effort: N` unchanged, including50/75/100; no rounding or named-tier substitution. Existing named reasoning commands, direct-API behavior, per-call disable overrides, other models/routing/credentials remain unchanged. No live setting has been changed by this implementation.

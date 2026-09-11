@@ -291,7 +291,9 @@ def test_edit_replaces_footer_and_metrics_without_borrowing(metrics):
     async def scenario():
         bot = fake_bot()
         message = Message()
-        target = SimpleNamespace(id=999, author=bot.user, edit=AsyncMock())
+        target = SimpleNamespace(id=999, author=bot.user, edit=AsyncMock(
+            side_effect=lambda **kwargs: SimpleNamespace(id=999, author=bot.user, content=kwargs["content"])
+        ))
         message.channel.fetch_message = AsyncMock(return_value=target)
         record_delivery(bot, message.channel, target, metrics)
         newer = replace(metrics, call_id="new", ttft_ms=777)
