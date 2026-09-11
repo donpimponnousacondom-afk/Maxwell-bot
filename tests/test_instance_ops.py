@@ -1,5 +1,6 @@
 """Offline deployment operations checks; no Docker or runtime files are read."""
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -299,6 +300,25 @@ def test_restore_refuses_nonempty_or_existing_containers(tmp_path):
     (app.path / "data" / "existing").touch()
     with pytest.raises(ValueError, match="nonempty"):
         ops.restore(app, tmp_path / "backup.tar")
+
+
+@pytest.mark.parametrize("size", [0, 8192, 200000])
+def test_restore_child_inherits_rewound_archive_descriptor(tmp_path, size):
+    app = instance(tmp_path)
+    app.inventory = Mock(return_value=[])
+    app.env = os.environ.copy()
+    source = tmp_path / "backup.tar"
+    source.write_bytes(tar_bytes([]).getvalue())
+    with tarfile.open(source, "a") as archive:
+        member = tarfile.TarInfo("data/sacred")
+        member.size = size
+        archive.addfile(member, io.BytesIO(b"x" * size))
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    program = f"import hashlib,sys; assert hashlib.sha256(sys.stdin.buffer.read()).hexdigest() == {expected!r}"
+    app.helper = Mock(return_value=[sys.executable, "-c", program])
+    ops.restore(app, source)
+    app.helper.assert_called_once_with(ops.RESTORE_PROGRAM, writable=True)
+    assert not any((app.path / "data").iterdir())
 
 
 def test_archive_destination_cannot_be_inside_state_or_redirected(tmp_path):
