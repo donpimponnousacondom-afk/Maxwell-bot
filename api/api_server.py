@@ -44,6 +44,12 @@ import sys as _sys  # noqa: E402
 _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import docker_runtime  # noqa: E402
+from error_reporting import (  # noqa: E402
+    IncidentLoggingHandler,
+    capture_incident,
+    configure_incident_store,
+    incident_context,
+)
 
 from api.storage import (  # noqa: E402
     APP_ROOT,
@@ -1185,7 +1191,8 @@ async def site_proxy(request):
             data=body,
             allow_redirects=False,
         )
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
+        capture_incident("api.site_proxy", "the site backend timed out", exception=exc, context={"slug": slug})
         await session.close()
         return _site_json({"error": "the site backend timed out"}, 504)
     except aiohttp.ClientError as e:
@@ -1886,7 +1893,7 @@ async def pm2_logs(request):
     if not _has_admin_auth(request):
         return _json_response({"error": "unauthorized"}, 401)
     if docker_runtime.container_mode():
-        return _json_response({"error": "Use instance.sh <id> logs on the host"}, 501)
+        return _json_response({"error": "Use instance.sh <id> logs on the host"}, 501, expected_refusal=True)
     process = request.query.get("process", "maxwell-bot")
     lines = request.query.get("lines", "30")
     try:
@@ -1949,7 +1956,7 @@ async def pm2_restart(request):
     if not _has_admin_auth(request):
         return _json_response({"error": "unauthorized"}, 401)
     if docker_runtime.container_mode():
-        return _json_response({"error": "Use instance.sh <id> restart on the host"}, 501)
+        return _json_response({"error": "Use instance.sh <id> restart on the host"}, 501, expected_refusal=True)
     target = request.query.get("target", "maxwell-bot")
     if target not in {"maxwell-bot", "maxwell-api", "all"}:
         return _json_response({"error": "bad target"}, 400)
@@ -2492,6 +2499,20 @@ async def health_check(request):
     )
 
 
+async def _initialize_incident_reporting(application):
+    secrets = [
+        secret for name, value in os.environ.items()
+        if name.endswith(("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET"))
+        or name in {"X_CT0", "API_KEY"}
+        for secret in (value, value.strip())
+    ]
+    secrets.append(DISCORD_CLIENT_SECRET)
+    configure_incident_store(DATA_DIR / "error_history.json", secrets=secrets)
+    root_logger = logging.getLogger()
+    if not any(isinstance(handler, IncidentLoggingHandler) for handler in root_logger.handlers):
+        root_logger.addHandler(IncidentLoggingHandler())
+
+
 @web.middleware
 async def _reliability_middleware(request, handler):
     if (
@@ -2504,27 +2525,31 @@ async def _reliability_middleware(request, handler):
             return web.json_response(
                 {"error": "slow down"}, status=429, headers={"Retry-After": "2"}
             )
-    try:
-        async with _API_CONCURRENCY_SEM:
-            return await asyncio.wait_for(
-                handler(request), timeout=_API_REQUEST_TIMEOUT
+    with incident_context(method=request.method, path=request.path):
+        try:
+            async with _API_CONCURRENCY_SEM:
+                return await asyncio.wait_for(
+                    handler(request), timeout=_API_REQUEST_TIMEOUT
+                )
+        except asyncio.TimeoutError as exc:
+            capture_incident("api.timeout", "request timed out", exception=exc)
+            logger.warning("request timeout %s %s", request.method, request.path)
+            return web.json_response({"error": "request timed out"}, status=504)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            capture_incident("api.unhandled", "internal error", exception=e)
+            logger.exception(
+                "unhandled error on %s %s: %s", request.method, request.path, e
             )
-    except asyncio.TimeoutError:
-        logger.warning("request timeout %s %s", request.method, request.path)
-        return web.json_response({"error": "request timed out"}, status=504)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        logger.exception(
-            "unhandled error on %s %s: %s", request.method, request.path, e
-        )
-        return web.json_response({"error": "internal error"}, status=500)
+            return web.json_response({"error": "internal error"}, status=500)
 
 
 app = web.Application(
     middlewares=[_reliability_middleware, _auth_middleware_unless_login],
     client_max_size=256 * 1024,
 )
+app.on_startup.append(_initialize_incident_reporting)
 app.router.add_get("/health", health_check)
 app.router.add_get("/api/health", health_check)
 app.router.add_get("/data/{file}", data_file)

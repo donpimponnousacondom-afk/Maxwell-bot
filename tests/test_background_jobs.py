@@ -9,6 +9,7 @@ import json
 
 import pytest
 
+from error_reporting import PUBLIC_ERROR_TEXT
 from jobs import (
     BackgroundJobManager,
     SpawnBackgroundTool,
@@ -282,7 +283,7 @@ def test_runner_marks_error_and_notifies(tmp_path):
 
     job, channel = asyncio.run(scenario())
     assert job.status == "error"
-    assert any("failed" in text for text in channel.sent)
+    assert channel.sent == [PUBLIC_ERROR_TEXT]
 
 
 def test_manager_list_text_guild_filtering(tmp_path):

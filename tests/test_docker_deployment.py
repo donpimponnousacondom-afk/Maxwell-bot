@@ -95,6 +95,10 @@ def test_image_uses_allowlisted_source_and_locked_dependencies():
     assert all("==" in line and ">" not in line for line in dependencies)
     assert "discord.py-self==2.1.0" in dependencies
     assert not any(line.startswith("discord.py==") for line in dependencies)
+    assert "error_reporting.py" in dockerfile.split()
+    assert "error_reporting.py" in allowed
+    assert "operator_commands.py" in dockerfile.split()
+    assert "operator_commands.py" in allowed
     assert "provider_telemetry.py" in dockerfile.split()
     assert "provider_telemetry.py" in allowed
     assert "response_observability.py" in dockerfile.split()

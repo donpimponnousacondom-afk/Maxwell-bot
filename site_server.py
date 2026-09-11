@@ -35,11 +35,14 @@ import os
 import re
 import shutil
 import socket
+import traceback
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
 import docker_runtime as runtime
+from error_reporting import capture_incident, incident_context, register_secrets
 from utils import FileLock, _atomic_json_write_sync
 
 logger = logging.getLogger(__name__)
@@ -73,6 +76,7 @@ START_TIMEOUT = 25.0
 # tore them down before docker flushed any logs.
 CRASH_GRACE_SECONDS = 1.5
 _LIFECYCLE_LOCK = asyncio.Lock()
+_START_DIAGNOSTICS: ContextVar[list[str] | None] = ContextVar("site_start_diagnostics", default=None)
 
 ENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 SLUG_RE = re.compile(r"^[a-z0-9-]{2,30}$")
@@ -84,6 +88,24 @@ RESERVED_ENV = {"PATH", "HOME", "PORT", "PYTHONPATH", "LD_PRELOAD", "LD_LIBRARY_
 
 class SiteServerError(Exception):
     """Something the model can fix by calling again differently."""
+
+
+class SiteServerExecutionError(SiteServerError):
+    def __init__(
+        self, message: str, *, operation: str, slug: str = "",
+        details: str = "", cause: BaseException | None = None,
+    ) -> None:
+        super().__init__(message)
+        received = "\n\n".join(_START_DIAGNOSTICS.get() or [])
+        self.incident_details = details + "\n\n" + received + "\n\nCapture stack:\n" + "".join(traceback.format_stack()[:-1])
+        self.__cause__ = cause
+        context = {"operation": operation}
+        if slug:
+            context["slug"] = slug
+        capture_incident(
+            "site_server", message, exception=self,
+            details=self.incident_details, context=context,
+        )
 
 
 def _check_slug(slug: str) -> str:
@@ -259,7 +281,10 @@ async def owned_resource(name: str, kind: str, slug: str, resource_type: str) ->
     if code != 0:
         if "no such" in err.lower():
             return False
-        raise SiteServerError("could not verify Docker resource ownership")
+        raise SiteServerExecutionError(
+            "could not verify Docker resource ownership", operation="ownership", slug=slug,
+            details=f"resource_type={resource_type}\nexitcode={code}\nstdout:\n{out}\nstderr:\n{err}",
+        )
     runtime.require_ownership(json.loads(out), kind, slug)
     return True
 
@@ -291,7 +316,9 @@ async def _docker_raw(*args: str, timeout: float = 30.0) -> tuple[int, str, str]
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError as exc:
-        raise SiteServerError("docker is not installed or not on PATH") from exc
+        raise SiteServerExecutionError(
+            "docker is not installed or not on PATH", operation=args[0], cause=exc,
+        ) from exc
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
@@ -301,7 +328,12 @@ async def _docker_raw(*args: str, timeout: float = 30.0) -> tuple[int, str, str]
             await proc.wait()
         if isinstance(exc, asyncio.CancelledError):
             raise
-        raise SiteServerError(f"docker did not respond within {timeout:.0f}s") from None
+        raise SiteServerExecutionError(
+            f"docker did not respond within {timeout:.0f}s", operation=args[0], cause=exc,
+            details=(f"timeout={timeout}\nexitcode={proc.returncode}\n"
+                     "stdout/stderr unavailable: communicate() was cancelled before returning; "
+                     "unread output was not recovered."),
+        ) from exc
     return (
         proc.returncode or 0,
         out.decode(errors="replace"),
@@ -316,9 +348,12 @@ async def _ensure_image() -> None:
         return
     logger.info("Building %s (first site backend on this host)", image)
     labels = runtime.label_args("site-runtime") if runtime.container_mode() else []
-    code, _out, err = await _docker("build", *labels, "-t", image, DOCKERFILE_DIR, timeout=600)
+    code, out, err = await _docker("build", *labels, "-t", image, DOCKERFILE_DIR, timeout=600)
     if code != 0:
-        raise SiteServerError(f"could not build the site runtime image: {err.strip()[:300]}")
+        raise SiteServerExecutionError(
+            f"could not build the site runtime image: {err.strip()[:300]}", operation="build",
+            details=f"image={image}\nexitcode={code}\nstdout:\n{out}\nstderr:\n{err}",
+        )
 
 
 async def _remove_container(slug: str) -> None:
@@ -331,11 +366,13 @@ async def _remove_container(slug: str) -> None:
     wrong health diagnoses. So: ask, then confirm it is absent.
     """
     name = container_name(slug)
-    _rm_code, _out, rm_err = await _docker("rm", "-f", name, timeout=30)
+    rm_code, rm_out, rm_err = await _docker("rm", "-f", name, timeout=30)
+    diagnostics = [f"remove exitcode={rm_code}\nstdout:\n{rm_out}\nstderr:\n{rm_err}"]
     for _ in range(100):  # ~20s — docker can be slow while a build is running
-        code, _out, _err = await _docker(
+        code, out, err = await _docker(
             "inspect", "--type", "container", "-f", "{{.Id}}", name, timeout=10
         )
+        diagnostics.append(f"inspect exitcode={code}\nstdout:\n{out}\nstderr:\n{err}")
         if code != 0:
             return
         await asyncio.sleep(0.2)
@@ -343,10 +380,11 @@ async def _remove_container(slug: str) -> None:
     # regardless of the first exit code; a replacement must not proceed into a
     # name/port collision, and a destroy should make a best effort to kill the
     # service rather than merely deleting its registry row.
-    retry_code, _out, retry_err = await _docker("rm", "-f", name, timeout=30)
+    retry_code, retry_out, retry_err = await _docker("rm", "-f", name, timeout=30)
+    diagnostics.append(f"retry remove exitcode={retry_code}\nstdout:\n{retry_out}\nstderr:\n{retry_err}")
     if retry_code == 0:
         for _ in range(25):
-            code, _out, _err = await _docker(
+            code, out, err = await _docker(
                 "inspect",
                 "--type",
                 "container",
@@ -355,13 +393,15 @@ async def _remove_container(slug: str) -> None:
                 name,
                 timeout=10,
             )
+            diagnostics.append(f"inspect exitcode={code}\nstdout:\n{out}\nstderr:\n{err}")
             if code != 0:
                 return
             await asyncio.sleep(0.2)
     rm_err = retry_err or rm_err
-    raise SiteServerError(
+    raise SiteServerExecutionError(
         f"could not remove backend container {name}: "
-        f"{(rm_err or 'container is still present').strip()[:300]}"
+        f"{(rm_err or 'container is still present').strip()[:300]}",
+        operation="remove", slug=slug, details="\n\n".join(diagnostics),
     )
 
 
@@ -486,10 +526,12 @@ async def build_site_image(data_dir, slug: str, packages: list[str]) -> str:
         encoding="utf-8",
     )
     labels = runtime.label_args("siteimg", slug) if runtime.container_mode() else []
-    code, _out, err = await _docker("build", *labels, "-t", tag, str(build_dir), timeout=600)
+    code, out, err = await _docker("build", *labels, "-t", tag, str(build_dir), timeout=600)
     if code != 0:
-        raise SiteServerError(
-            "could not install those packages:\n" + (err.strip()[-600:] or "pip failed")
+        raise SiteServerExecutionError(
+            "could not install those packages:\n" + (err.strip()[-600:] or "pip failed"),
+            operation="build", slug=slug,
+            details=f"image={tag}\nexitcode={code}\nstdout:\n{out}\nstderr:\n{err}",
         )
     return tag
 
@@ -602,7 +644,9 @@ def write_code(data_dir, slug: str, files: dict[str, str]) -> list[str]:
             for old in reversed(moved_old):
                 with contextlib.suppress(Exception):
                     os.replace(old, target / old.name)
-            raise SiteServerError(f"could not replace server source: {exc}") from exc
+            raise SiteServerExecutionError(
+                f"could not replace server source: {exc}", operation="write", slug=slug, cause=exc,
+            ) from exc
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(stage, ignore_errors=True)
@@ -674,7 +718,9 @@ def merge_code(data_dir, slug: str, files: dict[str, str]) -> list[str]:
         except Exception as exc:
             with contextlib.suppress(OSError):
                 tmp.unlink()
-            raise SiteServerError(f"could not write {rel}: {exc}") from exc
+            raise SiteServerExecutionError(
+                f"could not write {rel}: {exc}", operation="write", slug=slug, cause=exc,
+            ) from exc
     if not runtime.container_mode():
         with contextlib.suppress(OSError):
             os.chown(state_dir(data_dir, slug), 10001, 10001)
@@ -788,6 +834,9 @@ async def _http_ping(port: int, host: str = "127.0.0.1") -> str:
         # Any status counts — a 404 from the app is still the app answering.
         return "ok" if line.startswith(b"HTTP/") else "no HTTP response"
     except (OSError, asyncio.TimeoutError) as e:
+        diagnostics = _START_DIAGNOSTICS.get()
+        if diagnostics is not None:
+            diagnostics.append("health probe:\n" + "".join(traceback.format_exception(e)))
         return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
     finally:
         if writer is not None:
@@ -811,6 +860,9 @@ async def _wait_healthy(port: int, slug: str) -> str:
             container_name(slug),
             timeout=10,
         )
+        diagnostics = _START_DIAGNOSTICS.get()
+        if diagnostics is not None:
+            diagnostics.append(f"health inspect exitcode={code}\nstdout:\n{out}\nstderr:\n{_err}")
         if code != 0:
             return "the container disappeared"
         parts = out.split()
@@ -864,6 +916,12 @@ async def _start_unlocked(
             else {}
         )
     env = parse_env(env)
+    register_secrets(
+        secret for name, value in env.items()
+        if name.endswith(("_API_KEY", "_TOKEN", "_PASSWORD", "_SECRET"))
+        or name in {"X_CT0", "API_KEY"}
+        for secret in (value, value.strip())
+    )
     if packages is None:
         previous_packages = previous.get("packages")
         packages = list(previous_packages) if isinstance(previous_packages, list) else []
@@ -911,8 +969,12 @@ async def _start_unlocked(
         args.extend(["-e", f"{key}={value}"])
     args.append(image)
 
-    code, _out, err = await _docker(*args, timeout=60)
+    code, out, err = await _docker(*args, timeout=60)
     if code != 0:
+        failure = SiteServerExecutionError(
+            f"could not start the backend: {err.strip()[:300]}", operation="start", slug=slug,
+            details=f"exitcode={code}\nstdout:\n{out}\nstderr:\n{err}",
+        )
         if previous:
             failed = dict(previous)
             failed.update(
@@ -927,7 +989,7 @@ async def _start_unlocked(
                 }
             )
             _write_entry(data_dir, slug, failed)
-        raise SiteServerError(f"could not start the backend: {err.strip()[:300]}")
+        raise failure
 
     health = await _wait_healthy(port, slug)
     entry = {
@@ -946,7 +1008,8 @@ async def _start_unlocked(
         # Grab the logs BEFORE tearing it down — they are the only thing that
         # tells the model what to fix. Then remove it, so a broken app is not
         # left crash-looping forever holding a port.
-        tail = await logs(data_dir, slug, lines=30)
+        diagnostics = [f"run exitcode={code}\nstdout:\n{out}\nstderr:\n{err}"]
+        tail = await logs(data_dir, slug, lines=30, diagnostics=diagnostics)
         with contextlib.suppress(Exception):
             await _remove_container(slug)
         if not tail or tail.strip() in {"(no output yet)", ""}:
@@ -956,10 +1019,11 @@ async def _start_unlocked(
                 "and stay in the foreground; falling off the end of the file "
                 "exits 0 and Docker restarts it."
             )
-        raise SiteServerError(
+        raise SiteServerExecutionError(
             f"the backend never came up: {health}.\n"
             "It must listen on 0.0.0.0:$PORT and stay in the foreground.\n"
-            f"Its last output:\n{tail}"
+            f"Its last output:\n{tail}",
+            operation="start", slug=slug, details="\n\n".join(diagnostics),
         )
     return entry
 
@@ -974,10 +1038,15 @@ async def start(
     # Port selection, container replacement, and registry writes form one
     # lifecycle operation. Serialize them so two overlapping tool calls cannot
     # choose the same port or race through the same container name.
-    async with _LIFECYCLE_LOCK:
-        return await _start_unlocked(
-            data_dir, slug, env=env, packages=packages
-        )
+    with incident_context(slug=slug):
+        token = _START_DIAGNOSTICS.set([])
+        try:
+            async with _LIFECYCLE_LOCK:
+                return await _start_unlocked(
+                    data_dir, slug, env=env, packages=packages
+                )
+        finally:
+            _START_DIAGNOSTICS.reset(token)
 
 
 async def _stop_unlocked(data_dir, slug: str) -> bool:
@@ -994,8 +1063,9 @@ async def _stop_unlocked(data_dir, slug: str) -> bool:
 
 
 async def stop(data_dir, slug: str) -> bool:
-    async with _LIFECYCLE_LOCK:
-        return await _stop_unlocked(data_dir, slug)
+    with incident_context(slug=slug):
+        async with _LIFECYCLE_LOCK:
+            return await _stop_unlocked(data_dir, slug)
 
 
 async def _destroy_unlocked(data_dir, slug: str) -> None:
@@ -1020,11 +1090,14 @@ async def _destroy_unlocked(data_dir, slug: str) -> None:
 
 
 async def destroy(data_dir, slug: str) -> None:
-    async with _LIFECYCLE_LOCK:
-        await _destroy_unlocked(data_dir, slug)
+    with incident_context(slug=slug):
+        async with _LIFECYCLE_LOCK:
+            await _destroy_unlocked(data_dir, slug)
 
 
-async def logs(data_dir, slug: str, lines: int = 40) -> str:
+async def logs(
+    data_dir, slug: str, lines: int = 40, *, diagnostics: list[str] | None = None,
+) -> str:
     try:
         lines = int(lines or 40)
     except (TypeError, ValueError):
@@ -1033,6 +1106,8 @@ async def logs(data_dir, slug: str, lines: int = 40) -> str:
     code, out, err = await _docker(
         "logs", "--tail", str(lines), container_name(slug), timeout=20
     )
+    if diagnostics is not None:
+        diagnostics.append(f"logs exitcode={code}\nstdout:\n{out}\nstderr:\n{err}")
     if code != 0:
         return "(no container — the backend is not running)"
     text = (out + err).strip()
@@ -1084,7 +1159,10 @@ async def reconcile(data_dir) -> None:
                 await start(data_dir, slug)
                 logger.info("Restarted site backend %s", slug)
             except SiteServerError as e:
-                logger.warning("Site backend %s would not restart: %s", slug, e)
+                failure = e
+            else:
+                continue
+            logger.warning("Site backend %s would not restart: %s", slug, failure)
 
 
 # ── what the model is told ────────────────────────────────────────────────

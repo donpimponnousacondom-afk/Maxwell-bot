@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from error_reporting import PUBLIC_ERROR_TEXT
 from provider_telemetry import CallMetrics
 from response_observability import (
     DEFAULT_FOOTER_FORMAT,
@@ -702,7 +703,7 @@ def test_background_producing_call_survives_string_recovery_without_error_borrow
     async def scenario():
         message = Message()
         job = SimpleNamespace(
-            id="job", channel_id="100", user_id="7", goal="test", context=""
+            id="job", guild_id="9", channel_id="100", user_id="7", goal="test", context=""
         )
         manager = SimpleNamespace(
             get=lambda job_id: job,
@@ -738,7 +739,8 @@ def test_background_producing_call_survives_string_recovery_without_error_borrow
         assert bot._dispatch_tool_calls.call_args.kwargs["response_metrics"] is metrics
         assert message.channel.sent
         if fail_followup:
-            assert "generation failed" in message.channel.sent[-1].content
+            assert message.channel.sent[-1].content == PUBLIC_ERROR_TEXT
+            assert job.status == "error"
             assert not bot._delivery_measurements.records
             assert all(
                 FOOTER_MARKER not in sent.content for sent in message.channel.sent

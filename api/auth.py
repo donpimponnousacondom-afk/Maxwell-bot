@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 
@@ -25,6 +26,7 @@ from api.config import (
     DISCORD_TOKEN_TTL,
 )
 from api.storage import _data_dir
+from error_reporting import capture_incident
 
 ADMIN_USER = os.getenv("MAXWELL_ADMIN_USER", "").strip()
 ADMIN_PASSWORD = os.getenv("MAXWELL_ADMIN_PASSWORD", "").strip()
@@ -90,8 +92,8 @@ def _discord_token_authed(request) -> bool:
     return bool(info and info.get("expires", 0) >= time.time())
 
 
-def _json_response(data, status=200):
-    return web.json_response(
+def _json_response(data, status=200, *, expected_refusal=False):
+    response = web.json_response(
         data,
         status=status,
         headers={
@@ -100,6 +102,12 @@ def _json_response(data, status=200):
             "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Discord-Token",
         },
     )
+    if status >= 500 and not (status == 501 and expected_refusal):
+        capture_incident(
+            "api.response", f"HTTP {status}", exception=sys.exception(),
+            details=response.text, context={"status": str(status)},
+        )
+    return response
 
 
 # Public routes, both of them a generated site's own backend talking to a
