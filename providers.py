@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -15,6 +16,7 @@ from urllib.parse import urlsplit
 import aiohttp
 
 from control_defaults import DEEPSEEK_REASONING_EFFORTS
+from error_reporting import capture_incident, register_secrets
 from provider_telemetry import (
     CallMetrics,
     ChatCompletionMessage,
@@ -619,12 +621,119 @@ def _extract_partial_reasoning(arguments: str) -> str:
         return raw
 
 
+class _ProviderDiagnostics:
+    def __init__(self):
+        self.attempts: list[str] = []
+        self.current: dict = {}
+        self.body = bytearray()
+        self.response_text = ""
+        self.failed = False
+        self.first_exception: BaseException | None = None
+
+    def begin(self, endpoint, path: str, attempt: int, maximum: int, data: dict, timeout: int):
+        self.finish_attempt()
+        self.started_s = time.perf_counter()
+        self.current = {
+            "attempt": f"{attempt}/{maximum}",
+            "endpoint": endpoint.name,
+            "url": f"{endpoint.base_url}/{path}",
+            "model": data.get("model", endpoint.model),
+            "timeout_seconds": timeout,
+            "parameters": copy.deepcopy({key: value for key, value in data.items() if key != "messages"}),
+            "messages": [
+                {
+                    "role": message.get("role"),
+                    "fields": {key: type(value).__name__ for key, value in message.items()},
+                    "field_lengths": {
+                        key: len(value) for key, value in message.items()
+                        if isinstance(value, (str, list, dict))
+                    },
+                    "content_parts": [part.get("type") for part in message.get("content", []) if isinstance(part, dict)]
+                    if isinstance(message.get("content"), list) else [],
+                }
+                for message in data.get("messages", [])
+            ],
+        }
+        self.body = bytearray()
+        self.body_encoding = "utf-8"
+        self.response_text = ""
+        self.http_response = None
+
+    def response(self, resp):
+        self.http_response = resp
+        self.current["status"] = resp.status
+        self.current["headers_ms"] = (time.perf_counter() - self.started_s) * 1000
+        self.current["response_headers"] = {
+            key: value for key, value in resp.headers.items()
+            if key.lower() in {
+                "content-type", "content-length", "date", "server", "retry-after",
+                "request-id", "x-request-id", "x-correlation-id", "traceparent",
+                "cf-ray", "openai-processing-ms", "x-envoy-upstream-service-time",
+            } or key.lower().startswith(("x-ratelimit-", "ratelimit-"))
+            or key.lower().endswith(("-request-id", "-trace-id"))
+        }
+
+    def json_response(self, resp, result: object):
+        cached_body = getattr(resp, "_body", None)
+        if isinstance(cached_body, bytes):
+            self.body.extend(cached_body)
+            self.body_encoding = resp.get_encoding()
+        else:
+            self.response_text = json.dumps(result, ensure_ascii=False, default=str)
+
+    def failure(self, summary: str, exception: BaseException | None = None):
+        self.failed = True
+        cached_body = getattr(self.http_response, "_body", None)
+        if not self.body and not self.response_text and isinstance(cached_body, bytes):
+            self.body.extend(cached_body)
+            if isinstance(exception, UnicodeDecodeError):
+                self.body_encoding = exception.encoding
+        self.current.setdefault("failures", []).append(summary)
+        if exception is not None:
+            if self.first_exception is None:
+                self.first_exception = exception
+            group_id = getattr(self.first_exception, "incident_id", None)
+            if group_id and not getattr(exception, "incident_id", None):
+                exception.incident_id = group_id
+            self.current.setdefault("exceptions", []).append(
+                "".join(traceback.format_exception(exception))
+            )
+
+    def finish_attempt(self):
+        if self.current:
+            self.current["elapsed_ms"] = (time.perf_counter() - self.started_s) * 1000
+            exceptions = self.current.pop("exceptions", [])
+            record = json.dumps(self.current, ensure_ascii=False, indent=2, default=str)
+            if self.current.get("failures"):
+                body = self.response_text or self.body.decode(self.body_encoding, errors="replace")
+                record += "\nReceived response body (complete received text):\n" + body
+            if exceptions:
+                record += "\nUnderlying exception context:\n" + "\n".join(exceptions)
+            self.attempts.append(record)
+            self.current = {}
+
+    def capture(self, summary: str, exception: BaseException | None = None):
+        if self.failed:
+            self.finish_attempt()
+            details = "\n\n".join(self.attempts)
+            exception = exception if exception is not None else self.first_exception
+            group_id = getattr(self.first_exception, "incident_id", None)
+            if exception is not None:
+                if group_id and not getattr(exception, "incident_id", None):
+                    exception.incident_id = group_id
+                exception.incident_details = details
+            incident_id = capture_incident("provider", summary, exception=exception, details=details)
+            if exception is not None and incident_id is not None:
+                exception.incident_id = incident_id
+
+
 async def _read_sse_response(
     resp: aiohttp.ClientResponse,
     on_tool_call_name=None,
     on_token=None,
     custom_tool_calls: bool = False,
     observation: OutputObservation | None = None,
+    incident: _ProviderDiagnostics | None = None,
 ) -> dict:
     """Read an OpenAI-style SSE chat-completions stream and reassemble it into
     the same dict shape a non-streamed `await resp.json()` would return.
@@ -741,6 +850,8 @@ async def _read_sse_response(
         if done:
             break
         byte_count += len(raw_chunk)
+        if incident is not None:
+            incident.body.extend(raw_chunk)
         buf += raw_chunk
         while b"\n" in buf and not done:
             line, buf = buf.split(b"\n", 1)
@@ -765,7 +876,9 @@ async def _read_sse_response(
             data_count += 1
             try:
                 obj = json.loads(payload)
-            except ValueError:
+            except ValueError as e:
+                if incident is not None:
+                    incident.failure("Provider stream contains malformed JSON", e)
                 if error_event:
                     raise ProviderUpstreamError(payload.decode("utf-8", errors="replace")) from None
                 malformed_count += 1
@@ -1127,6 +1240,7 @@ class ProviderUpstreamError(ProviderResponseError):
     """An explicit HTTP 200 upstream failure with content-free diagnostics."""
 
     def __init__(self, error: object):
+        self.incident_details = json.dumps(error, ensure_ascii=False, default=str)
         details = error if isinstance(error, dict) else {}
         known_labels = {
             "rate_limit_exceeded", "rate_limit_error", "concurrency_limit_exceeded",
@@ -1538,6 +1652,7 @@ class OllamaProvider:
         self.top_p = top_p
         self.top_k = top_k
         self.api_key = api_key.strip()
+        register_secrets((self.api_key, fallback_api_key.strip(), vision_api_key.strip()))
         self.retry_attempts = max(1, retry_attempts)
         if empty_response_retries is None:
             try:
@@ -1916,25 +2031,34 @@ class OllamaProvider:
         session = await self._get_session()
         initialized = False
         for endpoint in self._endpoints:
+            incident = _ProviderDiagnostics()
+            incident.begin(endpoint, "models", 1, 1, {}, 10)
             try:
                 async with session.get(
                     f"{endpoint.base_url}/models",
                     timeout=aiohttp.ClientTimeout(total=10),
                     headers=self._headers(endpoint),
                 ) as resp:
+                    incident.response(resp)
                     if resp.status == 200:
                         initialized = True
                         logger.info(
                             f"Provider endpoint initialized: {endpoint.name} ({endpoint.model})"
                         )
                     else:
+                        incident.failure(f"HTTP {resp.status}")
+                        incident.response_text = await resp.text()
                         logger.warning(
                             f"Provider endpoint {endpoint.name} /models returned {resp.status}"
                         )
             except Exception as e:
+                incident.failure("Provider initialization failed", e)
+                incident.capture("Provider initialization failed", e)
                 logger.error(
-                    f"Provider endpoint {endpoint.name} initialization failed: {e}"
+                    f"Provider endpoint {endpoint.name} initialization failed: {type(e).__name__}"
                 )
+            else:
+                incident.capture("Provider initialization failed")
         self.available = initialized
         return initialized
 
@@ -2118,6 +2242,7 @@ class OllamaProvider:
         session = await self._get_session()
         last_error = None
         last_usage_error = None
+        incident = _ProviderDiagnostics()
         has_media = bool(payload_media)
         # Endpoints that rejected this call's media (text-only models 400 on
         # image_url; OpenRouter 404s on input audio). Steer retries away so a
@@ -2202,6 +2327,12 @@ class OllamaProvider:
                 ),
                 len(data.get("tools") or []),
             )
+            incident.begin(endpoint, "chat/completions", attempt, max_attempts, data, timeout)
+            incident.current["routing"] = {
+                "fast_fallback": fast_fallback, "prefer_fallback": prefer_fallback,
+                "has_media": has_media, "custom_tool_calls": custom_tool_calls,
+                "empty_response_recoveries": empty_response_recoveries,
+            }
             try:
                 async with session.post(
                     f"{endpoint.base_url}/chat/completions",
@@ -2210,8 +2341,11 @@ class OllamaProvider:
                     headers=self._headers(endpoint),
                 ) as resp:
                     headers_ms = (time.perf_counter() - request_start) * 1000
+                    incident.response(resp)
                     if resp.status in (500, 502, 503, 504):
                         error_text = await resp.text()
+                        incident.response_text = error_text
+                        incident.failure(f"HTTP {resp.status}")
                         logger.warning(
                             "Provider timing status endpoint=%s status=%s headers_ms=%.1f body_chars=%s",
                             endpoint.name,
@@ -2234,6 +2368,8 @@ class OllamaProvider:
                         )
                     if resp.status == 429:
                         error_text = await resp.text()
+                        incident.response_text = error_text
+                        incident.failure(f"HTTP {resp.status}")
                         logger.warning(
                             "Provider timing status endpoint=%s status=%s headers_ms=%.1f body_chars=%s",
                             endpoint.name,
@@ -2244,7 +2380,7 @@ class OllamaProvider:
                         self._cool_endpoint(endpoint.name)
                         if _is_usage_exhausted_error(resp.status, error_text):
                             last_usage_error = ProviderUsageExhaustedError(
-                                f"Provider {endpoint.name} usage exhausted: {error_text[:200]}"
+                                f"Provider {endpoint.name} usage exhausted: HTTP {resp.status}"
                             )
                             if len(self._endpoints) == 1:
                                 raise last_usage_error
@@ -2270,10 +2406,12 @@ class OllamaProvider:
                         ):
                             continue
                         raise RuntimeError(
-                            f"Provider rate limited after retries: {error_text[:200]}"
+                            f"Provider rate limited after retries: HTTP {resp.status}"
                         )
                     if resp.status != 200:
                         error_text = await resp.text()
+                        incident.response_text = error_text
+                        incident.failure(f"HTTP {resp.status}")
                         if (
                             resp.status in (400, 422)
                             and "stream_options" in data
@@ -2340,14 +2478,14 @@ class OllamaProvider:
                                 # the whole turn.
                                 if _strip_media_parts(chat_messages):
                                     logger.warning(
-                                        "No endpoint accepts this media; retrying text-only: %s",
-                                        error_text[:200],
+                                        "No endpoint accepts this media; retrying text-only: HTTP %s",
+                                        resp.status,
                                     )
                                     has_media = False
                                     media_broken.clear()
                                     continue
                                 raise RuntimeError(
-                                    f"Provider {endpoint.name} media-unsupported and no alternatives: {error_text[:200]}"
+                                    f"Provider {endpoint.name} media-unsupported and no alternatives: HTTP {resp.status}"
                                 )
                             logger.warning(
                                 "Provider endpoint %s cannot handle media; retrying with %s",
@@ -2376,7 +2514,7 @@ class OllamaProvider:
                             ):
                                 continue
                             raise RuntimeError(
-                                f"Provider {endpoint.name} degraded and no fallback available: {error_text[:200]}"
+                                f"Provider {endpoint.name} degraded and no fallback available: HTTP {resp.status}"
                             )
                         # Region / geo blocks (DeepSeek V4 Flash China opt-in)
                         # are not transient. Don't burn a 2s retry on the same
@@ -2399,7 +2537,7 @@ class OllamaProvider:
                             ):
                                 continue
                             raise RuntimeError(
-                                f"Provider {endpoint.name} 403 and no fallback available: {error_text[:200]}"
+                                f"Provider {endpoint.name} 403 and no fallback available: HTTP {resp.status}"
                             )
                         # Content-policy prompt blocks (Gemini "sensitive words
                         # that violate Google's use policy"). Not transient and
@@ -2413,9 +2551,9 @@ class OllamaProvider:
                             )
                             logger.warning(
                                 "Provider endpoint %s blocked the prompt on content policy; "
-                                "failing over: %s",
+                                "failing over: HTTP %s",
                                 endpoint.name,
-                                error_text[:200],
+                                resp.status,
                             )
                             if await self._retry_after_attempt(
                                 attempt,
@@ -2598,6 +2736,7 @@ class OllamaProvider:
                             on_token=on_token,
                             custom_tool_calls=custom_tool_calls,
                             observation=observation,
+                            incident=incident,
                         )
                         result = {
                             k: v for k, v in merged.items() if not k.startswith("__")
@@ -2606,11 +2745,15 @@ class OllamaProvider:
                         try:
                             result = await resp.json(content_type=None)
                         except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            incident.response_text = e.doc if isinstance(e, json.JSONDecodeError) else e.object.decode("utf-8", errors="replace")
+                            incident.failure("Provider JSON decoding failed", e)
                             raise ProviderResponseError(
                                 f"Provider JSON decoding failed: error_type={type(e).__name__}"
                             ) from None
+                        incident.json_response(resp, result)
                         observation.finished_s = time.perf_counter()
                     if not isinstance(result, dict):
+                        incident.failure("HTTP 200 with non-dict JSON body")
                         logger.warning(
                             "Provider %s returned 200 with non-dict JSON body (type=%s)",
                             endpoint.name,
@@ -2689,6 +2832,7 @@ class OllamaProvider:
                     # model on the very next attempt (no second try against the
                     # model that just refused — the same payload always loses).
                     if content and _is_policy_block_text(content):
+                        incident.failure("HTTP 200 content-policy prompt block")
                         self._cool_endpoint(
                             endpoint.name, "blocked the prompt on content policy"
                         )
@@ -2715,6 +2859,7 @@ class OllamaProvider:
                             "no fallback endpoint was available"
                         )
                     if not content and not message.get("tool_calls"):
+                        incident.failure("HTTP 200 with empty content and no tool calls")
                         # Some providers return choices with a message but blank content (e.g. refusals, reasoning-only, or bugs).
                         logger.warning(
                             "Provider %s returned 200 with empty content (tool_calls=%s) message_field_count=%s",
@@ -2795,8 +2940,10 @@ class OllamaProvider:
                         len(message.get("tool_calls") or []),
                         usage["total_tokens"],
                     )
+                    incident.capture("Provider request recovered after upstream failures")
                     return ChatCompletionMessage(message, metrics=metrics, usage=usage)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                incident.failure("Provider request timeout", e)
                 logger.warning(
                     "Provider timing timeout endpoint=%s elapsed_ms=%.1f timeout=%s",
                     endpoint.name,
@@ -2813,15 +2960,21 @@ class OllamaProvider:
                     prefer_fallback=prefer_fallback,
                 ):
                     continue
-                raise RuntimeError(
-                    f"Provider request timed out after {timeout}s"
-                ) from asyncio.TimeoutError
-            except ProviderUsageExhaustedError:
+                failure = RuntimeError(f"Provider request timed out after {timeout}s")
+                failure.__cause__ = e
+                incident.capture("Provider request timed out", failure)
+                raise failure from e
+            except ProviderUsageExhaustedError as e:
+                incident.failure("Provider usage exhausted", e)
+                incident.capture("Provider usage exhausted", e)
                 raise
-            except ProviderRequestError:
+            except ProviderRequestError as e:
                 # Deterministic and already failed over everywhere it could.
+                incident.failure("Provider request rejected", e)
+                incident.capture("Provider request rejected", e)
                 raise
             except RuntimeError as e:
+                incident.failure("Provider response failure", e)
                 last_error = e
                 if isinstance(e, ProviderResponseError):
                     logger.warning(
@@ -2831,30 +2984,38 @@ class OllamaProvider:
                 if await self._retry_after_attempt(
                     attempt,
                     endpoint,
-                    f"Provider {endpoint.name} error: {e}",
+                    f"Provider {endpoint.name} error: {type(e).__name__}",
                     max_attempts=max_attempts,
                     fast_fallback=fast_fallback,
                     has_media=has_media,
                     prefer_fallback=prefer_fallback,
                 ):
                     continue
+                incident.capture("Provider response failure", e)
                 raise
             except Exception as e:
+                incident.failure("Provider transport or response failure", e)
                 last_error = e
                 if await self._retry_after_attempt(
                     attempt,
                     endpoint,
-                    f"Provider {endpoint.name} error: {e}",
+                    f"Provider {endpoint.name} error: {type(e).__name__}",
                     max_attempts=max_attempts,
                     fast_fallback=fast_fallback,
                     has_media=has_media,
                     prefer_fallback=prefer_fallback,
                 ):
                     continue
-                raise RuntimeError(f"Provider call failed: {last_error}") from e
+                failure = RuntimeError(f"Provider call failed: {type(last_error).__name__}")
+                failure.__cause__ = e
+                incident.capture("Provider transport or response failure", failure)
+                raise failure from e
         if last_usage_error:
+            incident.capture("Provider usage exhausted", last_usage_error)
             raise last_usage_error
-        raise RuntimeError("Provider call failed after retries")
+        failure = RuntimeError("Provider call failed after retries")
+        incident.capture("Provider call failed after retries", failure)
+        raise failure
 
     async def _retry_after_attempt(
         self,
