@@ -14,9 +14,9 @@ from utils import FileLock, _atomic_json_write_sync
 DEEPSEEK_REASONING_EFFORTS = {"low": 50, "high": 75, "max": 100}
 
 
-def update_deepseek_reasoning(path: Path, level: str) -> None:
-    if level not in {*DEEPSEEK_REASONING_EFFORTS, "off", ""}:
-        raise ValueError("DeepSeek reasoning must be low, high, max, off, or blank")
+def update_deepseek_reasoning(path: Path, level: str | int) -> None:
+    if level not in (*DEEPSEEK_REASONING_EFFORTS, "off", "") and not (type(level) is int and 1 <= level <= 100):
+        raise ValueError("DeepSeek reasoning must be an integer 1–100, low, high, max, off, or blank")
     with FileLock(path):
         control = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         if not isinstance(control, dict):

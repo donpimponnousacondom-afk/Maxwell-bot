@@ -37,6 +37,32 @@ def test_baseline_and_runtime_are_always_explicit(base, model, transport, level)
     assert reasoning_fields(payload) == expected_fields(transport, level or "high")
 
 
+@pytest.mark.parametrize("number", range(1, 101))
+@pytest.mark.parametrize("source", ["control", "extra_body"])
+def test_numeric_openrouter_effort_reaches_payload_as_integer(number, source):
+    provider = OllamaProvider(
+        ROUTES[0][0], ROUTES[0][1], 8192, 0.6,
+        reasoning_control=(lambda: number) if source == "control" else None,
+        extra_body={"provider": {"only": ["deepseek"]}, "reasoning": {"effort": number}} if source == "extra_body" else {"provider": {"only": ["deepseek"]}},
+    )
+    endpoint = provider._endpoints[0]
+    payload = provider._request_payload(endpoint, [])
+    assert payload["reasoning"] == {"enabled": True, "effort": number}
+    assert type(payload["reasoning"]["effort"]) is int
+    assert payload["provider"] == {"only": ["deepseek"]}
+    assert provider._request_payload(endpoint, [], disable_reasoning=True)["reasoning"] == {"enabled": False, "effort": "none"}
+    assert provider._request_payload(endpoint, [], disable_reasoning=False)["reasoning"] == payload["reasoning"]
+    assert provider._request_payload(endpoint, []) == payload
+
+
+@pytest.mark.parametrize("base,model,transport", ROUTES[1:])
+@pytest.mark.parametrize("value", [1, 37, 50, 75, 100])
+def test_direct_api_numeric_behavior_is_unchanged(base, model, transport, value):
+    provider = OllamaProvider(base, model, 8192, 0.6, reasoning_control=lambda: value)
+    with pytest.raises(ValueError, match="DeepSeek reasoning control"):
+        provider._request_payload(provider._endpoints[0], [])
+
+
 @pytest.mark.parametrize("base,model,transport", ROUTES)
 @pytest.mark.parametrize("level", ["low", "max", "off"])
 @pytest.mark.parametrize("disable", [False, True])
@@ -137,14 +163,14 @@ def test_official_direct_compatibility_aliases_are_canonical(alias, expected):
 
 
 @pytest.mark.parametrize("base,model,transport", ROUTES)
-@pytest.mark.parametrize("value", [1, 50, 75, 100, "medium-unknown"])
+@pytest.mark.parametrize("value", [-1, 0, 101, True, False, 75.0, "75", "medium-unknown"])
 def test_unsupported_native_effort_is_not_sent(base, model, transport, value):
     provider = OllamaProvider(base, model, 8192, 0.6, extra_body={"reasoning_effort": value})
-    with pytest.raises(ValueError, match="numeric effort passthrough is unverified"):
+    with pytest.raises(ValueError, match="DeepSeek reasoning supports"):
         provider._request_payload(provider._endpoints[0], [])
 
 
-@pytest.mark.parametrize("value", ["bogus", 75, None, {}])
+@pytest.mark.parametrize("value", ["bogus", 0, 101, True, False, 75.0, "75", None, {}])
 def test_malformed_runtime_control_fails_closed(value):
     provider = OllamaProvider(ROUTES[0][0], ROUTES[0][1], 8192, 0.6, reasoning_control=lambda: value)
     with pytest.raises(ValueError, match="reasoning control"):

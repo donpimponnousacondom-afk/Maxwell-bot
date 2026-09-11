@@ -62,6 +62,10 @@ Do not amend/rebase/squash root's or another agent's commits without explicit ap
 - Use judgement: short acknowledgements/errors stay plain; deliberately rich help, clickable links and headings can remain outside the block. Single backticks are **inline code**, suitable for individual commands/paths, not a replacement for a multiline fenced report. Do not apply command formatting indiscriminately to conversational replies or model-facing tool results.
 - Test the **actual emitted Discord content**, not only the values inside it: balanced fences, readable line breaks, safe embedded fences, message-length limits and unchanged short replies. Readability is part of command acceptance, not a second pass left for root to discover in Discord. Apply this rule whenever adding or modifying commands.
 
+## Numeric OpenRouter effort
+
+Root explicitly requires **every integer1–100** for DeepSeek **V4.1 Flash** on OpenRouter, regardless of advertised enum schemas. `!effort N` must persist/send the exact JSON integer, including50/75/100; no rounding, tier conversion or silent substitution after rejection. Keep named reasoning commands and unrelated routes/models unchanged. Capture full received rejections for root's support report; local/mock acceptance does not prove the upstream honors the integer. Do not reinstate the old three-preset restriction.
+
 ## Private incidents and Discord cleanup
 
 - Automatic runtime-error notices use the single `PUBLIC_ERROR_TEXT` from `error_reporting.py`, with no TPS/TTFT/footer or exception suffix. Keep normal validation/refusal/cancellation semantics and the `error_replies` switch; do not manufacture failures from arbitrary `Error`-looking model/tool text.

@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Exact numeric OpenRouter effort — implemented, not deployed (2026-09-11)
+
+- Root explicitly rejected the local three-preset restriction and authorized sending every integer1–100 to the configured DeepSeek **V4.1 Flash** OpenRouter route, regardless of advertised enum schemas. `!effort N` now persists the integer and emits `reasoning.effort: N` unchanged, including50/75/100; no rounding or named-tier substitution. Existing named reasoning commands, direct-API behavior, per-call disable overrides, other models/routing/credentials remain unchanged. No live setting has been changed by this implementation.
+- Guarded candidate `5121ccf683dc60c8dd7dd430b249acc0ab9276fe` passed **655 focused tests**, zero failures/errors/skips, 4.534s. Coverage includes all100 integers through real command dispatch/persistence/reload and provider payload construction, integer wire types, invalid input/no mutation, existing direct-API semantics, and full simulated OpenRouter400 rejection bodies plus exact integer request metadata under the production incident handler, without tier retry. Evidence: `/home/codexy/.cache/maxwell-full-20260909.XKjuHF/5121ccf683dc-vgqxsrz0/`. This proves local behavior, not upstream acceptance or that OpenRouter honors the value.
+- **Live remains `maxwell-app:36e5eab`; full numeric support is not live yet.** Complete source/image acceptance and safe backup compatibility remain rollout gates. Work resumed under root's explicit numeric instruction. A scoped two-artifact backup adapter is being implemented/tested to preserve the existing interpreter symlink without editing live data or weakening generic archive validation.
+
 ## Private incident reports and Discord-only cleanup — validated, cutover deferred (2026-09-11)
 
 - Root authorized checkpoint, implementation, validation and restart. Explicit rollback checkpoint: `cfc6c05292633c45f4cbd4940e3cf46776358537` (clean source at `0862711`; no runtime changes). **Live application is still `maxwell-app:36e5eab`; this work is not deployed.** No credentials/model/persona/routing/settings changes are authorized as part of it.

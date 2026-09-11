@@ -63,7 +63,7 @@ def test_reports_show_explicit_effective_defaults_without_writing(tmp_path, name
     assert "reasoning_effort=high" in text if direct else "reasoning.effort=high" in text
     assert not (tmp_path / "bot_control.json").exists()
     if name == "effort":
-        assert "passthrough is unverified" in text
+        assert ("Direct API presets" if direct else "every integer 1..100 is sent unchanged") in text
 
 
 @pytest.mark.parametrize("direct", [False, True])
@@ -75,6 +75,8 @@ def test_admin_changes_persist_only_requested_key_and_apply_immediately(tmp_path
     path = tmp_path / "bot_control.json"
     _atomic_json_write_sync(path, {"footer_enabled": False, "unrelated": "keep"})
     bot = reasoning_bot(tmp_path, direct=direct)
+    if not direct and setting.startswith("effort "):
+        expected = int(setting.split()[1])
     text = command(bot, "!" + setting)
     assert text.startswith("```\n") and text.endswith("\n```")
     assert text.count("```") == 2
@@ -95,15 +97,53 @@ def test_nonadmins_cannot_change_settings(tmp_path, setting):
     assert not (tmp_path / "bot_control.json").exists()
 
 
-@pytest.mark.parametrize("number", ["0", "1", "49", "51", "74", "76", "99", "101", "-1", "75.0", "off", "high", "1 100"])
+@pytest.mark.parametrize("number", ["0", "101", "-1", "75.0", "off", "high", "1 100", "true", "５０"])
 def test_unsupported_numeric_effort_is_not_rounded_or_saved(tmp_path, number):
     bot = reasoning_bot(tmp_path)
     text = command(bot, "!effort " + number)
     assert text.startswith("```\nUnsupported setting; unchanged.\n")
     assert text.endswith("\n```") and text.count("```") == 2
     assert "effective reasoning: high" in text
-    assert "other values are unsupported and never rounded" in text
+    assert "every integer 1..100 is sent unchanged" in text
     assert not (tmp_path / "bot_control.json").exists()
+
+
+@pytest.mark.parametrize("number", range(1, 101))
+def test_every_openrouter_integer_persists_reloads_and_is_sent_exactly(tmp_path, number):
+    path = tmp_path / "bot_control.json"
+    path.write_text('{"unrelated":"keep","footer_enabled":false}')
+    bot = reasoning_bot(tmp_path)
+    text = command(bot, f"!effort {number}")
+    assert text.startswith("```\n") and text.endswith("\n```")
+    assert f"Effort: {number}/100 (sent unchanged as an integer)" in text
+    assert f"reasoning.effort={number}" in text
+    assert json.loads(path.read_text()) == {
+        "unrelated": "keep", "footer_enabled": False, "deepseek_reasoning": number,
+    }
+    restarted = reasoning_bot(tmp_path)
+    restarted._load_control(force=True)
+    payload = restarted.ai_provider._request_payload(restarted.ai_provider._endpoints[0], [])
+    wire = json.loads(json.dumps(payload))
+    assert type(wire["reasoning"]["effort"]) is int
+    assert wire["reasoning"] == {"enabled": True, "effort": number}
+    assert wire["provider"] == {"only": ["deepseek"]}
+    assert "sent unchanged as an integer" in command(restarted, "!reasoning")
+
+
+@pytest.mark.parametrize("number", [1, 49, 51, 74, 76, 99])
+def test_direct_api_numeric_command_behavior_is_unchanged(tmp_path, number):
+    text = command(reasoning_bot(tmp_path, direct=True), f"!effort {number}")
+    assert "Unsupported setting; unchanged" in text
+    assert not (tmp_path / "bot_control.json").exists()
+
+
+@pytest.mark.parametrize("value", [0, 101, -1, True, False, 75.0, "37", None, {}])
+def test_invalid_persisted_effort_values_never_write(tmp_path, value):
+    path = tmp_path / "bot_control.json"
+    path.write_text('{"unrelated":"keep"}')
+    with pytest.raises(ValueError, match="DeepSeek reasoning"):
+        update_deepseek_reasoning(path, value)
+    assert path.read_text() == '{"unrelated":"keep"}'
 
 
 @pytest.mark.parametrize("level", ["on", "medium", "minimal", "xhigh", "ultra", "50", "low extra"])
@@ -144,11 +184,11 @@ def test_off_report_is_not_claimed_to_be_numeric_minimum(tmp_path):
     assert "Per-call overrides" in text
 
 
-def test_help_lists_configured_prefix_and_numeric_limitation(tmp_path):
+def test_help_lists_configured_prefix_and_numeric_openrouter_control(tmp_path):
     text = command(reasoning_bot(tmp_path), "!help")
     assert "!reasoning [low|high|max|off]" in text
     assert "!effort [1..100]" in text
-    assert "exact hosted presets 50/75/100" in text
+    assert "exact numeric effort on OpenRouter" in text
 
 
 @pytest.mark.parametrize("original", ["broken json", "", "[]", "null", "false", '"text"'])

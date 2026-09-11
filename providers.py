@@ -1643,7 +1643,7 @@ class OllamaProvider:
         top_k: int = 20,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, object] | None = None,
-        reasoning_control: Callable[[], str] | None = None,
+        reasoning_control: Callable[[], str | int] | None = None,
     ):
         local_encoding()
         self.reasoning_control = reasoning_control
@@ -1877,7 +1877,8 @@ class OllamaProvider:
         endpoint: ProviderEndpoint,
         model: str | None = None,
         disable_reasoning: bool | None = None,
-    ) -> str:
+    ) -> str | int:
+        numeric_effort = urlsplit(endpoint.base_url).hostname == "openrouter.ai"
         body = self.extra_body if endpoint.name == "primary" else {}
         reasoning = body.get("reasoning") or {}
         thinking = body.get("thinking") or {}
@@ -1894,8 +1895,10 @@ class OllamaProvider:
             and (model or endpoint.model) == self.model
         ):
             requested = self.reasoning_control()
-            if requested not in ("", "off", *DEEPSEEK_REASONING_EFFORTS):
-                raise ValueError("DeepSeek reasoning control must be low, high, max, off, or blank")
+            if requested not in ("", "off", *DEEPSEEK_REASONING_EFFORTS) and not (
+                numeric_effort and type(requested) is int and 1 <= requested <= 100
+            ):
+                raise ValueError("DeepSeek reasoning control must be low, high, max, off, blank, or an OpenRouter integer 1–100")
             if requested:
                 level = "high" if requested == "off" else requested
                 disabled = requested == "off"
@@ -1908,8 +1911,10 @@ class OllamaProvider:
             if urlsplit(endpoint.base_url).hostname == "api.deepseek.com":
                 aliases.update({"minimal": "low", "medium": "high", "xhigh": "high", "ultra": "max"})
             level = aliases.get(level, level)
-            if level not in DEEPSEEK_REASONING_EFFORTS:
-                raise ValueError("DeepSeek hosted reasoning supports low, high, max; numeric effort passthrough is unverified")
+            if level not in DEEPSEEK_REASONING_EFFORTS and not (
+                numeric_effort and type(level) is int and 1 <= level <= 100
+            ):
+                raise ValueError("DeepSeek reasoning supports low, high, max, or an OpenRouter integer 1–100")
         return level
 
     def _request_payload(

@@ -137,6 +137,33 @@ def retry_sleep(monkeypatch):
 MESSAGES = [{"role": "user", "content": "synthetic private prompt not needed in diagnostics"}]
 
 
+@pytest.mark.parametrize("number", [1, 37, 50, 75, 100])
+def test_numeric_openrouter_rejection_keeps_integer_and_full_support_diagnostics(production_handler, caplog, number):
+    body = "reasoning.effort rejected as numeric; " + "FULL-UPSTREAM-DETAIL " * 1000 + "FINAL-SUPPORT-TAIL"
+    response = Response(body.encode(), 400, headers={"X-Request-ID": "synthetic-effort-request"})
+    provider = OllamaProvider(
+        "https://openrouter.ai/api/v1", "deepseek/deepseek-v4.1-flash", 8192, 0.6,
+        api_key="synthetic-effort-key", retry_attempts=4, reasoning_control=lambda: number,
+        extra_body={"provider": {"only": ["deepseek"]}},
+    )
+    provider.available = True
+    provider._session = Session([response])
+    with pytest.raises(ProviderRequestError):
+        asyncio.run(provider.generate_chat_completion(MESSAGES))
+    assert len(provider._session.requests) == 1
+    payload = provider._session.requests[0][1]
+    assert type(payload["reasoning"]["effort"]) is int
+    assert payload["reasoning"] == {"enabled": True, "effort": number}
+    assert payload["provider"] == {"only": ["deepseek"]}
+    report = production_handler.get(0).format_report()
+    assert body in report and "synthetic-effort-request" in report
+    assert f'"effort": {number}' in report
+    assert "synthetic-effort-key" not in report and MESSAGES[0]["content"] not in report
+    assert body not in caplog.text
+    assert production_handler.get(1) is None
+    assert provider.deepseek_reasoning_level(provider._endpoints[0]) == number
+
+
 def test_full_http400_body_is_private_with_exact_request_metadata(captured, caplog):
     body = "reason=" + "x" * 300 + "; missing reasoning_content in assistant continuation; END405"
     response = Response(body.encode(), 400, headers={

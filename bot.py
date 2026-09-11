@@ -7813,7 +7813,7 @@ class MaxwellBot(commands.Bot):
                     "` ,help` - show this list\n"
                     f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
                     f"`{self.command_prefix}reasoning [low|high|max|off]` - DeepSeek V4.1 reasoning (admin to change)\n"
-                    f"`{self.command_prefix}effort [1..100]` - report/set exact hosted presets 50/75/100; other values unsupported (admin to change)\n"
+                    f"`{self.command_prefix}effort [1..100]` - report/set exact numeric effort on OpenRouter (admin to change)\n"
                     f"`{self.command_prefix}debug` - loaded model/provider and measured bot reply (admin; reply to select)\n"
                     f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
@@ -8044,8 +8044,12 @@ class MaxwellBot(commands.Bot):
         else:
             code_block = True
             presets = {str(value): key for key, value in DEEPSEEK_REASONING_EFFORTS.items()}
-            level = presets.get(action, "") if numeric else action
-            valid = level in {*DEEPSEEK_REASONING_EFFORTS, "off"}
+            if numeric and transport == "openrouter":
+                level = int(action) if action.isascii() and action.isdecimal() else ""
+                valid = type(level) is int and 1 <= level <= 100
+            else:
+                level = presets.get(action, "") if numeric else action
+                valid = level in {*DEEPSEEK_REASONING_EFFORTS, "off"}
             if not reporting and valid:
                 await asyncio.to_thread(
                     update_deepseek_reasoning,
@@ -8055,7 +8059,7 @@ class MaxwellBot(commands.Bot):
                 self._load_control(force=True)
             effective = provider.deepseek_reasoning_level(provider._endpoints[0])
             requested = self._control.get("deepseek_reasoning", "") or "configured baseline"
-            effort = DEEPSEEK_REASONING_EFFORTS.get(effective)
+            effort = effective if type(effective) is int else DEEPSEEK_REASONING_EFFORTS.get(effective)
             wire_effort = "none" if effective == "off" else effective
             wire = (
                 f"reasoning.enabled={str(effective != 'off').lower()}, reasoning.effort={wire_effort}"
@@ -8066,13 +8070,18 @@ class MaxwellBot(commands.Bot):
                 f"DeepSeek V4.1 Flash ({transport}), primary model\n"
                 f"Requested: {requested}; effective reasoning: {effective}\n"
             )
-            text += (
-                f"Effort: {effort}/100 reference preset (sent as a string tier)\n"
-                if effort is not None else "Effort: inactive\n"
+            effort_format = (
+                " (sent unchanged as an integer)" if type(effective) is int else
+                " reference preset (sent as a string tier)"
             )
+            text += f"Effort: {effort}/100{effort_format}\n" if effort is not None else "Effort: inactive\n"
             text += f"Wire: {wire}\nPer-call overrides (including auxiliary disable) take precedence; other models/fallback unchanged."
             if numeric:
-                text += "\nHosted presets: 50=low, 75=high, 100=max. Arbitrary 1..100 passthrough is unverified; other values are unsupported and never rounded."
+                text += (
+                    "\nOpenRouter: every integer 1..100 is sent unchanged; never rounded or replaced with a tier after rejection."
+                    if transport == "openrouter" else
+                    "\nDirect API presets: 50=low, 75=high, 100=max; other values are unsupported and never rounded."
+                )
             if not reporting and not valid:
                 text = "Unsupported setting; unchanged.\n" + text
                 if not numeric:
