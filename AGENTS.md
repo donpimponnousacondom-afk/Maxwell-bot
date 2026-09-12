@@ -55,6 +55,26 @@ Do not amend/rebase/squash root's or another agent's commits without explicit ap
 - `api/`, `web/`, `docker/Caddyfile`: authenticated API and dashboard.
 - `docker_runtime.py`, `site_server.py`, `scripts/instance.py`, `scripts/migrate_instance.py`, `compose.yaml`: instance ownership, generated backends, operations and migration.
 
+## Discord command readability
+
+- **Dense command reports belong in fenced code blocks.** Status/configuration dumps, diagnostics, key-value reports and plain-text tables must use opening and closing triple backticks on their own lines. Use a plain fence without a language tag for ordinary reports; never put the first data line on the opening-fence line.
+- Reuse `send_command_response(..., code_block=True)` for these reports. It preserves balanced fences when splitting messages, handles embedded backticks and respects Discord's 2,000-character limit including footers. Do not hand-wrap a long report and then split through its fences.
+- Use judgement: short acknowledgements/errors stay plain; deliberately rich help, clickable links and headings can remain outside the block. Single backticks are **inline code**, suitable for individual commands/paths, not a replacement for a multiline fenced report. Do not apply command formatting indiscriminately to conversational replies or model-facing tool results.
+- Test the **actual emitted Discord content**, not only the values inside it: balanced fences, readable line breaks, safe embedded fences, message-length limits and unchanged short replies. Readability is part of command acceptance, not a second pass left for root to discover in Discord. Apply this rule whenever adding or modifying commands.
+
+## Numeric OpenRouter effort
+
+Root explicitly requires **every integer1–100** for DeepSeek **V4.1 Flash** on OpenRouter, regardless of advertised enum schemas. `!effort N` must persist/send the exact JSON integer, including50/75/100; no rounding, tier conversion or silent substitution after rejection. Keep named reasoning commands and unrelated routes/models unchanged. Capture full received rejections for root's support report; local/mock acceptance does not prove the upstream honors the integer. Do not reinstate the old three-preset restriction.
+
+## Private incidents and Discord cleanup
+
+- Automatic runtime-error notices use the single `PUBLIC_ERROR_TEXT` from `error_reporting.py`, with no TPS/TTFT/footer or exception suffix. Keep normal validation/refusal/cancellation semantics and the `error_replies` switch; do not manufacture failures from arbitrary `Error`-looking model/tool text.
+- Retain full useful diagnostics in the identity-global private last-ten incident history. `!error` requires an explicit index 0–9 (0 newest) and current bot-admin authorization. **Diagnostic reports and usage/index/empty-history answers go to the requesting admin's one-to-one DM**, including server invocations; no target override, shared-channel report fallback or new public file/API export. If DM delivery itself fails, only the generic dove notice may be sent at the invocation origin—never diagnostics or files. Long reports may use complete UTF-8 attachments. Known credentials/auth material are redacted without dropping upstream explanations, paths, traces or received error bodies.
+- Keep existing bot/model self-diagnostic tools, log access and model-facing tool feedback. Root knowingly accepts possible model-authored diagnostic quotations; automatic public projection must be safe, not a pretext to disable useful tools or filter arbitrary generated answers. Private report messages must not be automatically ingested into shared memory or dispatched to plugins; intentional admin references/log reads remain usable.
+- `!forward N` is deterministic, admin-only and silent on success. Delete only this bot's own N latest messages in the invoking Discord channel/DM before the invocation; never other authors, another channel or the invocation. Serialize history selection and deletion; do not use model deletion/purge tools. Protect command-owned deletions from plugin side effects.
+- **Discord deletion is not memory deletion.** Never clear, rewrite, re-embed or tombstone existing context, RAG, REM, tool history or bot-owned context caches as part of `!forward`. Preserve the existing model-accessible deletion tools independently.
+- Root explicitly excluded legacy **REM/autonomy audit and status displays** from this rollout because they are not currently used. Leave their existing outputs and stored data alone; do not claim mixed legacy audits were made safe or keep redesigning them. Actual runtime-failure notices still follow the generic-error contract.
+
 ## Documentation rules
 
 `CONTEXT_MEMORY_ANALYSIS.md` and `RELIABILITY_RESEARCH.md` are historical. The portable HTML guides remain reference copies, not live status reports. Prefer current code/tests plus `docs/STATUS.md`; correct stale operational instructions when their behavior changes. Keep historical evidence dated rather than blending it with current claims.

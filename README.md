@@ -262,6 +262,8 @@ Examples below use the normal `,` prefix. Commands follow the configured `COMMAN
 | `,footer on` / `off` / `enable` / `disable` | Yes | Enable or disable per-response Discord footers (on by default) |
 | `,footer format <text>` | Yes | Set the one-line format, at most 300 characters; see below |
 | `,debug` | Yes | Inspect this channel's latest measured bot message; reply to a message to select that exact message |
+| `,error <0–9>` | Yes | Retrieve an identity-global saved incident, always in your one-to-one Discord DM; index required |
+| `,forward <N>` | Yes | Silently delete the bot's last N own messages here from Discord only; stored context is untouched |
 | `,version` | No | Show this process's startup-frozen Git build and start time |
 | `,stop` | No | Cancel the active AI request in this channel (` ,stop job <id>` cancels a background job) |
 | `,bg <goal>` | No | Start a background sub-agent job: instant ack, channel stays free, pings you when done |
@@ -336,6 +338,30 @@ A split reply gets one footer on its last chunk, while every delivered chunk can
 `debug` labels the exact measured message and call. A reply selects only that message in the same channel; an unrecorded reply never falls back to another message. Records are bounded to 1,024 delivered messages in this process, so evicted/pre-restart measurements are unavailable. The new footer/debug/version commands make no model request; their own footer uses unavailable call fields (`—`), never the diagnostic target's measurements. Other static notices do not acquire a model sample.
 
 `version` reports commit, branch, commit date/subject, dirty-at-startup state, process start time and Python version captured once at startup. Both timestamps use UTC (`+00:00`). The entire report, including its enabled footer, is displayed in a code block for readability. Later commits do not change what the running process claims. A source tree without Git metadata reports unknown build fields rather than inventing a package version.
+
+### Private incident reports and Discord-only cleanup
+
+Automatic runtime-failure notices use this exact text, without a TPS/TTFT footer:
+
+> I waited, waited and I am losing things like tears in the rain 🕊️
+
+With `COMMAND_PREFIX=!`:
+
+```text
+!error 0
+!error 9
+!forward 4
+```
+
+`!error` is **bot-admin-only** and requires one explicit index: **0 is newest, 9 oldest**. Bare `!error` returns root's deliberately memorable syntax reminder; out-of-range indices return the 0–9 instructions. The ten incidents are global to this bot identity across servers, channels and DMs, and persist in private `DATA_DIR/error_history.json`. Reports and syntax/empty-history answers always go to the requesting admin's **one-to-one DM**, even when the command is invoked in a server or group. If DM delivery fails, only the generic dove notice may appear at the invocation origin—never a report or attachment. No public API/file export is added.
+
+Reports retain full useful exception chains, received upstream error bodies, provider request parameters/shape and correlation metadata, and actual tool/backend failures. Configured credentials and common authentication material are redacted. Provider request capture omits the raw conversation and Authorization/Cookie request headers; no environment dump is added. Failed tool output can include the logs or message content handled by that operation. Long reports arrive as complete UTF-8 text attachments, split into parts when needed. Old console logs are not imported, previously discarded bodies cannot be reconstructed, and unread transport data cannot be recovered. Unavailable/corrupt incident storage is not silently overwritten; persistence failure has no in-memory fallback.
+
+`error_replies` still controls automatic notices; `error_details` no longer enables public exception details. Existing model log tools and diagnostic feedback remain usable. Private reports are excluded from automatic plugin/shared-memory ingestion, not from intentional admin references or log reads. A model can still choose to quote diagnostics it reads; this is not a filter on generated answers. Legacy REM/autonomy audit/status displays are explicitly outside this rollout and remain unchanged.
+
+`!forward N` is **bot-admin-only**, requires a positive count, and deletes only this bot's latest N own messages in the current Discord channel/DM **before the invocation**. It excludes the invoking command, other authors and all other channels; if fewer own messages remain, it deletes those available. Selection and deletion are serialized per channel, so repeated `!forward 1` calls remove successive messages. Success—including nothing left to remove—is silent. Genuine failures use the dove notice and retain private diagnostics, including partial-batch progress.
+
+This removes Discord messages only: **stored context, RAG, embeddings, REM, tool history and bot-owned context caches are untouched**. Command-owned deletion events do not reach plugins. The existing model-accessible `delete_message`/purge tools remain available, but this command invokes neither them nor the model.
 
 ## Sites
 
@@ -566,10 +592,19 @@ restart. Deps: `python-chess` + `pillow` (already in `requirements.txt`).
 
 ## Usage
 
-The `usage` tool queries the provider quota endpoint (`z3ki.dev/v2/usage`)
-with the API key already in the environment (`OLLAMA_API_KEY`, falling back to
-`OPENAI_COMPAT_API_KEY`), returning remaining percentage and reset times.
-Override the URL with `MAXWELL_USAGE_URL`.
+The `usage` tool reports **OpenRouter spending for the loaded primary chat key**
+through its fixed HTTPS `/api/v1/key` endpoint. The ordinary chat key is sufficient;
+no management/workspace credential is needed. It reports USD credit usage for all
+time and the current UTC day/week/month, the key's spending cap/remaining cap/reset
+schedule, and external BYOK usage separately. These figures cover every caller
+sharing that key—not necessarily Curie alone—and are not workspace balance,
+token counts or cache-hit ratios.
+
+A non-OpenRouter primary returns unavailable without sending its credential.
+Redirects are disabled; key labels, identifiers, raw responses and errors are not
+forwarded to chat. The old z3ki adapter and `MAXWELL_USAGE_URL` override are no
+longer used. Rotating the primary key and restarting updates both inference and
+reporting; the new key's history is separate. See [OpenRouter's current-key API](https://openrouter.ai/docs/api/api-reference/api-keys/get-current-api-key).
 
 ## Memory and RAG
 

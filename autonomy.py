@@ -55,6 +55,7 @@ from typing import Any, ClassVar, cast
 
 import discord
 
+from error_reporting import capture_incident
 from control_defaults import (
     DEFAULT_CONTROL,
 )  # noqa: E402
@@ -1461,6 +1462,10 @@ class AutonomyEngine:
                     }
                 except Exception as e:
                     duration = time.time() - start
+                    capture_incident(
+                        "autonomy.tick", "Autonomy tick failed", exception=e,
+                        context={"tick_started": tick_start_iso, "user_id": str(getattr(getattr(self.bot, "user", None), "id", ""))},
+                    )
                     logger.error(f"Autonomy tick failed: {e}")
                     # Do not advance last_tick on failure — drain_slice would
                     # skip events the failed tick never planned over.
@@ -3595,6 +3600,22 @@ class AutonomyEngine:
         metrics_kwargs = {"response_metrics": metrics} if metrics is not None else {}
         return await self.run_allowed(verdicts, **metrics_kwargs)
 
+    def _capture_action_failure(
+        self, action: dict, result: dict, summary: str,
+        exception: BaseException | None = None, *, details: str = "",
+    ) -> str | None:
+        return capture_incident(
+            "autonomy", summary, exception=exception,
+            details="Action:\n" + json.dumps(action, ensure_ascii=False, default=str)
+            + "\n" + details + "\n" + str(getattr(exception, "text", "") or ""),
+            context={
+                "action": str(action.get("kind", "")), "tool": str(action.get("tool_name", "")),
+                "guild_id": str(result.get("guild_id") or action.get("guild_id") or ""),
+                "channel_id": str(result.get("channel_id") or action.get("target_channel_id") or ""),
+                "user_id": str(action.get("target_user_id") or getattr(getattr(self.bot, "user", None), "id", "")),
+            },
+        )
+
     async def run_allowed(self, verdicts: list[GateVerdict], *, response_metrics=None) -> list[dict]:
         """Execute the actions the gate allowed. One failure doesn't kill the rest.
 
@@ -3662,12 +3683,14 @@ class AutonomyEngine:
                     result["result"] = "skipped"
                     result["error"] = f"unknown kind: {kind}"
             except asyncio.TimeoutError as _exc:
+                self._capture_action_failure(action, result, "Autonomy action timed out", _exc)
                 result["result"] = "error"
                 result["error"] = f"action timed out after {ACTION_TIMEOUT}s"
                 logger.warning(
                     f"Autonomy action {kind} timed out after {ACTION_TIMEOUT}s"
                 )
             except Exception as e:
+                self._capture_action_failure(action, result, "Autonomy action failed", e)
                 result["result"] = "error"
                 result["error"] = str(e)[:1000]
                 logger.error(f"Autonomy action {kind} failed: {e}")
@@ -3720,6 +3743,7 @@ class AutonomyEngine:
             try:
                 user = await self.bot.fetch_user(_safe_int(user_id))
             except (discord.NotFound, discord.HTTPException, ValueError) as e:
+                self._capture_action_failure(action, result, "Autonomy DM user lookup failed", e)
                 result["result"] = "error"
                 result["error"] = f"user not found or API error: {e}"
                 return
@@ -3739,6 +3763,7 @@ class AutonomyEngine:
             try:
                 dm_channel = await user.create_dm()
             except discord.HTTPException as e:
+                self._capture_action_failure(action, result, "Autonomy DM channel creation failed", e)
                 self._unreachable_dm_users[str(user_id)] = time.time()
                 result["result"] = "error"
                 result["error"] = (
@@ -3759,11 +3784,13 @@ class AutonomyEngine:
                         dm_channel, msg, clean, reason=action.get("reason", "")
                     )
         except discord.Forbidden as _exc:
+            self._capture_action_failure(action, result | {"channel_id": str(getattr(dm_channel, "id", ""))}, "Autonomy DM send forbidden", _exc)
             self._unreachable_dm_users[str(user_id)] = time.time()
             result["result"] = "error"
             result["error"] = "user has DMs disabled or blocked the bot"
             return
         except discord.HTTPException as e:
+            self._capture_action_failure(action, result | {"channel_id": str(getattr(dm_channel, "id", ""))}, "Autonomy DM send failed", e)
             result["result"] = "error"
             result["error"] = f"Discord API error sending DM: {e}"
             return
@@ -3787,7 +3814,8 @@ class AutonomyEngine:
         if channel is None:
             try:
                 channel = cast(Any, await self.bot.fetch_channel(_safe_int(channel_id)))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                self._capture_action_failure(action, result, "Autonomy channel lookup failed", e)
                 channel = None
         if channel is None:
             result["result"] = "error"
@@ -3868,9 +3896,11 @@ class AutonomyEngine:
                     self._note_autonomy_post(channel_id, msg.id)
                     await self._remember_visible_self_message(channel, msg, clean, reason=action.get("reason", ""))
         except discord.Forbidden as _exc:
+            self._capture_action_failure(action, result, "Autonomy channel send forbidden", _exc)
             result["result"] = "error"
             result["error"] = "bot lacks permission to send in this channel"
         except discord.HTTPException as e:
+            self._capture_action_failure(action, result, "Autonomy channel send failed", e)
             result["result"] = "error"
             result["error"] = f"Discord API error: {e}"
 
@@ -4166,6 +4196,10 @@ class AutonomyEngine:
         }
         if "target_message_id" in exec_kwargs and "message_id" not in exec_kwargs:
             exec_kwargs["message_id"] = exec_kwargs["target_message_id"]
+        failure_context = result | {
+            "channel_id": str(getattr(channel, "id", "")),
+            "guild_id": str(getattr(guild, "id", "")),
+        }
         try:
             if tool_name in {"send_message", "edit_message"} and response_metrics is not None:
                 tool_result = await tool.execute(syn_msg, _response_metrics=response_metrics, **exec_kwargs)
@@ -4174,9 +4208,14 @@ class AutonomyEngine:
             text = str(tool_result) if tool_result is not None else ""
             # Many tools (especially permission/admin guards) return "Error: ..." strings
             # instead of raising. Treat those as failures for accurate autonomy auditing.
-            if text.lower().startswith("error"):
+            marked_failure = hasattr(tool_result, "incident_id")
+            if marked_failure and not tool_result.incident_id:
+                self._capture_action_failure(action, failure_context, "Autonomy tool returned a failure", details=text)
+            if text.lower().startswith("error") or marked_failure:
                 result["result"] = "error"
                 result["error"] = text[:1000]
+                if marked_failure:
+                    result["tool_output"] = text[:TOOL_OUTPUT_FEEDBACK_CHARS]
             else:
                 result["result"] = "success"
                 if tool_name in AUTONOMY_POST_TOOLS:
@@ -4190,6 +4229,7 @@ class AutonomyEngine:
                 if text:
                     result["tool_output"] = text[:TOOL_OUTPUT_FEEDBACK_CHARS]
         except Exception as e:
+            self._capture_action_failure(action, failure_context, "Autonomy tool execution failed", e)
             result["result"] = "error"
             result["error"] = str(e)[:1000]
 
@@ -4207,6 +4247,7 @@ class AutonomyEngine:
             await memory.add_long_term_memory(content)
             result["tool_called"] = "add_long_term_memory"
         except Exception as e:
+            self._capture_action_failure(action, result, "Autonomy memory update failed", e)
             result["result"] = "error"
             result["error"] = str(e)[:1000]
 

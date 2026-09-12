@@ -302,7 +302,7 @@ def restore(instance: Instance, source: Path) -> None:
         raise ValueError("restore requires a fresh instance without owned containers")
     if any(any((instance.path / root).iterdir()) for root in ROOTS):
         raise ValueError("restore refuses nonempty state directories")
-    with source.open("rb") as archive_file:
+    with source.open("rb", buffering=0) as archive_file:
         with tarfile.open(fileobj=archive_file, mode="r:*") as archive:
             validate_archive(archive, instance.name)
         archive_file.seek(0)

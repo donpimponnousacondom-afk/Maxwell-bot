@@ -27,12 +27,15 @@ from urllib.parse import urljoin, urlparse
 
 from response_observability import (
     DeliveryMeasurements,
+    FOOTER_MARKER,
     capture_running_build,
     clean_message_content,
     footer_template_error,
     format_debug,
     format_runtime_provider,
+    latest_delivered_footer,
     prepare_delivery,
+    record_delivered_footer,
     record_delivery,
     send_command_response,
     send_measured,
@@ -275,6 +278,7 @@ from bot_tools import (  # noqa: E402 - voice_recv monkey patch must run before 
     AuditLogTool,
     ListSitesTool,
     GuideTool,
+    ToolFailure,
     LookupUserTool,
     ManagePluginTool,
     MoreToolsTool,
@@ -327,6 +331,22 @@ from captcha_solver import (  # noqa: E402
     build_solver,
 )
 from config import Config  # noqa: E402
+from error_reporting import (  # noqa: E402
+    PUBLIC_ERROR_TEXT,
+    IncidentLoggingHandler,
+    capture_incident,
+    configure_incident_store,
+    incident_context,
+)
+from operator_commands import (  # noqa: E402
+    PRIVATE_ERROR_REPORT_MARKER,
+    handle_error_command,
+    handle_forward_command,
+    ignore_operator_message,
+    is_private_error_report,
+    is_operator_command,
+    send_public_error,
+)
 from prompt_storage import PromptStorageError, get_prompt_store  # noqa: E402
 from context_budget import (  # noqa: E402
     BudgetPlan,
@@ -337,8 +357,10 @@ from context_budget import (  # noqa: E402
 from control_defaults import (  # noqa: E402
     DEAD_CONTROL_KEYS,
     DEFAULT_CONTROL,
+    DEEPSEEK_REASONING_EFFORTS,
     KNOWN_TOOLS,
     parse_bool,
+    update_deepseek_reasoning,
 )
 import guild_onboarding  # noqa: E402
 from email_inbox import EmailInboxPoller  # noqa: E402
@@ -354,6 +376,7 @@ from providers import (  # noqa: E402
     OllamaProvider,
     ProviderEmptyResponseError,
     ProviderUsageExhaustedError,
+    deepseek_reasoning_transport,
 )
 from rag_memory import RAGMemoryManager, RemEventLog, _parse_iso  # noqa: E402
 from jobs import BackgroundJobManager, SpawnBackgroundTool  # noqa: E402
@@ -366,7 +389,7 @@ from tool_registry import (  # noqa: E402 — reasoning now rides inside tool ca
 import site_backend  # noqa: E402
 import site_server  # noqa: E402
 import site_test  # noqa: E402
-from plugin_manager import PluginManager  # noqa: E402
+from plugin_manager import PluginManager, PluginReloadFailure  # noqa: E402
 from tool_schemas import (  # noqa: E402
     CHAT_CORE_TOOL_NAMES,
     RESULT_TOOL_NAMES,
@@ -2920,6 +2943,24 @@ class MaxwellBot(commands.Bot):
             except Exception as e:
                 # validate() below fails loudly if the dir is truly unusable.
                 logger.warning("Could not pre-create %s: %s", gf_data, e)
+        credential_names = (
+            "DISCORD_TOKEN", "GF_DISCORD_TOKEN", "TELEGRAM_TOKEN",
+            "OLLAMA_API_KEY", "OPENAI_COMPAT_API_KEY", "OLLAMA_FALLBACK_API_KEY",
+            "OLLAMA_VISION_API_KEY", "EMBED_API_KEY", "AUTONOMY_API_KEY", "AUX_API_KEY",
+            "CAPTCHA_SOLVER_API_KEY", "IMAGE_GEN_API_KEY", "NVIDIA_API_KEY",
+            "GPT_IMAGE_API_KEY", "GEMINI_IMAGE_API_KEY", "MAXWELL_EMAIL_PASSWORD",
+            "X_AUTH_TOKEN", "X_CT0", "X_API_KEY", "MAXWELL_ADMIN_PASSWORD",
+        )
+        credentials = [getattr(self.config, name, "") or "" for name in credential_names]
+        credentials.extend(os.getenv(name, "") for name in (
+            "FISH_API_KEY", "TELEGRAM_WEBHOOK_SECRET", "TELEGRAM_WEBHOOK_PATH_SECRET",
+        ))
+        configure_incident_store(Path(self.config.DATA_DIR) / "error_history.json", secrets=credentials)
+        root_logger = logging.getLogger()
+        if not any(isinstance(handler, IncidentLoggingHandler) for handler in root_logger.handlers):
+            root_logger.addHandler(IncidentLoggingHandler())
+        self._forward_locks: dict[str, asyncio.Lock] = {}
+        self._forward_delete_ids: set[int] = set()
         self.config.validate()
         if self.config.MAXWELL_PROMPTS_DIR:
             get_prompt_store(
@@ -3408,6 +3449,7 @@ class MaxwellBot(commands.Bot):
             api_key=self.config.OLLAMA_API_KEY,
             extra_headers=self.config.OLLAMA_EXTRA_HEADERS,
             extra_body=self.config.OLLAMA_EXTRA_BODY,
+            reasoning_control=lambda: self._control.get("deepseek_reasoning", ""),
             disable_reasoning=self.config.OLLAMA_DISABLE_REASONING,
             fallback_base_url=self.config.OLLAMA_FALLBACK_BASE_URL,
             fallback_model=self.config.OLLAMA_FALLBACK_MODEL,
@@ -4088,6 +4130,8 @@ class MaxwellBot(commands.Bot):
         which carried guild_id. This wrapper is the single point of
         truth now.
         """
+        if ignore_operator_message(self, message):
+            return
         enriched = dict(message_dict)
         enriched.update(self._mem_kwargs(message))
         await self.memory.add_to_channel_memory(channel_id, enriched)
@@ -4520,7 +4564,7 @@ class MaxwellBot(commands.Bot):
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         rendered = render_discord_context_text(
             parent,
-            clean_message_content(self, parent),
+            str(getattr(parent, "content", "") or "").replace(FOOTER_MARKER, ""),
             known_users=(getattr(self, "_recent_users", None) or {}).get(
                 channel_id, {}
             ),
@@ -5602,6 +5646,10 @@ class MaxwellBot(commands.Bot):
                 logger.warning(f"Discord state snapshot error: {e}")
 
     def _dispatch_plugin_event(self, event: str, *args: Any, **kwargs: Any) -> None:
+        if event in {"on_message", "on_message_edit", "on_message_delete"} and any(
+            ignore_operator_message(self, message) for message in args
+        ):
+            return
         pm = getattr(self, "plugin_manager", None)
         if pm is None:
             return
@@ -6395,7 +6443,7 @@ class MaxwellBot(commands.Bot):
 
     async def _refresh_edited_message(self, message, *, before=None) -> bool:
         """Refresh memory/media for MESSAGE_UPDATE, never dispatch a reply."""
-        if message is None:
+        if message is None or ignore_operator_message(self, message):
             return False
         snapshots = getattr(self, "_message_snapshots", None)
         if snapshots is None:
@@ -6430,6 +6478,8 @@ class MaxwellBot(commands.Bot):
 
         channel_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
         author = getattr(message, "author", None)
+        if MaxwellBot._author_is_self(self, message):
+            record_delivered_footer(self, message.channel, message, replace=True)
         update_users = getattr(self, "_update_recent_users", None)
         if author is not None:
             if callable(update_users):
@@ -6530,6 +6580,8 @@ class MaxwellBot(commands.Bot):
 
     async def on_message_edit(self, before, after):
         """Keep transcript/visual context current without answering the edit."""
+        if ignore_operator_message(self, before) or ignore_operator_message(self, after):
+            return
         self._dispatch_plugin_event("on_message_edit", before, after)
         try:
             loader = getattr(self, "_load_control", None)
@@ -6544,13 +6596,15 @@ class MaxwellBot(commands.Bot):
 
     async def on_raw_message_edit(self, payload):
         """Handle embeds for messages not present in discord.py's cache."""
+        if ignore_operator_message(self, getattr(payload, "cached_message", None)):
+            return
         try:
             loader = getattr(self, "_load_control", None)
             if callable(loader) and getattr(self, "config", None) is not None:
                 with contextlib.suppress(Exception):
                     loader()
             message = await self._message_from_raw_update(payload)
-            if message is not None:
+            if message is not None and not ignore_operator_message(self, message):
                 await self._refresh_edited_message(message)
         except asyncio.CancelledError:
             raise
@@ -6566,32 +6620,43 @@ class MaxwellBot(commands.Bot):
         never answered. It also had no dedup, so a gateway resume that
         redelivered MESSAGE_CREATE produced a second full reply.
         """
-        self._dispatch_plugin_event("on_message", message)
+        own_id = getattr(getattr(self, "user", None), "id", None)
+        if is_private_error_report(message, own_id):
+            return
+        if not is_operator_command(message, getattr(self, "command_prefix", ","), own_id):
+            self._dispatch_plugin_event("on_message", message)
         message_id = getattr(message, "id", None)
-        try:
-            if not self._inbound_dedup.check_and_add(message_id):
-                logger.debug("Duplicate MESSAGE_CREATE %s ignored", message_id)
-                return
-            # Record how far this room has been read BEFORE doing any work, so
-            # a crash mid-handler does not make the reconnect replay it.
-            with contextlib.suppress(Exception):
-                self._watermarks.note(
-                    getattr(getattr(message, "channel", None), "id", ""),
+        with incident_context(
+            source="discord", channel=str(getattr(getattr(message, "channel", None), "id", "")),
+            guild=str(getattr(getattr(message, "guild", None), "id", "DM")),
+            user=str(getattr(getattr(message, "author", None), "id", "")), message=str(message_id),
+        ):
+            try:
+                if not self._inbound_dedup.check_and_add(message_id):
+                    logger.debug("Duplicate MESSAGE_CREATE %s ignored", message_id)
+                    return
+                # Record how far this room has been read BEFORE doing any work, so
+                # a crash mid-handler does not make the reconnect replay it.
+                with contextlib.suppress(Exception):
+                    self._watermarks.note(
+                        getattr(getattr(message, "channel", None), "id", ""),
+                        message_id,
+                    )
+                await self._on_message_impl(message)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A single malformed message must not be able to take the handler
+                # down silently. The id is logged so the message can be found.
+                logger.exception(
+                    "on_message failed for %s in %s",
                     message_id,
+                    getattr(getattr(message, "channel", None), "id", "?"),
                 )
-            await self._on_message_impl(message)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A single malformed message must not be able to take the handler
-            # down silently. The id is logged so the message can be found.
-            logger.exception(
-                "on_message failed for %s in %s",
-                message_id,
-                getattr(getattr(message, "channel", None), "id", "?"),
-            )
 
     async def _on_message_impl(self, message):
+        if is_private_error_report(message, getattr(getattr(self, "user", None), "id", None)):
+            return
         try:
             self._load_control()
         except Exception as e:
@@ -6694,6 +6759,7 @@ class MaxwellBot(commands.Bot):
             self._update_recent_users(channel_id, u)
 
         if self.user and message.author.id == self.user.id:
+            record_delivered_footer(self, message.channel, message, replace=True)
             if (
                 message.content or has_attachment or has_embed or has_sticker
             ) and self._control.get("store_memory", True):
@@ -7277,6 +7343,8 @@ class MaxwellBot(commands.Bot):
             "solo",
             "x",
             "debug",
+            "error",
+            "forward",
         }
         if cmd in admin_commands and not self._is_admin(message.author.id):
             await message.channel.send("not authorized")
@@ -7284,7 +7352,11 @@ class MaxwellBot(commands.Bot):
         server_id = str(message.guild.id) if message.guild else "DM"
         channel_id = str(message.channel.id)
         try:
-            if cmd == "stop":
+            if cmd == "error":
+                await handle_error_command(self, message, args)
+            elif cmd == "forward":
+                await handle_forward_command(self, message, args)
+            elif cmd == "stop":
                 # ",stop job <id>" cancels a background job instead of the live turn.
                 _stop_args = (args or "").strip().split()
                 if len(_stop_args) >= 2 and _stop_args[0].lower() == "job":
@@ -7351,8 +7423,9 @@ class MaxwellBot(commands.Bot):
                             _task = _spawn_background(_run_bg(self, _job.id))
                             self.bg_jobs.track_task(_job.id, _task)
                         except RuntimeError as _exc:
+                            logger.error("Could not launch background job: %s", _exc)
                             self.bg_jobs.mark(_job.id, status="error", progress=str(_exc)[:200])
-                            await message.channel.send(f"could not launch job: {_exc}")
+                            await send_public_error(self, message.channel)
                         else:
                             await message.channel.send(
                                 f"on it — job `{_job.id}`, I'll ping you when it's done"
@@ -7381,7 +7454,6 @@ class MaxwellBot(commands.Bot):
                     else:
                         await message.channel.send(
                             f"`{_job.id}` [{_job.status}] {_job.goal[:200]}"
-                            + (f"\n{_job.progress[:500]}" if _job.progress else "")
                         )
             elif cmd == "prompt":
                 if args is None:
@@ -7706,13 +7778,18 @@ class MaxwellBot(commands.Bot):
                 tool = self.tools.get("guide")
                 if tool:
                     res = await tool.execute(message, goal=goal)
-                    await message.channel.send(res[:1900])
+                    if isinstance(res, ToolFailure):
+                        await send_public_error(self, message.channel)
+                    else:
+                        await message.channel.send(res[:1900])
                 else:
                     await message.channel.send(
                         "Guide tool not available (ENABLE_CREATE_SITE off)."
                     )
             elif cmd == "solo":
                 await self._handle_solo_command(message, args)
+            elif cmd in {"reasoning", "effort"}:
+                await self._handle_reasoning_command(message, args, numeric=cmd == "effort")
             elif cmd == "footer":
                 await self._handle_footer_command(message, args)
             elif cmd == "debug":
@@ -7733,11 +7810,16 @@ class MaxwellBot(commands.Bot):
             elif cmd == "version":
                 await send_command_response(self, message.channel, self._running_build.format(), allowed_mentions=discord.AllowedMentions.none(), code_block=True)
             elif cmd == "help":
-                await message.channel.send(
+                await send_command_response(
+                    self, message.channel,
                     "Commands:\n"
+                    f"`{self.command_prefix}error 0..9` - private incident report in your DM (admin)\n"
+                    f"`{self.command_prefix}forward N` - delete my last N posts here; memory unchanged (admin)\n"
                     "` ,guide [goal]` / `,guided-goal [goal]` - create a thread and ask 5 clarifying questions before building (use when request is vague)\n"
                     "` ,help` - show this list\n"
                     f"`{self.command_prefix}footer on|off|format <text>|status` - response footer (admin to change)\n"
+                    f"`{self.command_prefix}reasoning [low|high|max|off]` - DeepSeek V4.1 reasoning (admin to change)\n"
+                    f"`{self.command_prefix}effort [1..100]` - report/set exact numeric effort on OpenRouter (admin to change)\n"
                     f"`{self.command_prefix}debug` - loaded model/provider and measured bot reply (admin; reply to select)\n"
                     f"`{self.command_prefix}version` - frozen running build\n"
                     "` ,stop` - stop active response in this channel\n"
@@ -7758,7 +7840,8 @@ class MaxwellBot(commands.Bot):
                     "` ,admin [@user|user_id|clear]` - add/remove/list admins (admin). Promoted users can log into the dashboard at /admin via 'Continue with Discord'."
                     "` ,shell [@user|clear]` - shell whitelist (admin)\n"
                     "` ,confirm` - authorize one destructive tool call on a tainted turn\n"
-                    "` ,blacklist [@user|clear]` / `,unblacklist @user` - blacklist controls (admin)\n"
+                    "` ,blacklist [@user|clear]` / `,unblacklist @user` - blacklist controls (admin)\n",
+                    allowed_mentions=discord.AllowedMentions.none(), unmeasured=False,
                 )
             elif cmd == "x":
                 await self._handle_x_command(message, args)
@@ -7873,7 +7956,10 @@ class MaxwellBot(commands.Bot):
                         )
                         return
                     res = pm.reload_plugins()
-                    await message.channel.send(res)
+                    if isinstance(res, PluginReloadFailure):
+                        await send_public_error(self, message.channel)
+                    else:
+                        await message.channel.send(res)
                 else:
                     await message.channel.send(
                         "Usage: `,plugin <list|enable|disable|reload> [plugin_name] [--global]`"
@@ -7938,16 +8024,79 @@ class MaxwellBot(commands.Bot):
                     )
                     await message.channel.send(f"Unblacklisted {label}")
         except discord.Forbidden as _exc:
-            pass
+            logger.warning("Command Discord operation forbidden: %s", _exc)
+            with contextlib.suppress(discord.HTTPException):
+                await send_public_error(self, message.channel)
         except PromptStorageError as exc:
             logger.error("Prompt command failed: %s", exc)
-            await message.channel.send(f"Prompt update failed: {exc}")
+            await send_public_error(self, message.channel)
         except Exception as e:
             logger.error(
                 f"Command handling error for ,{cmd}: {e}\n{traceback.format_exc()}"
             )
             with contextlib.suppress(discord.Forbidden):
-                await message.channel.send("Something went wrong with that command.")
+                await send_public_error(self, message.channel)
+
+    async def _handle_reasoning_command(self, message, args, numeric: bool = False):
+        action = (args or "").strip().lower()
+        reporting = action in {"", "status"}
+        provider = self.ai_provider
+        transport = deepseek_reasoning_transport(provider.base_url, provider.model)
+        code_block = False
+        if not reporting and not self._is_admin(message.author.id):
+            text = "not authorized"
+        elif not transport:
+            text = "These controls are verified only for DeepSeek V4.1 Flash on OpenRouter or the official DeepSeek API. Current model unchanged."
+        else:
+            code_block = True
+            presets = {str(value): key for key, value in DEEPSEEK_REASONING_EFFORTS.items()}
+            if numeric and transport == "openrouter":
+                level = int(action) if action.isascii() and action.isdecimal() else ""
+                valid = type(level) is int and 1 <= level <= 100
+            else:
+                level = presets.get(action, "") if numeric else action
+                valid = level in {*DEEPSEEK_REASONING_EFFORTS, "off"}
+            if not reporting and valid:
+                await asyncio.to_thread(
+                    update_deepseek_reasoning,
+                    Path(self.config.DATA_DIR) / "bot_control.json",
+                    level,
+                )
+                self._load_control(force=True)
+            effective = provider.deepseek_reasoning_level(provider._endpoints[0])
+            requested = self._control.get("deepseek_reasoning", "") or "configured baseline"
+            effort = effective if type(effective) is int else DEEPSEEK_REASONING_EFFORTS.get(effective)
+            wire_effort = "none" if effective == "off" else effective
+            wire = (
+                f"reasoning.enabled={str(effective != 'off').lower()}, reasoning.effort={wire_effort}"
+                if transport == "openrouter"
+                else f"thinking.type={'disabled' if effective == 'off' else 'enabled'}, reasoning_effort={wire_effort}"
+            )
+            text = (
+                f"DeepSeek V4.1 Flash ({transport}), primary model\n"
+                f"Requested: {requested}; effective reasoning: {effective}\n"
+            )
+            effort_format = (
+                " (sent unchanged as an integer)" if type(effective) is int else
+                " reference preset (sent as a string tier)"
+            )
+            text += f"Effort: {effort}/100{effort_format}\n" if effort is not None else "Effort: inactive\n"
+            text += f"Wire: {wire}\nPer-call overrides (including auxiliary disable) take precedence; other models/fallback unchanged."
+            if numeric:
+                text += (
+                    "\nOpenRouter: every integer 1..100 is sent unchanged; never rounded or replaced with a tier after rejection."
+                    if transport == "openrouter" else
+                    "\nDirect API presets: 50=low, 75=high, 100=max; other values are unsupported and never rounded."
+                )
+            if not reporting and not valid:
+                text = "Unsupported setting; unchanged.\n" + text
+                if not numeric:
+                    text += f"\nUsage: {self.command_prefix}reasoning [low|high|max|off]"
+        await send_command_response(
+            self, message.channel, text,
+            allowed_mentions=discord.AllowedMentions.none(),
+            code_block=code_block, unmeasured=False,
+        )
 
     async def _handle_footer_command(self, message, args):
         parts = (args or "status").split(maxsplit=1)
@@ -7979,7 +8128,11 @@ class MaxwellBot(commands.Bot):
                 self._load_control(force=True)
         else:
             text = f"usage: `{self.command_prefix}footer on|off|enable|disable|format <text>|status`"
-        await send_command_response(self, message.channel, text, allowed_mentions=discord.AllowedMentions.none())
+        await send_command_response(
+            self, message.channel, text,
+            allowed_mentions=discord.AllowedMentions.none(),
+            code_block=action in {"status", ""},
+        )
 
     async def _handle_solo_command(self, message, args):
         """`,solo` — lock a server to one channel, or unlock it.
@@ -8101,9 +8254,12 @@ class MaxwellBot(commands.Bot):
         try:
             if sub in {"status", ""}:
                 budget = await client.budget.check()
-                await message.channel.send(
+                await send_command_response(
+                    self, message.channel,
                     f"X: {client.status()}\n"
-                    + (f"budget: {budget}" if budget else "budget: room to post")
+                    + (f"budget: {budget}" if budget else "budget: room to post"),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    code_block=True, unmeasured=False,
                 )
             elif sub == "budget":
                 blocked = await client.budget.check()
@@ -8136,9 +8292,11 @@ class MaxwellBot(commands.Bot):
                     "| `,x tweet <id|url>` | `,x post <text>` | `,x budget`"
                 )
         except XError as e:
-            await message.channel.send(f"X error: {e}"[:1900])
+            capture_incident("discord.x", "X command failed", exception=e)
+            await send_public_error(self, message.channel)
         except Exception as e:  # pragma: no cover - defensive
-            await message.channel.send(f"X failed: {type(e).__name__}: {e}"[:1900])
+            capture_incident("discord.x", "X command failed", exception=e)
+            await send_public_error(self, message.channel)
 
     async def _handle_vc_command(self, message, args: str | None):
         if not getattr(self.config, "ENABLE_VC", True):
@@ -8165,15 +8323,24 @@ class MaxwellBot(commands.Bot):
             chan = getattr(getattr(vc, "channel", None), "name", None) or str(
                 getattr(getattr(vc, "channel", None), "id", "none")
             )
-            await message.channel.send(
-                f"connected: **{connected}** | channel: **{chan}** | listening: **{listening}** | reply_mode: **{self._control.get('vc_reply_mode', 'voice')}** | response_mode: **{self._control.get('vc_response_mode', 'addressed')}** | rms: **{self._control.get('vc_rms_threshold', 500)}** | pause: **{self._control.get('vc_pause_seconds', 0.9)}s**"
+            await send_command_response(
+                self, message.channel,
+                f"connected: {connected}\nchannel: {chan}\nlistening: {listening}\n"
+                f"reply_mode: {self._control.get('vc_reply_mode', 'voice')}\n"
+                f"response_mode: {self._control.get('vc_response_mode', 'addressed')}\n"
+                f"rms: {self._control.get('vc_rms_threshold', 500)}\n"
+                f"pause: {self._control.get('vc_pause_seconds', 0.9)}s",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if sub == "join":
             if voice_recv is None or LiveSpeechSink is None:
-                await message.channel.send(
-                    f"voice receive module missing or failed to import. install requirements (`pip install -r requirements.txt`) and retry. error: {_voice_recv_import_error}"
+                capture_incident(
+                    "discord.vc", "Voice receive module unavailable", exception=_voice_recv_import_error,
+                    details="voice_recv or LiveSpeechSink is unavailable.",
                 )
+                await send_public_error(self, message.channel)
                 return
             if not target_channel:
                 await message.channel.send("join a voice channel first")
@@ -8188,13 +8355,12 @@ class MaxwellBot(commands.Bot):
                 else:
                     vc = await self._vc_connect_channel(target_channel)
                 if not hasattr(vc, "listen"):
-                    await message.channel.send(
-                        "joined voice, but this connection does not support receive/listen"
-                    )
+                    capture_incident("discord.vc", "Voice connection does not support receive/listen")
+                    await send_public_error(self, message.channel)
                     return
             except (RuntimeError, TypeError, discord.ClientException) as e:
                 logger.exception("Voice channel join failed")
-                await message.channel.send(f"couldn't join voice: {e}")
+                await send_public_error(self, message.channel)
                 return
             try:
                 listening = await self._vc_start_listening(
@@ -8205,9 +8371,7 @@ class MaxwellBot(commands.Bot):
                 )
             except Exception as e:
                 logger.exception("Voice listening start failed")
-                await message.channel.send(
-                    f"joined **{getattr(target_channel, 'name', target_channel.id)}** | listening failed: {e}"
-                )
+                await send_public_error(self, message.channel)
             return
         if sub == "leave":
             vc = self._vc_get_client(message.guild, target_channel)
@@ -8220,15 +8384,17 @@ class MaxwellBot(commands.Bot):
                     await message.channel.send("left voice channel")
                 except Exception as e:
                     logger.warning(f"Voice disconnect failed: {e}")
-                    await message.channel.send(f"failed to leave voice: {e}")
+                    await send_public_error(self, message.channel)
             else:
                 await message.channel.send("not connected")
             return
         if sub == "listen":
             if voice_recv is None or LiveSpeechSink is None:
-                await message.channel.send(
-                    f"voice receive module missing or failed to import. install requirements (`pip install -r requirements.txt`) and retry. error: {_voice_recv_import_error}"
+                capture_incident(
+                    "discord.vc", "Voice receive module unavailable", exception=_voice_recv_import_error,
+                    details="voice_recv or LiveSpeechSink is unavailable.",
                 )
+                await send_public_error(self, message.channel)
                 return
             vc = self._vc_get_client(message.guild, target_channel)
             if not vc or not vc.is_connected():
@@ -8245,7 +8411,7 @@ class MaxwellBot(commands.Bot):
                 )
             except Exception as e:
                 logger.exception("Voice listen failed")
-                await message.channel.send(f"failed to start listening: {e}")
+                await send_public_error(self, message.channel)
             return
         if sub == "unlisten":
             await self._vc_stop_listening(
@@ -8293,10 +8459,10 @@ class MaxwellBot(commands.Bot):
                     await asyncio.wait_for(done.wait(), timeout=90)
             except asyncio.TimeoutError as _exc:
                 logger.warning("VC TTS playback timed out")
-                await message.channel.send("TTS playback timed out.")
+                await send_public_error(self, message.channel)
             except Exception as e:
                 logger.warning(f"VC TTS say failed: {e}")
-                await message.channel.send(f"failed to speak: {e}")
+                await send_public_error(self, message.channel)
             return
         await message.channel.send("unknown vc command. try `,vc help`")
 
@@ -8901,8 +9067,11 @@ class MaxwellBot(commands.Bot):
                 f"{e.get('content')}"
                 for e in entries[:20]
             )
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
 
         if not arg:
             entries = await self.memory.get_relevant_shared_context(
@@ -9004,7 +9173,7 @@ class MaxwellBot(commands.Bot):
             )
         )
         ref_content = render_discord_context_text(
-            ref, clean_message_content(self, ref), known_users=self._recent_users.get(ch_id, {})
+            ref, str(getattr(ref, "content", "") or "").replace(FOOTER_MARKER, ""), known_users=self._recent_users.get(ch_id, {})
         )
         if ref.attachments:
             ref_content = (ref_content + " [media attached]").strip()
@@ -9379,13 +9548,14 @@ class MaxwellBot(commands.Bot):
             + summary
             + "\nSolve it here (expires in ~2 min): "
             + url
+            + "\n" + PRIVATE_ERROR_REPORT_MARKER
         )
         for uid in self._captcha_recipient_ids():
             try:
                 user = await self._captcha_resolve_user(uid)
                 if user is None:
                     continue
-                await user.send(msg)
+                await user.send(msg, allowed_mentions=discord.AllowedMentions.none())
             except Exception as e:
                 logger.warning("captcha DM to %s failed: %s", uid, e)
 
@@ -9646,6 +9816,8 @@ class MaxwellBot(commands.Bot):
         self._dispatch_plugin_event("on_presence_update", before, after)
 
     async def on_message_delete(self, message):
+        if message.id in getattr(self, "_forward_delete_ids", ()):
+            return
         self._dispatch_plugin_event("on_message_delete", message)
 
     async def on_guild_channel_create(self, channel):
@@ -9885,21 +10057,27 @@ class MaxwellBot(commands.Bot):
         arg = (args or "").strip().lower()
         if not arg:
             status = await self._rem_status()
-            await message.channel.send(
+            await send_command_response(
+                self, message.channel,
                 "REM status\n"
                 f"enabled: {status['enabled']} running: {status['running']}\n"
                 f"interval: {status['interval_s']}s model: {status['model']}\n"
                 f"last run: {status['last_run'] or 'never'} events: {status['events_buffered']}\n"
-                f"audit: {status['last_audit_preview'] or '-'}"
+                f"audit: {status['last_audit_preview'] or '-'}",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if arg == "now":
             ok, reason, run = await self._run_rem_once_guarded()
-            await message.channel.send(
-                f"REM done: {(run or {}).get('audit', reason)[:1500]}"
-                if ok
-                else f"REM not started: {reason}"
-            )
+            if not ok and reason != "REM is already running":
+                await send_public_error(self, message.channel)
+            else:
+                await message.channel.send(
+                    f"REM done: {(run or {}).get('audit', reason)[:1500]}"
+                    if ok
+                    else f"REM not started: {reason}"
+                )
             return
         if arg == "on":
             self.rem_enabled = True
@@ -9925,8 +10103,11 @@ class MaxwellBot(commands.Bot):
                 f"{r.get('ts', '?')} turns={r.get('turns_used', 0)} events={r.get('events', 0)} {str(r.get('audit', ''))[:500]}"
                 for r in runs
             ]
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
             return
         if arg == "fix":
             enabled = self.rem_enabled
@@ -9969,7 +10150,8 @@ class MaxwellBot(commands.Bot):
                     floor_line += " (enforcement OFF)"
             except Exception:
                 floor_line = "floor: unavailable"
-            await message.channel.send(
+            await send_command_response(
+                self, message.channel,
                 "Autonomy status\n"
                 f"enabled: {enabled} interval: {interval}s\n"
                 f"last tick: {last_tick or 'never'}\n"
@@ -9978,7 +10160,9 @@ class MaxwellBot(commands.Bot):
                 f"{floor_line}\n"
                 f"last reflection: {last_reflect}\n"
                 f"blacklists — channels: {', '.join(ab_ch) or '(none)'} servers: {', '.join(ab_sv) or '(none)'}\n"
-                f"thought: {thought}"
+                f"thought: {thought}",
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
             )
             return
         if arg == "on":
@@ -10011,7 +10195,7 @@ class MaxwellBot(commands.Bot):
                     "Tick skipped — previous tick still running."
                 )
             elif tick_result.get("error"):
-                await message.channel.send(f"Tick error: {tick_result['error'][:500]}")
+                await send_public_error(self, message.channel)
             else:
                 await message.channel.send(
                     f"Tick done: {tick_result.get('actions', 0)} actions in {tick_result.get('duration', 0):.1f}s"
@@ -10028,8 +10212,11 @@ class MaxwellBot(commands.Bot):
                 f"{e.get('content_summary', '')[:80]} -> {e.get('result', '?')}"
                 for e in recent
             ]
-            for chunk in self._split_response("\n".join(lines), limit=1900):
-                await message.channel.send(chunk)
+            await send_command_response(
+                self, message.channel, "\n".join(lines),
+                allowed_mentions=discord.AllowedMentions.none(),
+                code_block=True, unmeasured=False,
+            )
             return
         if arg.startswith("interval"):
             parts = arg.split()
@@ -10134,6 +10321,8 @@ class MaxwellBot(commands.Bot):
         return " ".join(p for p in parts if p).strip()
 
     async def _record_rem_event(self, message, role: str, content: str | None = None):
+        if ignore_operator_message(self, message):
+            return
         try:
             msg_id = getattr(message, "id", None)
             if msg_id and role == "user":
@@ -14199,11 +14388,14 @@ class MaxwellBot(commands.Bot):
                 gen_progress = None
             if (not response or not str(response).strip()) and not native_calls:
                 logger.warning(f"Empty response from provider for channel {channel_id}")
+                capture_incident(
+                    "discord.provider", "Provider returned no usable output",
+                    details="Provider result had neither visible text nor native tool calls.",
+                    context={"channel": channel_id, "message": str(message.id)},
+                )
                 if self._control.get("error_replies", True):
                     try:
-                        await message.channel.send(
-                            "couldn't generate a response — try rephrasing or try again."
-                        )
+                        await send_public_error(self, message.channel)
                         normal_reply_sent = True
                     except discord.Forbidden as _exc:
                         pass
@@ -14703,7 +14895,7 @@ class MaxwellBot(commands.Bot):
             logger.warning(f"Provider usage exhausted while handling message: {e}")
             if self._control.get("error_replies", True):
                 try:
-                    await message.channel.send(e.user_message)
+                    await send_public_error(self, message.channel)
                     normal_reply_sent = True
                 except discord.Forbidden as _exc:
                     pass
@@ -14711,27 +14903,15 @@ class MaxwellBot(commands.Bot):
             logger.warning("Provider returned no usable response: %s", e)
             if self._control.get("error_replies", True):
                 try:
-                    await message.channel.send(e.user_message)
+                    await send_public_error(self, message.channel)
                     normal_reply_sent = True
                 except discord.Forbidden as _exc:
                     pass
         except Exception as e:
-            is_timeout = isinstance(e, asyncio.TimeoutError) or (
-                isinstance(e, RuntimeError) and "timed out" in str(e).lower()
-            )
             logger.error(f"Error handling message: {e}\n{traceback.format_exc()}")
             if self._control.get("error_replies", True):
                 try:
-                    if is_timeout:
-                        await message.channel.send(
-                            "timed out waiting for a response (10 min). try again or break the task into smaller pieces."
-                        )
-                    elif self._control.get("error_details", True):
-                        await message.channel.send(
-                            f"something broke — {_format_user_error(e)}"
-                        )
-                    else:
-                        await message.channel.send("Sorry, please try again.")
+                    await send_public_error(self, message.channel)
                     normal_reply_sent = True
                 except discord.Forbidden as _exc:
                     pass
@@ -17258,6 +17438,9 @@ class MaxwellBot(commands.Bot):
                 + f". Mentions Dame Curie: {'yes' if mentions_maxwell else 'no'}."
             )
         user_parts.extend(self._reply_parent_context_lines(message))
+        delivered_footer = latest_delivered_footer(self, channel_id)
+        if delivered_footer:
+            user_parts.append(delivered_footer)
         if media_summary:
             user_parts.append(media_summary)
         elif has_media:
@@ -17427,35 +17610,35 @@ class MaxwellBot(commands.Bot):
         self, message, chat_id, text, user_name, user_id, session, url_base
     ):
         """Shared Telegram message processing for both polling and webhook modes."""
-        try:
-            await self._process_telegram_message_inner(
-                message, chat_id, text, user_name, user_id, session, url_base
-            )
-        except asyncio.CancelledError as _exc:
-            raise
-        except Exception as e:
-            logger.error(
-                f"Telegram message processing failed: {e}\n{traceback.format_exc()}"
-            )
-            # The polling loop used to own this apology; now that both
-            # transports funnel through here, it lives with the handler that
-            # actually knows the failure happened.
-            if self._control.get("error_replies", True) and chat_id:
-                with contextlib.suppress(Exception):
-                    await TelegramMessageAdapter(
-                        session,
-                        url_base,
-                        chat_id,
-                        (message or {}).get("message_id")
-                        if isinstance(message, dict)
-                        else None,
-                        user_id,
-                        user_name,
-                    ).reply(
-                        f"something broke — {_format_user_error(e)}"
-                        if self._control.get("error_details", True)
-                        else "Sorry, please try again."
-                    )
+        with incident_context(
+            source="telegram", channel=str(chat_id), user=str(user_id), guild="DM",
+            message=str(message.get("message_id", "")) if isinstance(message, dict) else "",
+        ):
+            try:
+                await self._process_telegram_message_inner(
+                    message, chat_id, text, user_name, user_id, session, url_base
+                )
+            except asyncio.CancelledError as _exc:
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Telegram message processing failed: {e}\n{traceback.format_exc()}"
+                )
+                # The polling loop used to own this apology; now that both
+                # transports funnel through here, it lives with the handler that
+                # actually knows the failure happened.
+                if self._control.get("error_replies", True) and chat_id:
+                    with contextlib.suppress(Exception):
+                        await TelegramMessageAdapter(
+                            session,
+                            url_base,
+                            chat_id,
+                            (message or {}).get("message_id")
+                            if isinstance(message, dict)
+                            else None,
+                            user_id,
+                            user_name,
+                        ).reply(PUBLIC_ERROR_TEXT)
 
     async def _process_telegram_message_inner(
         self, message, chat_id, text, user_name, user_id, session, url_base
@@ -17567,14 +17750,15 @@ class MaxwellBot(commands.Bot):
                 )
             except ProviderUsageExhaustedError as e:
                 logger.warning("Provider usage exhausted in Telegram: %s", e)
-                await TelegramMessageAdapter(
-                    session,
-                    url_base,
-                    chat_id,
-                    message.get("message_id"),
-                    user_id,
-                    user_name,
-                ).reply(e.user_message)
+                if self._control.get("error_replies", True):
+                    await TelegramMessageAdapter(
+                        session,
+                        url_base,
+                        chat_id,
+                        message.get("message_id"),
+                        user_id,
+                        user_name,
+                    ).reply(PUBLIC_ERROR_TEXT)
                 return
         finally:
             await self._release_ai_slot()
@@ -17587,6 +17771,15 @@ class MaxwellBot(commands.Bot):
         if (
             not response_text or not str(response_text).strip()
         ) and not tg_native_calls:
+            capture_incident(
+                "telegram.provider", "Provider returned no usable output",
+                details="Provider result had neither visible text nor native tool calls.",
+                context={"channel": str(chat_id), "user": str(user_id), "message": str(message.get("message_id"))},
+            )
+            if self._control.get("error_replies", True):
+                await TelegramMessageAdapter(
+                    session, url_base, chat_id, message.get("message_id"), user_id, user_name,
+                ).reply(PUBLIC_ERROR_TEXT)
             return
 
         response_text = (response_text or "").strip()

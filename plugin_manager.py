@@ -59,6 +59,10 @@ ALLOWED_EVENTS: frozenset[str] = frozenset(
 MIN_JOB_INTERVAL_SECONDS = 5.0
 
 
+class PluginReloadFailure(str):
+    pass
+
+
 class PluginContext:
     """What a plugin gets to work with, and the only supported way in.
 
@@ -661,7 +665,7 @@ class PluginManager:
             loaded = self.load_plugins()
         except Exception as exc:
             logger.exception("Failed to reload plugins")
-            return f"Error reloading plugins: {exc}"
+            return PluginReloadFailure(f"Error reloading plugins: {exc}")
         try:
             self.start_jobs()
         except Exception:

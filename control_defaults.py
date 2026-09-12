@@ -5,6 +5,26 @@ Both bot.py and api_server.py import from here so config ranges never drift.
 """
 
 
+import json
+from pathlib import Path
+
+from utils import FileLock, _atomic_json_write_sync
+
+
+DEEPSEEK_REASONING_EFFORTS = {"low": 50, "high": 75, "max": 100}
+
+
+def update_deepseek_reasoning(path: Path, level: str | int) -> None:
+    if level not in (*DEEPSEEK_REASONING_EFFORTS, "off", "") and not (type(level) is int and 1 <= level <= 100):
+        raise ValueError("DeepSeek reasoning must be an integer 1–100, low, high, max, off, or blank")
+    with FileLock(path):
+        control = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(control, dict):
+            raise TypeError("Control file must contain a JSON object")
+        control["deepseek_reasoning"] = level
+        _atomic_json_write_sync(path, control)
+
+
 def parse_bool(value, default: bool = False) -> bool:
     """Parse persisted/env booleans. bool("false") is True because Python is an asshole."""
     if isinstance(value, bool):
@@ -171,6 +191,7 @@ DEFAULT_CONTROL = {
     "night_fallback_end_hour": 9,
     "ai_timeout_seconds": 3600,
     "ai_concurrency": 2,
+    "deepseek_reasoning": "",
     "memory_history_messages": 40,
     "memory_context_budget": 48000,
     "tool_history_messages": 8,

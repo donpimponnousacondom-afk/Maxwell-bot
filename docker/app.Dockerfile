@@ -18,8 +18,8 @@ WORKDIR /app
 COPY autonomy.py autonomy_social.py bot.py bot_tools.py captcha_solver.py \
     channel_watch.py chess_game.py concurrency_safety.py config.py context_budget.py \
     control_defaults.py discord_vc_compat.py docker_runtime.py doctor.py \
-    email_inbox.py guild_onboarding.py inbox.py jobs.py knowledge_graph.py \
-    message_pipeline.py plugin_manager.py prompt_storage.py providers.py provider_telemetry.py \
+    email_inbox.py error_reporting.py guild_onboarding.py inbox.py jobs.py knowledge_graph.py \
+    message_pipeline.py operator_commands.py plugin_manager.py prompt_storage.py providers.py provider_telemetry.py \
     rag_memory.py rag_maintenance.py rem.py rem_defaults.json response_guard.py response_observability.py site_backend.py \
     site_server.py site_test.py tool_progress.py tool_registry.py tool_schemas.py \
     tools.py utils.py voice_live.py watch_policy.py x_client.py ./

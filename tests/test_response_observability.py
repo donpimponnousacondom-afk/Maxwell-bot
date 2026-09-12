@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from error_reporting import PUBLIC_ERROR_TEXT
 from provider_telemetry import CallMetrics
 from response_observability import (
     DEFAULT_FOOTER_FORMAT,
@@ -290,7 +291,9 @@ def test_edit_replaces_footer_and_metrics_without_borrowing(metrics):
     async def scenario():
         bot = fake_bot()
         message = Message()
-        target = SimpleNamespace(id=999, author=bot.user, edit=AsyncMock())
+        target = SimpleNamespace(id=999, author=bot.user, edit=AsyncMock(
+            side_effect=lambda **kwargs: SimpleNamespace(id=999, author=bot.user, content=kwargs["content"])
+        ))
         message.channel.fetch_message = AsyncMock(return_value=target)
         record_delivery(bot, message.channel, target, metrics)
         newer = replace(metrics, call_id="new", ttft_ms=777)
@@ -410,8 +413,12 @@ def test_footer_commands_auth_validation_and_static_replies(
         )
         assert all(
             sent.content.endswith("-# — —" + FOOTER_MARKER)
-            for sent in message.channel.sent[2:]
+            and not sent.content.startswith("```")
+            for sent in message.channel.sent[2:-1]
         )
+        assert message.channel.sent[-1].content.startswith("```\nFooter: on\n")
+        assert message.channel.sent[-1].content.endswith("— —" + FOOTER_MARKER + "\n```")
+        assert message.channel.sent[-1].content.count("```") == 2
         assert bot._delivery_measurements.lookup("100")[0] == "999"
         assert len(writes) == 3
 
@@ -440,7 +447,7 @@ def test_debug_command_exact_reference_and_version_are_unmeasured(metrics):
         assert "must be in this channel" in message.channel.sent[-1].content
         message.content = "!version"
         await MaxwellBot._handle_command(bot, message)
-        assert "Running build:" in message.channel.sent[-1].content
+        assert "Checkout at boot:" in message.channel.sent[-1].content
         assert all(
             sent.content.startswith("```\n") and sent.content.endswith("\n```")
             and FOOTER_MARKER not in sent.content
@@ -698,7 +705,7 @@ def test_background_producing_call_survives_string_recovery_without_error_borrow
     async def scenario():
         message = Message()
         job = SimpleNamespace(
-            id="job", channel_id="100", user_id="7", goal="test", context=""
+            id="job", guild_id="9", channel_id="100", user_id="7", goal="test", context=""
         )
         manager = SimpleNamespace(
             get=lambda job_id: job,
@@ -734,7 +741,8 @@ def test_background_producing_call_survives_string_recovery_without_error_borrow
         assert bot._dispatch_tool_calls.call_args.kwargs["response_metrics"] is metrics
         assert message.channel.sent
         if fail_followup:
-            assert "generation failed" in message.channel.sent[-1].content
+            assert message.channel.sent[-1].content == PUBLIC_ERROR_TEXT
+            assert job.status == "error"
             assert not bot._delivery_measurements.records
             assert all(
                 FOOTER_MARKER not in sent.content for sent in message.channel.sent

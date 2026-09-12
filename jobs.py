@@ -30,6 +30,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from error_reporting import PUBLIC_ERROR_TEXT, capture_incident
 from tools import Tool
 from response_observability import prepare_delivery, record_delivery
 from utils import _safe_int, _spawn_background
@@ -365,6 +366,10 @@ class SpawnBackgroundTool(Tool):
             task = _spawn_background(run_background_job(bot, job.id))
             manager.track_task(job.id, task)
         except RuntimeError as exc:
+            capture_incident(
+                "jobs", "Background job launch failed", exception=exc,
+                context={"job_id": job.id, "guild_id": job.guild_id, "channel_id": job.channel_id, "user_id": job.user_id},
+            )
             manager.mark(job.id, status="error", progress=f"could not launch: {exc}")
             return f"ERROR launching background job `{job.id}`: {exc} Do the work inline."
         return (
@@ -386,23 +391,17 @@ def _call_name(call: Any) -> str:
     return ""
 
 
-def _summarize_tool_results(results: Any, limit: int = 300) -> str:
-    parts = []
-    for item in list(results or [])[:4]:
-        text = re.sub(r"\s+", " ", str(item or "")).strip()
-        if text:
-            parts.append(text[:limit])
-    blob = " | ".join(parts)
-    return blob[:1200] if blob else "(no output)"
-
-
-async def _post_thread(thread: Any, text: str) -> None:
+async def _post_thread(thread, text: str, *, context: dict[str, str] | None = None) -> None:
     if thread is None or not text:
         return
     try:
         await thread.send(str(text)[:1900])
     except Exception as exc:
-        logger.debug("background job thread post failed: %s", exc)
+        capture_incident(
+            "jobs", "Background job message delivery failed", exception=exc,
+            details="Unsent job message:\n" + text + "\n" + str(getattr(exc, "text", "") or ""), context=context,
+        )
+        logger.debug("background job thread post failed: %s", type(exc).__name__)
 
 
 async def run_background_job(bot: Any, job_id: str) -> None:
@@ -414,28 +413,46 @@ async def run_background_job(bot: Any, job_id: str) -> None:
     manager = getattr(bot, "bg_jobs", None)
     job = manager.get(job_id) if manager is not None else None
     if job is None:
+        capture_incident("jobs", "Background job vanished before start", context={"job_id": str(job_id)})
         logger.warning("background job %s vanished before start", job_id)
         return
+    job_context = {
+        "job_id": job.id, "guild_id": job.guild_id,
+        "channel_id": job.channel_id, "user_id": job.user_id,
+    }
+    partial_tool_results: list[str] = []
     rt = manager.runtime(job.id)
     orig_message = rt.get("message")
     channel = rt.get("channel")
     if channel is None and orig_message is not None:
         channel = getattr(orig_message, "channel", None)
+    origin_error = None
     if channel is None:
-        with contextlib.suppress(Exception):
+        try:
             channel = bot.get_channel(int(job.channel_id))
+        except Exception as exc:
+            origin_error = exc
+            capture_incident("jobs", "Background origin lookup failed", exception=exc, context=job_context)
         if channel is None:
-            with contextlib.suppress(Exception):
+            try:
                 channel = await bot.fetch_channel(int(job.channel_id))
+            except Exception as exc:
+                origin_error = exc
+                capture_incident("jobs", "Background origin fetch failed", exception=exc, context=job_context)
 
-    async def _fail(text: str) -> None:
-        manager.mark(job.id, status="error", progress=text[:500])
-        if channel is not None:
-            with contextlib.suppress(Exception):
-                await channel.send(f"<@{job.user_id}> job `{job.id}` failed — {text[:1500]}")
+    async def _fail(text: str, exception: BaseException | None = None, *, partial: str = "") -> None:
+        capture_incident(
+            "jobs", "Background job failed", exception=exception,
+            details=text + ("\nPartial output:\n" + partial if partial else "")
+            + ("\nCompleted tool results:\n" + "\n".join(partial_tool_results) if partial_tool_results else ""),
+            context=job_context,
+        )
+        manager.mark(job.id, status="error", progress=text[:500], result=partial[:8000])
+        if channel is not None and (getattr(bot, "_control", {}) or {}).get("error_replies", True):
+            await _post_thread(channel, PUBLIC_ERROR_TEXT, context=job_context)
 
     if orig_message is None or channel is None:
-        await _fail("lost the origin channel (restart or deleted channel).")
+        await _fail("lost the origin channel (restart or deleted channel).", origin_error)
         return
 
     budgets = resolve_job_budgets(getattr(bot, "_control", {}) or {}, getattr(bot, "config", None))
@@ -463,13 +480,15 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 message=orig_message,
             )
     except Exception as exc:
-        thread_err = str(exc)[:200]
+        capture_incident("jobs", "Background progress thread creation failed", exception=exc, context=job_context)
+        thread_err = type(exc).__name__
     if thread is not None:
         manager.mark(job.id, thread_id=str(getattr(thread, "id", "") or ""))
         await _post_thread(
             thread,
             f"Job `{job.id}` running for <@{job.user_id}> — `{_short(job.goal, 120)}`\n"
             f"Budgets: {max_tokens} tokens/call, {timeout}s timeout, {max_iters} steps. Progress lands here.",
+            context=job_context,
         )
     else:
         logger.info("background job %s: no thread (%s)", job.id, thread_err or "DMs have no threads")
@@ -540,9 +559,16 @@ async def run_background_job(bot: Any, job_id: str) -> None:
     except Exception:
         provider_tools = openai_tools
 
+    known_tool_names = {
+        name for tool in openai_tools
+        if isinstance(name := (tool.get("function") or {}).get("name"), str)
+        and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name)
+    }
     final_text = ""
     final_metrics = None
     succeeded = False
+    terminal_failure = None
+    failure_text = ""
     deadline = time.monotonic() + float(timeout)
     try:
         for step in range(max(1, max_iters)):
@@ -558,9 +584,12 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 )
             except Exception as exc:
                 if step == 0:
-                    await _fail(f"still waiting on an LLM slot after 10m ({exc}).")
+                    await _fail(f"still waiting on an LLM slot after 10m ({exc}).", exc)
                     return
-                logger.warning("background job %s slot wait failed at step %s: %s", job.id, step, exc)
+                terminal_failure = exc
+                failure_text = f"LLM slot wait failed at step {step + 1}: {exc}"
+                capture_incident("jobs", "Background LLM slot wait failed", exception=exc, context=job_context | {"step": str(step + 1)})
+                logger.warning("background job %s slot wait failed at step %s: %s", job.id, step, type(exc).__name__)
                 break
 
             try:
@@ -574,8 +603,10 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 response_metrics = getattr(response, "metrics", None)
                 succeeded = True
             except Exception as exc:
-                logger.warning("background job %s generation failed at step %s: %s", job.id, step, exc)
-                final_text = final_text or f"generation failed ({type(exc).__name__}); partial work is in the thread."
+                terminal_failure = exc
+                failure_text = f"generation failed at step {step + 1}: {exc}"
+                capture_incident("jobs", "Background generation failed", exception=exc, context=job_context | {"step": str(step + 1)})
+                logger.warning("background job %s generation failed at step %s: %s", job.id, step, type(exc).__name__)
                 break
             finally:
                 with contextlib.suppress(Exception):
@@ -595,7 +626,11 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 try:
                     cleaned = await bot._dispatch_tool_calls(orig_message, response or "", **metrics_kwargs)
                     final_text = cleaned[0] if isinstance(cleaned, (list, tuple)) else str(cleaned or "")
-                except Exception:
+                    terminal_failure = None
+                except Exception as exc:
+                    terminal_failure = exc
+                    failure_text = f"final dispatch failed at step {step + 1}: {exc}"
+                    capture_incident("jobs", "Background final dispatch failed", exception=exc, context=job_context | {"step": str(step + 1)})
                     final_text = str(response or "")
                 final_text = str(final_text or "").strip()
                 final_metrics = response_metrics if final_text else None
@@ -613,15 +648,21 @@ async def run_background_job(bot: Any, job_id: str) -> None:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("background job %s dispatch failed at step %s: %s", job.id, step, exc)
-                succeeded = True  # the turn itself worked; one tool errored
+                terminal_failure = exc
+                failure_text = f"tool dispatch failed at step {step + 1}: {exc}"
+                capture_incident("jobs", "Background tool dispatch failed", exception=exc, context=job_context | {"step": str(step + 1)})
+                logger.warning("background job %s dispatch failed at step %s: %s", job.id, step, type(exc).__name__)
                 messages.append({"role": "assistant", "content": str(response or "")})
                 messages.append({"role": "user", "content": f"=== TOOL RESULTS ===\ntool error: {exc}"})
                 continue
-            manager.mark(job.id, progress=f"step {step + 1}: {', '.join([n for n in names if n][:4]) or 'thinking'}")
+            terminal_failure = None
+            partial_tool_results.extend(tool_results)
+            safe_names = [name for name in names if name in known_tool_names][:4]
+            manager.mark(job.id, progress=f"step {step + 1}: {', '.join(safe_names) or 'tools'}")
             await _post_thread(
                 thread,
-                f"step {step + 1} `{', '.join([n for n in names if n][:4]) or '…'}` — {_summarize_tool_results(tool_results)}",
+                f"step {step + 1} `{', '.join(safe_names) or 'tools'}` — {len(calls)} tool call(s), {len(tool_results)} result(s) received",
+                context=job_context,
             )
             # An ending-only batch (e.g. the model wrapped up via send_message)
             # is the finished answer — do not loop for more.
@@ -649,15 +690,15 @@ async def run_background_job(bot: Any, job_id: str) -> None:
             final_metrics = response_metrics if final_text else None
     except asyncio.CancelledError:
         manager.mark(job.id, status="cancelled", progress="cancelled on request")
-        await _post_thread(thread, f"Job `{job.id}` cancelled.")
+        await _post_thread(thread, f"Job `{job.id}` cancelled.", context=job_context)
         raise
     finally:
         manager.cleanup_runtime(job.id)
 
-    if not succeeded:
-        # Nothing ever came back — honest error, not a fake done.
-        await _fail(final_text or "the model never returned anything.")
-        await _post_thread(thread, "Failed before producing output.")
+    if terminal_failure is not None or not succeeded:
+        await _fail(failure_text or final_text or "the model never returned anything.", terminal_failure, partial=final_text)
+        if (getattr(bot, "_control", {}) or {}).get("error_replies", True):
+            await _post_thread(thread, PUBLIC_ERROR_TEXT, context=job_context)
         return
 
     final_text = str(final_text or "").strip() or "Done — details are in the thread."
@@ -687,6 +728,15 @@ async def run_background_job(bot: Any, job_id: str) -> None:
                 sent = await channel.send(chunk)
                 record_delivery(bot, channel, sent, final_metrics, platform=platform)
     except Exception as exc:
-        logger.warning("background job %s delivery failed: %s", job.id, exc)
-        await _post_thread(thread, f"Done, but I could not post to the channel ({exc}):\n{body[:1500]}")
-    await _post_thread(thread, f"Finished.\n{body[:1500]}")
+        capture_incident(
+            "jobs", "Background final delivery failed", exception=exc,
+            details="Undelivered output:\n" + final_text
+            + ("\nCompleted tool results:\n" + "\n".join(partial_tool_results) if partial_tool_results else ""),
+            context=job_context,
+        )
+        manager.mark(job.id, status="error", progress=f"delivery failed: {exc}"[:500])
+        logger.warning("background job %s delivery failed: %s", job.id, type(exc).__name__)
+        if (getattr(bot, "_control", {}) or {}).get("error_replies", True):
+            await _post_thread(thread, PUBLIC_ERROR_TEXT, context=job_context)
+        return
+    await _post_thread(thread, f"Finished.\n{body[:1500]}", context=job_context)

@@ -21,6 +21,7 @@ import ssl
 import sys
 import tempfile
 import time
+import traceback
 import wave
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -36,7 +37,8 @@ import uuid
 import discord
 from discord import Activity, File, Message, Status
 from tools import Tool
-from response_observability import clean_message_content, prepare_delivery, record_delivery, strip_footer
+from error_reporting import PUBLIC_ERROR_TEXT, capture_incident, register_secrets
+from response_observability import FOOTER_MARKER, clean_message_content, discord_message_excerpt, prepare_delivery, record_delivery, strip_footer
 from captcha_solver import CaptchaSolveError
 from control_defaults import parse_bool
 import site_backend
@@ -51,6 +53,113 @@ from utils import (  # single source of truth, fd-safe
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ToolFailure(str):
+    incident_id: str | None
+
+    def __new__(cls, text: str, incident_id: str | None):
+        result = super().__new__(cls, text)
+        result.incident_id = incident_id
+        return result
+
+
+class ShellDiagnosticCapture:
+    def __init__(self, command: str):
+        self.command = command
+        self.incident_id: str | None = None
+        self.streams = {}
+        self.failures: list[tuple[str, Exception]] = []
+
+    def __enter__(self):
+        for name in ("stdout", "stderr"):
+            try:
+                self.streams[name] = tempfile.TemporaryFile(buffering=0)
+            except Exception as exc:
+                self.failures.append((f"{name} allocation", exc))
+        return self
+
+    def close_stream(self, name: str) -> None:
+        stream = self.streams.pop(name, None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception as exc:
+                self.failures.append((f"{name} close", exc))
+
+    def write(self, name: str, chunk: bytes) -> None:
+        if name not in self.streams:
+            return
+        try:
+            remaining = memoryview(chunk)
+            while remaining:
+                written = self.streams[name].write(remaining)
+                if written is None or written <= 0:
+                    raise OSError("diagnostic spool write made no progress")
+                remaining = remaining[written:]
+        except Exception as exc:
+            self.failures.append((f"{name} write", exc))
+            self.close_stream(name)
+
+    def read(self, name: str, fallback: bytes) -> str:
+        if name in self.streams:
+            try:
+                self.streams[name].seek(0)
+                return self.streams[name].read().decode(errors="replace")
+            except Exception as exc:
+                self.failures.append((f"{name} read", exc))
+                self.close_stream(name)
+        return "[Full diagnostic capture unavailable; original capped buffer follows]\n" + fallback.decode(errors="replace")
+
+    def text(self, stdout: bytes, stderr: bytes, exit_code: int | None) -> str:
+        try:
+            return (
+                f"Command: {self.command}\n[stdout]\n{self.read('stdout', stdout)}"
+                f"\n[stderr]\n{self.read('stderr', stderr)}\n[exit code: {exit_code}]"
+            )
+        except Exception as exc:
+            self.failures.append(("diagnostic formatting", exc))
+            return (
+                f"Command: {self.command}\n[Full diagnostic capture unavailable; original capped buffers follow]"
+                f"\n[stdout]\n{stdout.decode(errors='replace')}\n[stderr]\n{stderr.decode(errors='replace')}"
+                f"\n[exit code: {exit_code}]"
+            )
+
+    def __exit__(self, exception_type, exception, tb):
+        for name in tuple(self.streams):
+            self.close_stream(name)
+        if self.failures:
+            if self.incident_id is not None:
+                self.failures[0][1].incident_id = self.incident_id
+            details = f"Command: {self.command}\n" + "\n".join(
+                f"{stage}:\n{''.join(traceback.format_exception(exc))}"
+                for stage, exc in self.failures
+            )
+            capture_incident(
+                "tool.shell.capture", "Shell diagnostic capture degraded; command result is unchanged",
+                exception=self.failures[0][1], details=details,
+            )
+
+
+class ShellResult(tuple):
+    incident_id: str | None
+
+    def __new__(cls, stdout: bytes, stderr: bytes, exit_code: int, incident_id: str | None = None):
+        result = super().__new__(cls, (stdout, stderr, exit_code))
+        result.incident_id = incident_id
+        return result
+
+
+def tool_failure(
+    source: str, text: str, *, exception: BaseException | None = None,
+    details: str = "", context: dict[str, str] | None = None,
+) -> ToolFailure:
+    incident_id = capture_incident(
+        source, text, exception=exception,
+        details=details or str(getattr(exception, "text", "") or ""), context=context,
+    )
+    return ToolFailure(text, incident_id)
+
 
 # Chess is optional: if python-chess is missing the chess_* tools will not be
 # registered, but nothing else breaks. __CHESS_IMPORTED__ gates the tool classes.
@@ -199,6 +308,7 @@ async def _synthesize_fish_tts(
     """
     if not api_key:
         return None
+    register_secrets([api_key])
     url = "https://api.fish.audio/v1/tts"
     payload = {
         "text": text,
@@ -219,12 +329,15 @@ async def _synthesize_fish_tts(
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
-                logger.warning("Fish TTS API returned %s: %s", resp.status, body[:200])
+                incident_id = capture_incident("tool.tts.fish", f"Fish TTS API returned {resp.status}", details=body)
+                logger.warning("Fish TTS API returned %s: %s", resp.status, body[:200], extra={"incident_id": incident_id})
                 return None
             data = await resp.read()
         if not data or len(data) < 64:
+            incident_id = capture_incident("tool.tts.fish", "Fish TTS returned empty/too-small payload", details=repr(data))
             logger.warning(
-                "Fish TTS returned empty/too-small payload (%d bytes)", len(data)
+                "Fish TTS returned empty/too-small payload (%d bytes)", len(data),
+                extra={"incident_id": incident_id},
             )
             return None
         # Fish returns MP3 bytes (or whatever fmt requested); write directly.
@@ -241,9 +354,11 @@ async def _synthesize_fish_tts(
         )
         return output_path
     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        capture_incident("tool.tts.fish", "Fish TTS request failed", exception=e)
         logger.warning("Fish TTS request failed: %s", e)
         return None
     except Exception as e:
+        capture_incident("tool.tts.fish", "Fish TTS unexpected error", exception=e)
         logger.warning("Fish TTS unexpected error: %s", e)
         return None
 
@@ -1038,6 +1153,11 @@ async def _resolve_member(guild, spec):
                     f"Error: cannot fetch members in {getattr(guild, 'name', 'this server')}",
                 )
             except Exception as exc:
+                if (
+                    isinstance(exc, (OSError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError))
+                    or isinstance(exc, discord.HTTPException) and exc.status >= 500
+                ):
+                    return None, tool_failure("tool.resolve_member", f"Error fetching member: {exc}", exception=exc)
                 return None, f"Error fetching member: {exc}"
         if member is None:
             return (
@@ -1116,6 +1236,11 @@ async def _get_guild_channel(bot, channel_id):
         try:
             channel = await bot.fetch_channel(cid)
         except Exception as exc:
+            if (
+                isinstance(exc, (OSError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError))
+                or isinstance(exc, discord.HTTPException) and exc.status >= 500
+            ):
+                return None, tool_failure("tool.get_guild_channel", f"Error finding channel: {exc}", exception=exc)
             return None, f"Error finding channel: {exc}"
     if not getattr(channel, "guild", None):
         return None, "Error: channel is not in a server"
@@ -1189,11 +1314,11 @@ def _persist_public_image(
 
 
 class ImageGeneratorTool(Tool):
-    """Fast image generation using Pollinations (SDXL-Lightning)."""
+    """Image generation using the configured fast image provider."""
 
     def get_description(self):
         return (
-            "Generate an AI image (~2-5s) — the DEFAULT image tool, text-to-image only. "
+            "Generate an AI image using the configured normal profile — the DEFAULT image tool, text-to-image only. "
             "It CANNOT take an input image: to edit/modify/restyle an existing image, use hd_image. "
             "Params: prompt (required). Posts the image to chat with a CDN URL you can reuse in sites."
         )
@@ -1203,18 +1328,45 @@ class ImageGeneratorTool(Tool):
     ) -> str:
         if not prompt:
             return "Error: prompt parameter is required"
-        # Pollinations is the primary generator — keyless, fast, always up.
-        # The long-dead NVIDIA Flux route was dropped (it hung ~6 min per
-        # request before timing out).
-        return await self._pollinations_generate(message, prompt)
+        protocol = getattr(self.bot.config, "IMAGE_GEN_PROTOCOL", "pollinations")
+        if protocol == "images":
+            result = await self._native_generate(message, prompt)
+        elif protocol == "pollinations":
+            result = await self._pollinations_generate(message, prompt)
+        else:
+            result = "Error: unsupported IMAGE_GEN_PROTOCOL; use pollinations or images"
+        return result
+
+    async def _native_generate(self, message: Message, prompt: str) -> str:
+        cfg = self.bot.config
+        base = (getattr(cfg, "IMAGE_GEN_BASE_URL", "") or "").strip().rstrip("/")
+        if not base:
+            return (
+                "Error: image generation is not configured "
+                "(set IMAGE_GEN_BASE_URL explicitly; chat settings are not used)"
+            )
+        image_bytes, ext, error = await _native_image_request(
+            base,
+            getattr(cfg, "IMAGE_GEN_API_KEY", "") or "",
+            getattr(cfg, "IMAGE_GEN_MODEL", "") or "gpt-image-2",
+            prompt,
+            quality=getattr(cfg, "IMAGE_GEN_QUALITY", "low"),
+            timeout_s=int(getattr(cfg, "IMAGE_GEN_TIMEOUT", 300)),
+        )
+        if error:
+            return error
+        return await self._deliver_generated_image(
+            message, prompt, image_bytes, prefix="image", ext=ext
+        )
 
     async def _deliver_generated_image(
-        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str
+        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str,
+        ext: str = "png",
     ) -> str:
         local_path, perm_url = _persist_public_image(
-            self.bot, image_bytes, prefix=prefix
+            self.bot, image_bytes, prefix=prefix, ext=f".{ext}"
         )
-        file = File(BytesIO(image_bytes), filename="generated_image.png")
+        file = File(BytesIO(image_bytes), filename=f"generated_image.{ext}")
         sent_msg = None
         self._signal_streaming(message)
         try:
@@ -1278,12 +1430,17 @@ class ImageGeneratorTool(Tool):
             ) as response:
                 if response.status != 200:
                     body = await response.text()
+                    failure = tool_failure(
+                        "tool.image_generator", f"Error generating image: Pollinations returned {response.status}.",
+                        details=body, context={"status": str(response.status)},
+                    )
                     logger.error(
                         "Pollinations image error: %s - %s",
                         response.status,
                         body[:300],
+                        extra={"incident_id": failure.incident_id},
                     )
-                    return f"Error generating image: Pollinations returned {response.status}."
+                    return failure
                 ctype = (
                     (response.headers.get("Content-Type") or "")
                     .split(";")[0]
@@ -1291,11 +1448,11 @@ class ImageGeneratorTool(Tool):
                     .lower()
                 )
                 raw = await _read_response_limited(response, 12 * 1024 * 1024)
-        except asyncio.TimeoutError:
-            return "Error: Pollinations image generation timed out."
+        except asyncio.TimeoutError as exc:
+            return tool_failure("tool.image_generator", "Error: Pollinations image generation timed out.", exception=exc)
         except Exception as e:
             logger.warning("Pollinations image error: %s", e)
-            return f"Error generating image: {e}"
+            return tool_failure("tool.image_generator", f"Error generating image: {e}", exception=e)
         looks_like_image = bool(
             raw
             and (
@@ -1304,12 +1461,17 @@ class ImageGeneratorTool(Tool):
             )
         )
         if not looks_like_image:
+            failure = tool_failure(
+                "tool.image_generator", "Error: Pollinations did not return an image.",
+                details=repr(raw), context={"content_type": ctype},
+            )
             logger.error(
                 "Pollinations returned non-image payload (%s, %s bytes)",
                 ctype,
                 len(raw or b""),
+                extra={"incident_id": failure.incident_id},
             )
-            return "Error: Pollinations did not return an image."
+            return failure
         logger.info(
             "Pollinations image generated successfully, size: %s bytes", len(raw)
         )
@@ -1336,27 +1498,120 @@ _IMAGE_FETCH_UA = (
 )
 
 
-class HDImageGeneratorTool(Tool):
-    """HD image generation and editing via the Gemini image model.
+_IMAGE_DATA_URI_RE = re.compile(
+    r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
+)
 
-    Talks to the OpenAI-compatible chat endpoint rather than
-    /images/generations: only the chat route accepts an input image, so
-    generate and edit are the same call with or without an `image` part.
-    """
+
+def _decode_image_response(data: dict, *, native: bool) -> tuple[bytes, str]:
+    if native:
+        image_bytes = base64.b64decode(data["data"][0]["b64_json"], validate=True)
+        ext = _sniff_image_mime(image_bytes).removeprefix("image/")
+    else:
+        msg = data["choices"][0].get("message") or {}
+        content = msg.get("content")
+        image_parts = msg.get("images") or []
+        if isinstance(content, list):
+            image_parts = [*image_parts, *content]
+            content = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
+        found = _IMAGE_DATA_URI_RE.findall(content or "")
+        for part in image_parts:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                found.extend(_IMAGE_DATA_URI_RE.findall(part["image_url"]["url"]))
+        ext, b64 = found[0]
+        image_bytes = base64.b64decode(b64)
+        ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
+    if not image_bytes:
+        raise ValueError("empty image data")
+    return image_bytes, "jpg" if ext == "jpeg" else ext
+
+
+async def _image_generation_request(
+    api_url: str, api_key: str, payload: dict, *, timeout_s: int, native: bool,
+) -> tuple[bytes, str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    no_retry = (
+        " The request may have been billed. It was not retried; "
+        "do not automatically repeat image generation."
+    )
+    label = "image" if native else "HD image"
+    image_bytes, ext, error = b"", "png", ""
+    body = ""
+    context = {"endpoint": api_url, "model": str(payload.get("model", ""))}
+    register_secrets([api_key])
+    session = await _get_shared_session()
+    try:
+        async with session.post(
+            api_url,
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            allow_redirects=False,
+        ) as response:
+            context["status"] = str(response.status)
+            body = await response.text()
+            if response.status != 200:
+                error = f"Error: {label} API returned status {response.status}"
+                if "quota" in body.lower():
+                    error += f"; the image model ({payload['model']}) has no quota right now."
+                return b"", ext, tool_failure(
+                    "tool.image_request", error + no_retry, details=body, context=context,
+                )
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                return b"", ext, tool_failure(
+                    "tool.image_request", f"Error: {label} endpoint returned a non-JSON response" + no_retry,
+                    exception=exc, details=body, context=context,
+                )
+        image_bytes, ext = _decode_image_response(data, native=native)
+    except asyncio.TimeoutError as exc:
+        error = tool_failure(
+            "tool.image_request", f"Error: {label} generation timed out after {timeout_s}s" + no_retry,
+            exception=exc, details=body, context=context,
+        )
+    except Exception as exc:
+        error = tool_failure(
+            "tool.image_request", f"Error: {label} request failed or returned unsupported image data." + no_retry,
+            exception=exc, details=body, context=context,
+        )
+    return image_bytes, ext, error
+
+
+async def _native_image_request(
+    base: str, api_key: str, model: str, prompt: str, *, quality: str,
+    timeout_s: int, images: tuple[str, ...] | list[str] = (),
+) -> tuple[bytes, str, str]:
+    base = base.removesuffix("/images/generations").removesuffix("/images/edits")
+    action = "edits" if images else "generations"
+    payload = {
+        "model": model, "prompt": prompt, "quality": quality,
+        "output_format": "png", "response_format": "b64_json", "n": 1,
+    }
+    if images:
+        payload["images"] = [{"image_url": image} for image in images]
+    return await _image_generation_request(
+        f"{base}/images/{action}", api_key, payload, timeout_s=timeout_s, native=True,
+    )
+
+
+class HDImageGeneratorTool(Tool):
+    """HD generation and editing through dedicated image provider settings."""
 
     # Discord's own limit is 25MB; inputs get downscaled well below it.
     MAX_INPUT_BYTES = 20 * 1024 * 1024
-    # Generation can be billed even when its response is lost or unrecognized.
-    # Never automatically submit a second generation request.
-    MAX_ATTEMPTS = 1
-    _DATA_URI_RE = re.compile(
-        r"data:image/(?P<ext>[A-Za-z0-9.+-]+);base64,(?P<b64>[A-Za-z0-9+/=]+)"
-    )
+    _DATA_URI_RE = _IMAGE_DATA_URI_RE
     _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
     def get_description(self):
         return (
-            "Generate OR edit an HD AI image with Gemini (~10-30s). Use for high quality/HD/HQ "
+            "Generate OR edit an AI image using the configured HD/edit profile. "
+            "Actual quality and dimensions depend on the provider. Use for high quality/HD/HQ "
             "requests, and for ANY edit of an existing image ('make the car red', 'add a hat', "
             "'remove the background', 'combine these'). "
             "Params: prompt (required — for an edit, describe the change, not the whole scene); "
@@ -1366,12 +1621,16 @@ class HDImageGeneratorTool(Tool):
         )
 
     def _endpoint(self) -> tuple[str, str, str]:
-        """(chat_completions_url, api_key, model) from dedicated image settings."""
+        """(image_endpoint_url, api_key, model) from dedicated image settings."""
         cfg = self.bot.config
         base = (getattr(cfg, "GEMINI_IMAGE_BASE_URL", "") or "").strip().rstrip("/")
         key = getattr(cfg, "GEMINI_IMAGE_API_KEY", "") or ""
-        model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or "gemini-3.1-flash-image"
-        url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+        native = getattr(cfg, "GEMINI_IMAGE_PROTOCOL", "chat_completions") == "images"
+        default_model = "gpt-image-2" if native else "gemini-3.1-flash-image"
+        model = getattr(cfg, "GEMINI_IMAGE_MODEL", "") or default_model
+        url = base
+        if not native and not base.endswith("/chat/completions"):
+            url = f"{base}/chat/completions"
         return url, key, model
 
     def _shrink(self, raw: bytes) -> tuple[bytes, str]:
@@ -1489,6 +1748,9 @@ class HDImageGeneratorTool(Tool):
         if not prompt:
             return "Error: prompt parameter is required"
 
+        protocol = getattr(self.bot.config, "GEMINI_IMAGE_PROTOCOL", "chat_completions")
+        if protocol not in ("chat_completions", "images"):
+            return "Error: unsupported GEMINI_IMAGE_PROTOCOL; use chat_completions or images"
         api_url, api_key, model = self._endpoint()
         if not api_url or api_url == "/chat/completions":
             return "Error: HD image generation is not configured (set GEMINI_IMAGE_BASE_URL explicitly; chat settings are not used)"
@@ -1530,7 +1792,10 @@ class HDImageGeneratorTool(Tool):
             if raw is None:
                 logger.warning(f"hd_image input rejected: {err}")
                 return f"Error: {err}"
-            shrunk, mime = self._shrink(raw)
+            shrunk, mime = (
+                (raw, _sniff_image_mime(raw))
+                if protocol == "images" else self._shrink(raw)
+            )
             parts.append(
                 {
                     "type": "image_url",
@@ -1541,119 +1806,26 @@ class HDImageGeneratorTool(Tool):
             )
             loaded += 1
 
-        payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
         timeout_s = int(getattr(self.bot.config, "GEMINI_IMAGE_TIMEOUT", 300))
-        session = await _get_shared_session()
-
-        no_retry = (
-            " The request may have been billed. It was not retried; "
-            "do not automatically repeat image generation."
-        )
-        found: list[tuple[str, str]] = []
-        said = ""
-        last_error = ""
-        for attempt in range(self.MAX_ATTEMPTS):
-            try:
-                async with session.post(
-                    api_url,
-                    json=payload,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout_s),
-                ) as response:
-                    body = await response.text()
-                    if response.status != 200:
-                        logger.error(
-                            f"HD image API error: {response.status} - {body[:500]}"
-                        )
-                        if "quota" in body.lower():
-                            return (
-                                f"Error: the HD image model ({model}) has no quota "
-                                "right now." + no_retry
-                            )
-                        last_error = (
-                            "Error generating HD image: API returned status "
-                            f"{response.status}" + no_retry
-                        )
-                        if 500 <= response.status < 600:
-                            continue
-                        return last_error
-                    try:
-                        data = json.loads(body)
-                    except Exception:
-                        logger.error(f"HD image non-JSON response: {body[:300]}")
-                        return (
-                            "Error: HD image endpoint returned a non-JSON response"
-                            + no_retry
-                        )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"HD image timed out after {timeout_s}s "
-                    f"(attempt {attempt + 1}/{self.MAX_ATTEMPTS})"
-                )
-                last_error = (
-                    f"Error: HD image generation timed out after {timeout_s}s" + no_retry
-                )
-                continue
-            except Exception as e:
-                logger.error(f"HD image generation request error: {e}")
-                return f"Error generating HD image: {e}" + no_retry
-
-            choices = data.get("choices") or []
-            if not choices:
-                logger.error(f"HD image response has no choices: {list(data.keys())}")
-                last_error = "Error: No image data in HD response" + no_retry
-                continue
-            msg = choices[0].get("message") or {}
-            content = msg.get("content")
-            image_parts = msg.get("images") or []
-            if isinstance(content, list):
-                image_parts = [*image_parts, *content]
-                # Some gateways hand back structured parts, not a string.
-                content = " ".join(
-                    p.get("text", "") if isinstance(p, dict) else str(p)
-                    for p in content
-                )
-            content = content or ""
-
-            found = self._DATA_URI_RE.findall(content)
-            for part in image_parts:
-                if isinstance(part, dict) and part.get("type") == "image_url":
-                    found.extend(
-                        self._DATA_URI_RE.findall(part["image_url"]["url"])
-                    )
-            if found:
-                break
-
-            said = re.sub(r"\s+", " ", str(content)).strip()
-            logger.warning(
-                f"HD image attempt {attempt + 1}/{self.MAX_ATTEMPTS} returned no "
-                f"image. Text: {said[:200]!r}"
+        if protocol == "images":
+            image_bytes, ext, error = await _native_image_request(
+                api_url, api_key, model, prompt,
+                quality=getattr(self.bot.config, "GEMINI_IMAGE_QUALITY", "high"),
+                timeout_s=timeout_s,
+                images=[part["image_url"]["url"] for part in parts[1:]],
             )
-            if said:
-                return (
-                    "Error: the HD image model returned text, not an image: "
-                    f"{said[:300]}" + no_retry
-                )
-
-        if not found:
-            if last_error:
-                return last_error
-            return (
-                "Error: the HD image response contained no supported image data."
-                + no_retry
+        else:
+            payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
+            image_bytes, ext, error = await _image_generation_request(
+                api_url, api_key, payload, timeout_s=timeout_s, native=False,
             )
+        if error:
+            return error
+        return await self._deliver_generated_image(message, prompt, image_bytes, ext, loaded)
 
-        ext, b64 = found[0]
-        try:
-            image_bytes = base64.b64decode(b64)
-        except Exception as e:
-            logger.error(f"HD image base64 decode failed: {e}")
-            return "Error: HD image data was not decodable" + no_retry
-
-        ext = "jpg" if ext.lower() in ("jpeg", "jpg") else "png"
+    async def _deliver_generated_image(
+        self, message: Message, prompt: str, image_bytes: bytes, ext: str, loaded: int,
+    ) -> str:
         file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")
         sent_msg = None
         # Step aside for the live progress message — the HD image is
@@ -1754,7 +1926,7 @@ class ReactTool(Tool):
                         await message.add_reaction(e)
                         return f"Reacted with {e}"
                     except discord.HTTPException as ex:
-                        return f"Error: Could not add reaction — {ex}"
+                        return tool_failure("tool.react", f"Error: Could not add reaction — {ex}", exception=ex)
             # Full emoji strings can still be valid if Discord lets this bot use
             # the emoji cross-guild. Try it, but don't try malformed nonsense.
             try:
@@ -1763,6 +1935,7 @@ class ReactTool(Tool):
             except discord.NotFound:
                 return f"Error: Emoji '{raw}' not found or invalid"
             except discord.HTTPException as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error: Could not add reaction — {e}"
 
         alias_match = self._ALIAS_RE.match(raw)
@@ -1781,7 +1954,7 @@ class ReactTool(Tool):
                             await message.add_reaction(e)
                             return f"Reacted with {e}"
                         except discord.HTTPException as ex:
-                            return f"Error: Could not add reaction — {ex}"
+                            return tool_failure("tool.react", f"Error: Could not add reaction — {ex}", exception=ex)
             if (
                 alias_match
                 or broken_match
@@ -1806,6 +1979,7 @@ class ReactTool(Tool):
         except discord.NotFound:
             return f"Error: Emoji '{raw}' not found or invalid"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: Could not add reaction — {e}"
 
 
@@ -1832,14 +2006,15 @@ class EditMessageTool(Tool):
             content = strip_footer(content, self_authored=True)
             platform = str(getattr(message, "tool_platform", "discord") or "discord")
             _, chunks = prepare_delivery(self.bot, content, metrics, SendMessageTool._chunks, platform=platform, limit=2000)
-            await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
-            record_delivery(self.bot, message.channel, msg, metrics, platform=platform, replace=True)
+            edited = await msg.edit(content=chunks[0] if len(chunks) == 1 else content)
+            record_delivery(self.bot, message.channel, edited, metrics, platform=platform, replace=True)
             return f"Message {message_id} edited successfully"
         except discord.NotFound:
             return f"Error: Message {message_id} not found"
         except discord.Forbidden:
             return "Error: I don't have permission to edit that message"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error editing message: {e}"
 
 
@@ -1887,6 +2062,7 @@ class DeleteMessageTool(Tool):
         except discord.Forbidden:
             return "Error: I don't have permission to delete that message"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error deleting message: {e}"
 
 
@@ -2157,6 +2333,7 @@ class CreatePollTool(Tool):
         except ValueError:
             return "Error: duration_hours must be a number"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error creating poll: {e}"
 
 
@@ -2193,6 +2370,7 @@ class CreateInviteTool(Tool):
         except ValueError:
             return "Error: max_uses and max_age must be numbers"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error creating invite: {e}"
 
 
@@ -2336,8 +2514,10 @@ class JoinServerTool(Tool):
                 "(banned from server or invite disabled)"
             )
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error fetching invite '{code}': HTTP {e.status}: {e.text[:200]}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error fetching invite '{code}': {type(e).__name__}: {e}"
 
         g = inv.guild
@@ -2364,52 +2544,58 @@ class JoinServerTool(Tool):
         try:
             await inv.accept()
         except discord.CaptchaRequired as e:
-            # The global client captcha handler (bot._handle_captcha) already
-            # tried the auto-solver and/or DM-based human solve. If it raised,
-            # we get here — post the solve link right in this channel so the
-            # person who asked for the join can complete it, then re-submit
-            # the invite accept with the solved token.
+            incident_id = capture_incident(
+                "tool.join_server", f"CAPTCHA required to join {gname}",
+                exception=e, details=_format_captcha(e),
+            )
             human = bool(
                 getattr(getattr(self.bot, "config", None), "CAPTCHA_HUMAN_SOLVE", False)
             )
             if human:
-                channel = getattr(message, "channel", None)
+                async def _notify_admin(url: str) -> None:
+                    from operator_commands import send_private_error_report
 
-                async def _notify_in_channel(url: str) -> None:
+                    if not self.bot._is_admin(author_id):
+                        return
                     try:
-                        if channel is not None:
-                            await channel.send(
-                                "⚠️ CAPTCHA required to join "
-                                + gname
-                                + ". Solve here (expires ~2 min): "
-                                + url
-                            )
+                        await send_private_error_report(
+                            self.bot, message.author,
+                            "⚠️ CAPTCHA required to join " + gname + ". Solve here (expires ~2 min): " + url,
+                            report=False,
+                        )
                     except Exception as ex:
-                        logger.warning("captcha in-channel notify failed: %s", ex)
+                        capture_incident("tool.join_server", "Could not privately notify CAPTCHA requester", exception=ex)
+                        logger.warning("captcha admin DM notify failed: %s", ex)
 
                 try:
                     token = await self.bot._solve_captcha_with_notify(
-                        e, notify=_notify_in_channel
+                        e, notify=_notify_admin
                     )
                 except CaptchaSolveError as se:
-                    return (
+                    return tool_failure(
+                        "tool.join_server",
                         "\n".join(lines)
                         + f"\nCAPTCHA REQUIRED to join {gname}: {_format_captcha(e)}"
                         + _solver_status(self.bot)
-                        + f"\nHuman solve failed: {se}"
+                        + f"\nHuman solve failed: {se}",
+                        exception=se,
                     )
                 try:
                     data = await self.bot._retry_invite_with_captcha(code, e, token)
                 except discord.HTTPException as he:
-                    return (
+                    return tool_failure(
+                        "tool.join_server",
                         "\n".join(lines)
                         + f"\nCAPTCHA solved but join retry failed: HTTP {he.status}: "
-                        + (he.text[:200] if he.text else "")
+                        + (he.text[:200] if he.text else ""),
+                        exception=he,
                     )
                 except Exception as ex:
-                    return (
+                    return tool_failure(
+                        "tool.join_server",
                         "\n".join(lines)
-                        + f"\nCAPTCHA solved but join retry failed: {type(ex).__name__}: {ex}"
+                        + f"\nCAPTCHA solved but join retry failed: {type(ex).__name__}: {ex}",
+                        exception=ex,
                     )
                 gid2 = None
                 if isinstance(data, dict):
@@ -2443,11 +2629,12 @@ class JoinServerTool(Tool):
                     + "\nCAPTCHA solved and join re-submitted — waiting on the "
                     + "guild to appear in cache. Check list_servers shortly."
                 )
-            return (
+            return ToolFailure(
                 "\n".join(lines)
                 + f"\nCAPTCHA REQUIRED to join {gname}: {_format_captcha(e)}"
                 + _solver_status(self.bot)
-                + "\nJoin blocked until the captcha is solved."
+                + "\nJoin blocked until the captcha is solved.",
+                incident_id,
             )
         except discord.NotFound as e:
             return f"Error joining '{code}': invite invalid/expired (HTTP {e.status})"
@@ -2458,14 +2645,19 @@ class JoinServerTool(Tool):
                 "between fetch and accept."
             )
         except discord.HTTPException as e:
+            incident_id = capture_incident(
+                "tool.join_server", f"Could not join {gname}: HTTP {e.status}", exception=e, details=e.text or "",
+            )
             detail = e.text[:200] if e.text else ""
             if e.status == 429:
-                return (
+                return ToolFailure(
                     f"Error joining {gname}: rate limited (429). "
-                    "Wait a bit and retry — Discord throttles rapid joins."
+                    "Wait a bit and retry — Discord throttles rapid joins.",
+                    incident_id,
                 )
-            return f"Error joining {gname}: HTTP {e.status}: {detail}"
+            return ToolFailure(f"Error joining {gname}: HTTP {e.status}: {detail}", incident_id)
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error joining {gname}: {type(e).__name__}: {e}"
 
         # Wait for the guild to land in the cache (gateway round-trip; large
@@ -2637,6 +2829,7 @@ class ServerSetupTool(Tool):
                 detail=True,
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error setting up {guild.name}: {type(e).__name__}: {e}"
 
         prompts = result.get("prompts") or []
@@ -2719,10 +2912,12 @@ class LeaveServerTool(Tool):
         except discord.NotFound as e:
             return f"Error leaving {guild.name}: guild not found (HTTP {e.status})"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error leaving {guild.name}: HTTP {e.status}: " + (
                 e.text[:200] if e.text else ""
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error leaving {guild.name}: {type(e).__name__}: {e}"
 
 
@@ -2833,6 +3028,7 @@ class LookupUserTool(Tool):
         except ValueError:
             return f"Error: Invalid user_id: {user_id}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error looking up user: {e}"
 
 
@@ -2857,10 +3053,7 @@ class SearchMessagesTool(Tool):
             if not clean_query:
                 if chan and hasattr(chan, "history"):
                     async for msg in chan.history(limit=search_limit):
-                        content = clean_message_content(self.bot, msg)
-                        snippet = content[:150] + (
-                            "..." if len(content) > 150 else ""
-                        )
+                        snippet = discord_message_excerpt(msg)
                         results.append(
                             f"[{msg.id}] {msg.author.display_name}: {snippet}"
                         )
@@ -2873,11 +3066,9 @@ class SearchMessagesTool(Tool):
             if chan and hasattr(chan, "history"):
                 try:
                     async for msg in chan.history(limit=100):
-                        content = clean_message_content(self.bot, msg)
+                        content = str(getattr(msg, "content", "") or "").replace(FOOTER_MARKER, "")
                         if clean_query in content.lower():
-                            snippet = content[:150] + (
-                                "..." if len(content) > 150 else ""
-                            )
+                            snippet = discord_message_excerpt(msg)
                             results.append(
                                 f"[#{getattr(chan, 'name', 'chat')} - {msg.id}] {msg.author.display_name}: {snippet}"
                             )
@@ -2904,11 +3095,9 @@ class SearchMessagesTool(Tool):
                         break
                     try:
                         async for msg in c.history(limit=50):
-                            content = clean_message_content(self.bot, msg)
+                            content = str(getattr(msg, "content", "") or "").replace(FOOTER_MARKER, "")
                             if clean_query in content.lower():
-                                snippet = content[:150] + (
-                                    "..." if len(content) > 150 else ""
-                                )
+                                snippet = discord_message_excerpt(msg)
                                 results.append(
                                     f"[#{c.name} - {msg.id}] {msg.author.display_name}: {snippet}"
                                 )
@@ -2927,6 +3116,7 @@ class SearchMessagesTool(Tool):
                 return f"No messages found matching '{query}'"
             return "Search results:\n" + "\n".join(results)
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error searching messages: {e}"
 
 
@@ -2963,6 +3153,7 @@ class SetNicknameTool(Tool):
         except discord.Forbidden:
             return "Error: I don't have permission to change my nickname here"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error setting nickname: {e}"
 
 
@@ -3011,6 +3202,7 @@ class ForwardMessageTool(Tool):
         except discord.Forbidden:
             return "Error: I don't have permission to forward messages"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error forwarding message: {e}"
 
 
@@ -3026,6 +3218,7 @@ class TypingTool(Tool):
                 pass
             return "Triggered typing indicator"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error triggering typing: {e}"
 
 
@@ -3159,6 +3352,7 @@ class CreateCategoryTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied creating category in {guild.name}; missing manage_channels or role hierarchy issue"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error creating category: {e}"
 
 
@@ -3262,6 +3456,7 @@ class CreateChannelTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied creating channel in {guild.name}; missing manage_channels or role hierarchy issue"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error creating channel: {e}"
 
 
@@ -3296,6 +3491,7 @@ class EditChannelTool(Tool):
         except (TypeError, ValueError):
             return f"Error: invalid channel_id: {channel_id}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error finding channel: {e}"
         guild = getattr(channel, "guild", None)
         if not guild:
@@ -3349,6 +3545,7 @@ class EditChannelTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied editing {_channel_label(channel)}; missing manage_channels or role hierarchy issue"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error editing channel: {e}"
 
 
@@ -3377,6 +3574,7 @@ class DeleteChannelTool(Tool):
         except (TypeError, ValueError):
             return f"Error: invalid channel_id: {channel_id}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error finding channel: {e}"
         guild = getattr(channel, "guild", None)
         if not guild:
@@ -3395,6 +3593,7 @@ class DeleteChannelTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied deleting {_channel_label(channel)}; missing manage_channels or role hierarchy issue"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error deleting channel: {e}"
 
 
@@ -3442,6 +3641,7 @@ class KickMemberTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied kicking {member}; hierarchy or missing kick_members"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error kicking member: {e}"
 
 
@@ -3499,10 +3699,12 @@ class BanMemberTool(Tool):
                 )
                 return f"Banned {member} ({member.id}) from {guild.name}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error banning member: {e}"
         except discord.Forbidden:
             return f"Error: Discord denied banning {member}; hierarchy or missing ban_members"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error banning member: {e}"
 
 
@@ -3541,6 +3743,7 @@ class UnbanMemberTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied unbanning {uid} in {guild.name}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error unbanning member: {e}"
 
 
@@ -3579,6 +3782,7 @@ class ListBansTool(Tool):
         except discord.Forbidden:
             return f"Error: cannot list bans in {guild.name}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error listing bans: {e}"
         if not rows:
             return f"No bans in {guild.name}"
@@ -3633,6 +3837,7 @@ class TimeoutMemberTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied timing out {member}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error timing out member: {e}"
 
 
@@ -3700,6 +3905,7 @@ class ManageRoleTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied creating a role in {guild.name}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error creating role: {e}"
         role, error = _find_role(guild, role_id or name)
         if error:
@@ -3731,6 +3937,7 @@ class ManageRoleTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied editing {role.name}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error editing role: {e}"
         if act == "delete":
             actual = getattr(role, "name", "")
@@ -3743,6 +3950,7 @@ class ManageRoleTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied deleting {actual}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error deleting role: {e}"
         if act in {"add", "remove"}:
             member, error = await _resolve_member(guild, user_id)
@@ -3760,6 +3968,7 @@ class ManageRoleTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied changing roles on {member}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error changing roles: {e}"
         return "Error: action must be list, create, edit, delete, add, or remove"
 
@@ -3811,6 +4020,7 @@ class PurgeMessagesTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied purging {_channel_label(channel)}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error purging messages: {e}"
 
 
@@ -3856,6 +4066,7 @@ class PinMessageTool(Tool):
         except discord.Forbidden:
             return "Error: Discord denied pinning that message"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error pinning message: {e}"
 
 
@@ -3897,6 +4108,7 @@ class SetMemberNicknameTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied changing nickname for {member}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error setting nickname: {e}"
 
 
@@ -3967,6 +4179,7 @@ class VoiceModTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied voice mod on {member}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error in voice_mod: {e}"
 
 
@@ -4020,6 +4233,7 @@ class LockChannelTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied locking {_channel_label(channel)}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error locking channel: {e}"
 
 
@@ -4076,6 +4290,7 @@ class SetChannelPermissionsTool(Tool):
                 f"Error: Discord denied editing overwrites on {_channel_label(channel)}"
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error setting channel permissions: {e}"
 
 
@@ -4115,6 +4330,7 @@ class EditServerTool(Tool):
         except discord.Forbidden:
             return f"Error: Discord denied editing {guild.name}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error editing server: {e}"
 
 
@@ -4152,6 +4368,7 @@ class AuditLogTool(Tool):
         except discord.Forbidden:
             return f"Error: cannot read audit log in {guild.name}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error reading audit log: {e}"
         if not rows:
             return f"No audit-log entries in {guild.name}"
@@ -4211,6 +4428,7 @@ class ManageEmojiTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied creating emoji in {guild.name}"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error creating emoji: {e}"
         if act == "delete":
             spec = str(emoji_id or name or "").strip().strip(":")
@@ -4230,6 +4448,7 @@ class ManageEmojiTool(Tool):
             except discord.Forbidden:
                 return f"Error: Discord denied deleting :{emoji.name}:"
             except Exception as e:
+                capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
                 return f"Error deleting emoji: {e}"
         return "Error: action must be list, create, or delete"
 
@@ -4273,8 +4492,10 @@ class ChangeAvatarTool(Tool):
             await self.bot.user.edit(avatar=image_bytes)
             return "Avatar changed successfully"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error changing avatar: {e}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: {e}"
 
 
@@ -5214,7 +5435,7 @@ class CreateSiteTool(Tool):
                     with contextlib.suppress(Exception):
                         shutil.rmtree(site_dir, ignore_errors=True)
                 logger.error(f"Failed to commit site metadata for {slug}: {e}")
-                return f"Error creating site: {e}"
+                return tool_failure("tool.create_site", f"Error creating site: {e}", exception=e)
             if not committed:
                 # Overwrite disallowed by a concurrent owner change / quota hit
                 # discovered under the lock; clean up only a directory we created.
@@ -5260,7 +5481,7 @@ class CreateSiteTool(Tool):
             return result
         except Exception as e:
             logger.error(f"Failed to create site {slug}: {e}")
-            return f"Error creating site: {e}"
+            return tool_failure("tool.create_site", f"Error creating site: {e}", exception=e)
 
     def _commit_site_locked(
         self, slug: str, user_id: str, is_admin: bool, entry: dict
@@ -5468,7 +5689,7 @@ class EditSiteTool(_SiteOwnedTool):
             try:
                 text = target.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as e:
-                return f"Error reading {rel}: {e}"
+                return tool_failure("tool.edit_site", f"Error reading {rel}: {e}", exception=e)
             start = _site_start_line(start_line)
             blocked = site_read_loop_guard(
                 message,
@@ -5544,7 +5765,7 @@ class EditSiteTool(_SiteOwnedTool):
             try:
                 text = target.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError) as e:
-                return f"Error reading {rel}: {e}"
+                return tool_failure("tool.edit_site", f"Error reading {rel}: {e}", exception=e)
             if find not in text:
                 return (
                     f"Error: `find` text is not in {rel} — it must match byte-for-byte. "
@@ -5585,7 +5806,7 @@ class EditSiteTool(_SiteOwnedTool):
             try:
                 target.unlink()
             except OSError as e:
-                return f"Error deleting {rel}: {e}"
+                return tool_failure("tool.edit_site", f"Error deleting {rel}: {e}", exception=e)
             return f"Deleted {rel} from {slug}." + _site_graph_note(self.bot, slug)
 
         if act in {"rename", "title", "retitle"}:
@@ -5635,6 +5856,12 @@ class EditSiteTool(_SiteOwnedTool):
 
 class SiteServerTool(_SiteOwnedTool):
     """Give a site a real backend: its own Python server in its own container."""
+
+    _FAILED_MUTATIONS = {
+        "write", "update", "patch_file", "code", "deploy", "create", "snapshot",
+        "replace", "patch", "sub", "rm", "unlink", "start", "restart", "reload",
+        "env", "secrets", "config",
+    }
 
     def get_description(self):
         return (
@@ -5867,30 +6094,17 @@ class SiteServerTool(_SiteOwnedTool):
                 f"Error: unknown action '{act}'. Use list, read, write, replace, "
                 "deploy, start, stop, restart, status, logs, env, rm, or delete."
             )
+        except site_server.SiteServerExecutionError as e:
+            failure = tool_failure("tool.site_server", f"Error: {e}", exception=e)
+            if act in self._FAILED_MUTATIONS:
+                with contextlib.suppress(Exception):
+                    await self._mark_server(slug, entry, False)
+            return failure
         except site_server.SiteServerError as e:
             # A failed redeploy/start writes a non-running registry row, so
             # keep the public site listing from claiming that its server is
             # still live.
-            if act in {
-                "write",
-                "update",
-                "patch_file",
-                "code",
-                "deploy",
-                "create",
-                "snapshot",
-                "replace",
-                "patch",
-                "sub",
-                "rm",
-                "unlink",
-                "start",
-                "restart",
-                "reload",
-                "env",
-                "secrets",
-                "config",
-            }:
+            if act in self._FAILED_MUTATIONS:
                 with contextlib.suppress(Exception):
                     await self._mark_server(slug, entry, False)
             return f"Error: {e}"
@@ -5986,6 +6200,7 @@ class SiteTestTool(_SiteOwnedTool):
                 if clipped:
                     backend_bits.append("Recent logs:\n" + clipped)
             except Exception as e:
+                capture_incident("tool.site_test", "Could not read backend logs", exception=e)
                 backend_bits.append(f"logs: {e}")
         if entry.get("backend"):
             public = getattr(self.bot.config, "MAXWELL_PUBLIC_BASE_URL", "").rstrip("/")
@@ -6239,6 +6454,7 @@ class GuideTool(Tool):
         )
         thread = None
         err = None
+        failure = None
         try:
             if hasattr(message, "create_thread"):
                 thread = await message.create_thread(
@@ -6254,23 +6470,28 @@ class GuideTool(Tool):
                     message=message,
                 )
         except Exception as e:
+            failure = tool_failure("tool.guide", f"Guide thread creation failed: {e}", exception=e)
             err = str(e)[:200]
         if thread is not None:
             try:
                 await thread.send(questionnaire)
             except Exception as e:
+                failure = tool_failure("tool.guide", f"Guide questionnaire delivery failed: {e}", exception=e)
                 err = str(e)[:200]
             url = (
                 getattr(thread, "jump_url", None)
                 or getattr(thread, "mention", None)
                 or thread_name
             )
-            return f"Guide thread created: {url} — questionnaire posted. Waiting for replies in thread {getattr(thread, 'id', '')}."
+            result = f"Guide thread created: {url} — questionnaire posted. Waiting for replies in thread {getattr(thread, 'id', '')}."
+            return ToolFailure(result, failure.incident_id) if failure is not None else result
         try:
             await message.channel.send(questionnaire)
         except Exception as e:
+            failure = tool_failure("tool.guide", f"Guide questionnaire delivery failed: {e}", exception=e)
             err = str(e)[:200]
-        return f"Guide posted in channel (no thread: {err or 'DMs have no threads'}) — waiting for replies."
+        result = f"Guide posted in channel (no thread: {err or 'DMs have no threads'}) — waiting for replies."
+        return ToolFailure(result, failure.incident_id) if failure is not None else result
 
 
 _WEB_SNIPPET_CHARS = 400
@@ -6844,7 +7065,8 @@ class SendMessageTool(Tool):
                         record_delivery(self.bot, target_channel, sent, _response_metrics, platform=platform)
                         sent_any = True
                         sent_chunks.append(clean_chunks[i])
-                    except Exception:
+                    except Exception as exc:
+                        capture_incident("tool.send_message", "Message delivery failed", exception=exc, details=str(getattr(exc, "text", "") or ""))
                         if sent_any:
                             return "__MESSAGE_SENT__\n" + "\n".join(sent_chunks)
                         raise
@@ -6861,9 +7083,10 @@ class SendMessageTool(Tool):
         except discord.Forbidden:
             return "Error: missing permissions to send message"
         except Exception as e:
+            failure = tool_failure("tool.send_message", f"Error sending message: {e}", exception=e)
             if sent_any:
                 return f"__MESSAGE_SENT__\n{text}"
-            return f"Error sending message: {e}"
+            return failure
 
 
 class ReasoningLogTool(Tool):
@@ -6916,6 +7139,7 @@ class ReasoningLogTool(Tool):
             await self.bot._record_llm_trace(message, payload)
             return "__REASONING_RECORDED__"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error recording reasoning: {e}"
 
 
@@ -7153,8 +7377,10 @@ class SendFileTool(Tool):
         except discord.Forbidden:
             return "Error: no permission to send files here"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error sending file: {e}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error sending file: {e}"
 
         # Every piece of media gets its URL attached: the sent Discord
@@ -7702,8 +7928,9 @@ class ShellTool(Tool):
             raise RuntimeError(validation_error)
         if not sanitized:
             raise RuntimeError("empty command")
-        async with self._lifecycle_lock:
+        async with self._lifecycle_lock, contextlib.AsyncExitStack() as scope:
             container_id = await self._ensure_container()
+            diagnostics = scope.enter_context(ShellDiagnosticCapture(sanitized))
             exec_token = f"maxwell-exec-{uuid.uuid4().hex}"
             pid_file = f"/tmp/{exec_token}.pid"
             # Run the user's shell in its own session/process group and leave
@@ -7758,7 +7985,7 @@ class ShellTool(Tool):
                         now - started,
                     )
 
-            async def _pump(stream, buf: bytearray) -> None:
+            async def _pump(stream, buf: bytearray, name: str) -> None:
                 if stream is None:
                     return
                 while True:
@@ -7776,6 +8003,7 @@ class ShellTool(Tool):
                             output_truncated = True
                     else:
                         buf.extend(chunk)
+                    diagnostics.write(name, chunk)
                     await _emit()
 
             async def _heartbeat() -> None:
@@ -7788,47 +8016,69 @@ class ShellTool(Tool):
                 except asyncio.CancelledError:
                     return
 
+            workers = [
+                asyncio.create_task(_pump(proc.stdout, stdout_buf, "stdout")),
+                asyncio.create_task(_pump(proc.stderr, stderr_buf, "stderr")),
+                asyncio.create_task(proc.wait()),
+            ]
+            execution = asyncio.gather(*workers)
             beat = asyncio.create_task(_heartbeat())
+            completed = False
             try:
                 await _emit(force=True)
-                await asyncio.wait_for(
-                    asyncio.gather(
-                        _pump(proc.stdout, stdout_buf),
-                        _pump(proc.stderr, stderr_buf),
-                        proc.wait(),
-                    ),
-                    timeout=self._timeout_seconds(),
-                )
-            except asyncio.TimeoutError:
-                await self._kill_container_exec(pid_file, container_id)
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                await proc.wait()
-                raise
-            except asyncio.CancelledError:
-                # Outer autonomy wait_for or other cancel can hit here; always kill child.
-                await self._kill_container_exec(pid_file, container_id)
-                if proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
-                raise
+                await asyncio.wait_for(asyncio.shield(execution), timeout=self._timeout_seconds())
+                completed = True
             finally:
-                beat.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await beat
-                # Belt-and-suspenders: ensure no zombie if communicate didn't finish.
-                if proc.returncode is None:
+                exception = sys.exception()
+                observed_exit_code = proc.returncode
+                cleanup = asyncio.create_task(self._settle_shell_execution(
+                    proc, workers, execution, beat, pid_file, container_id, completed,
+                ))
+                interrupted = False
+                while not cleanup.done():
                     try:
-                        await self._kill_container_exec(pid_file, container_id)
-                        proc.kill()
-                        await proc.wait()
-                    except Exception as e:
-                        # Usually means the process already exited.
-                        logger.debug("shell zombie cleanup: %s", e)
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        interrupted = True
+                cleanup.result()
+                if not completed and exception is not None and not isinstance(exception, asyncio.CancelledError):
+                    diagnostics.incident_id = capture_incident(
+                        "tool.shell", f"Shell execution failed: {exception}", exception=exception,
+                        details=diagnostics.text(bytes(stdout_buf), bytes(stderr_buf), proc.returncode),
+                    )
+                elif observed_exit_code is not None and observed_exit_code != 0:
+                    diagnostics.incident_id = capture_incident(
+                        "tool.shell", f"Command exited with status {observed_exit_code}",
+                        details=diagnostics.text(bytes(stdout_buf), bytes(stderr_buf), observed_exit_code),
+                    )
+                if interrupted:
+                    raise asyncio.CancelledError
+            incident_id = diagnostics.incident_id if proc.returncode != 0 else None
             if output_truncated:
                 stderr_buf.extend(b"\n[output truncated at MAXWELL_SHELL_MAX_OUTPUT]")
-            return bytes(stdout_buf), bytes(stderr_buf), proc.returncode
+            return ShellResult(bytes(stdout_buf), bytes(stderr_buf), proc.returncode, incident_id)
+
+    async def _settle_shell_execution(self, proc, workers, execution, beat, pid_file, container_id, completed):
+        beat.cancel()
+        try:
+            if not completed or proc.returncode is None:
+                await self._terminate_shell_process(proc, pid_file, container_id)
+        except Exception as exc:
+            capture_incident("tool.shell.cleanup", "Shell process cleanup failed", exception=exc)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(beat, execution, *workers, return_exceptions=True)
+
+    async def _terminate_shell_process(self, proc, pid_file: str, container_id: str) -> None:
+        try:
+            await self._kill_container_exec(pid_file, container_id)
+        finally:
+            try:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+            finally:
+                await proc.wait()
 
     async def _kill_container_exec(self, pid_file: str, container_id: str) -> None:
         """Terminate the timed-out command, not just its docker client."""
@@ -7917,7 +8167,7 @@ class ShellTool(Tool):
     async def _flush_shell_progress_unlocked(
         self, message: Message, sess: _ShellProgressTurn
     ) -> None:
-        rendered = "\n\n".join(part for part in sess.parts if part)
+        rendered = PUBLIC_ERROR_TEXT if PUBLIC_ERROR_TEXT in sess.parts else "\n\n".join(part for part in sess.parts if part)
         formatted = self._format_ansi_message(rendered)
         if sess.posted is None:
             sess.posted = await message.channel.send(formatted)
@@ -7965,6 +8215,9 @@ class ShellTool(Tool):
         normalized = self._normalize_command(self._command_arg(command, **kwargs))
         if not normalized:
             return "Error: command is required (tool-call markup was detected or command was empty)"
+        validation_error = self._validate_command(normalized)
+        if validation_error:
+            return f"Error executing command: {validation_error}"
 
         # No whitelist: any user in an allowed channel can run shell. The
         # sandbox is the security boundary (root inside container, but no
@@ -8026,26 +8279,23 @@ class ShellTool(Tool):
             await self._finish_shell_progress(message, sess, slot, "working on it…")
 
         try:
-            stdout, stderr, exit_code = await self._run_shell_command(
-                normalized, on_progress=_on_progress
+            execution = await self._run_shell_command(normalized, on_progress=_on_progress)
+            stdout, stderr, exit_code = execution
+        except asyncio.TimeoutError as exc:
+            failure = tool_failure(
+                "tool.shell", f"Error: Command timed out after {self._timeout_seconds()}s",
+                exception=exc, details=f"Command: {normalized}",
             )
-        except asyncio.TimeoutError:
-            if sess is not None and slot is not None:
+            if sess is not None and slot is not None and getattr(self.bot, "_control", {}).get("error_replies", True):
                 with contextlib.suppress(Exception):
-                    await self._finish_shell_progress(
-                        message,
-                        sess,
-                        slot,
-                        f"Command timed out after {self._timeout_seconds()}s",
-                    )
-            return f"Error: Command timed out after {self._timeout_seconds()}s"
+                    await self._finish_shell_progress(message, sess, slot, PUBLIC_ERROR_TEXT)
+            return failure
         except Exception as e:
-            if sess is not None and slot is not None:
+            failure = tool_failure("tool.shell", f"Error executing command: {e}", exception=e, details=f"Command: {normalized}")
+            if sess is not None and slot is not None and getattr(self.bot, "_control", {}).get("error_replies", True):
                 with contextlib.suppress(Exception):
-                    await self._finish_shell_progress(
-                        message, sess, slot, f"Error: {e}"
-                    )
-            return f"Error executing command: {e}"
+                    await self._finish_shell_progress(message, sess, slot, PUBLIC_ERROR_TEXT)
+            return failure
 
         out = stdout.decode(errors="replace")
         err = stderr.decode(errors="replace")
@@ -8056,8 +8306,17 @@ class ShellTool(Tool):
             if combined:
                 combined += "\n"
             combined += f"[stderr] {err.strip()}"
+        incident_id = getattr(execution, "incident_id", None)
         if exit_code != 0:
             combined += f"\n[exit code: {exit_code}]"
+            if incident_id is None:
+                incident_id = capture_incident(
+                    "tool.shell", f"Command exited with status {exit_code}",
+                    details=f"Command: {normalized}\n[stdout]\n{out}\n[stderr]\n{err}\n[exit code: {exit_code}]",
+                )
+        if exit_code != 0 and sess is not None and slot is not None and getattr(self.bot, "_control", {}).get("error_replies", True):
+            with contextlib.suppress(Exception):
+                await self._finish_shell_progress(message, sess, slot, PUBLIC_ERROR_TEXT)
 
         max_out = self._max_output()
         if max_out and len(combined) > max_out:
@@ -8076,7 +8335,7 @@ class ShellTool(Tool):
             if sent_files:
                 result += f"\nSent files: {', '.join(sent_files)}"
 
-        return result
+        return ToolFailure(result, incident_id) if exit_code != 0 else result
 
     @staticmethod
     def _parse_file_list(files: str) -> list[str]:
@@ -8154,23 +8413,31 @@ async def _fetch_public_url(
                 if resp.status in _FETCH_REDIRECT_STATUSES:
                     loc = resp.headers.get("Location")
                     if not loc:
-                        raise ValueError(f"HTTP {resp.status}")
+                        error = ValueError(f"HTTP {resp.status}")
+                        error.incident_details = await resp.text()
+                        raise error
                     current = urljoin(current, loc)
                     continue
                 if resp.status != 200:
-                    raise ValueError(f"HTTP {resp.status}")
+                    error = ValueError(f"HTTP {resp.status}")
+                    error.incident_details = await resp.text()
+                    raise error
                 content_type = resp.headers.get("Content-Type", "") or ""
                 raw = await _read_response_limited(resp, max_bytes)
                 return current, content_type, raw
         raise ValueError("too many redirects")
-    except ValueError:
+    except ValueError as e:
+        if hasattr(e, "incident_details"):
+            capture_incident("tool.fetch_url", str(e), exception=e, context={"url": current})
         raise
     except asyncio.TimeoutError as e:
+        capture_incident("tool.fetch_url", f"timed out fetching {url}", exception=e)
         raise ValueError(f"timed out fetching {url}") from e
     except Exception as e:
         msg = str(e)
         if "blocked unsafe" in msg.lower():
             raise ValueError("Cannot fetch from private/internal URLs") from e
+        capture_incident("tool.fetch_url", msg, exception=e, context={"url": current})
         raise ValueError(msg) from e
 
 
@@ -8252,6 +8519,7 @@ class FetchUrlTool(Tool):
         except asyncio.TimeoutError:
             return f"Error: timed out fetching {url}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error fetching URL: {e}"
 
         mime = (content_type or "").split(";", 1)[0].strip().lower()
@@ -8318,6 +8586,7 @@ class FetchUrlTool(Tool):
             else:
                 text = raw.decode(errors="replace")
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error parsing content: {e}"
 
         text = text.strip()
@@ -9371,6 +9640,7 @@ class SendMemeTool(Tool):
                     return f"Error: meme API returned {resp.status}"
                 data = await resp.json()
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error fetching meme: {e}"
 
         meme_url = data.get("url")
@@ -9396,6 +9666,7 @@ class SendMemeTool(Tool):
                     return f"Error: could not download meme image ({img_resp.status})"
                 img_bytes = await _read_response_limited(img_resp, self.MAX_SIZE)
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error downloading meme: {e}"
 
         filename = meme_url.rsplit("/", 1)[-1].split("?")[0] or "meme.png"
@@ -9409,6 +9680,7 @@ class SendMemeTool(Tool):
         except discord.Forbidden:
             return "Error: no permission to send files here"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error sending meme: {e}"
 
         return f'__MEME_SENT__ Sent meme: "{title}" from r/{sub} ({ups} upvotes)'
@@ -9443,6 +9715,7 @@ class SendMediaTool(Tool):
         except asyncio.TimeoutError:
             return f"Error: timed out downloading {url}"
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error downloading: {e}"
 
         filename = _safe_attachment_filename(
@@ -9474,6 +9747,7 @@ class SendMediaTool(Tool):
         except discord.Forbidden:
             return "Error: no permission to send files here"
         except discord.HTTPException as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error sending media: {e}"
 
         # Attach the URL of what was actually sent (source URL + the new
@@ -10019,6 +10293,7 @@ class JoinVcTool(Tool):
                 f"(listening: {bool(listening)})"
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error joining voice: {e}"
 
 
@@ -10142,6 +10417,7 @@ class LeaveVcTool(Tool):
             await vc.disconnect(force=True)
             return "Successfully disconnected from the voice channel."
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error leaving voice channel: {e}"
 
 
@@ -10849,6 +11125,7 @@ class EmailSendTool(Tool):
                 str(reply_to).strip() if reply_to else None,
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: SMTP send failed: {e}"
 
 
@@ -10898,6 +11175,7 @@ class EmailReadInboxTool(Tool):
                 str(unread_only).lower() in {"1", "true", "yes"},
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: IMAP read failed: {e}"
         if self.bot is not None:
             self.bot.mark_message_tainted(message)
@@ -10944,6 +11222,7 @@ class EmailGetMessageTool(Tool):
                 cap,
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: IMAP fetch failed: {e}"
         if self.bot is not None:
             self.bot.mark_message_tainted(message)
@@ -10988,6 +11267,7 @@ class EmailSearchTool(Tool):
                 limit,
             )
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: IMAP search failed: {e}"
         if self.bot is not None:
             self.bot.mark_message_tainted(message)
@@ -11077,6 +11357,7 @@ class XReadTool(Tool):
         except XError as e:
             return f"Error: {e}"
         except Exception as e:  # pragma: no cover - defensive
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e)
             return f"Error: X read failed: {type(e).__name__}: {e}"
 
         header = {
@@ -11169,6 +11450,7 @@ class XPostTool(Tool):
         except XError as e:
             return f"Error: {e}"
         except Exception as e:  # pragma: no cover - defensive
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e)
             return f"Error: X {act} failed: {type(e).__name__}: {e}"
         done = {"delete": "Deleted", "like": "Liked", "repost": "Reposted"}[act]
         return f"{done} on X: {result.get('url') or result.get('id') or 'ok'}"
@@ -11232,6 +11514,7 @@ class UpdateBasePersonalityTool(Tool):
             if not store.external:
                 self.bot._control["base_personality"] = text
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: failed to persist base_personality: {e}"
         return (
             f"base_personality updated. {len(text)} chars written to "
@@ -11289,6 +11572,7 @@ class UpdateServerPromptTool(Tool):
                 )
             self.bot.memory.set_server_prompt(server_id, text_str)
         except Exception as e:
+            capture_incident(f"tool.{type(self).__name__}", str(e), exception=e, details=str(getattr(e, "text", "") or ""))
             return f"Error: failed to persist server prompt: {e}"
         return (
             f"Server prompt updated for server_id={server_id}. "
@@ -12052,182 +12336,101 @@ class ChessResignTool(Tool):
 
 
 class UsageTool(Tool):
-    """Query the usage/quota endpoint (z3ki.dev/v2/usage) with the API key in env."""
+    """Report OpenRouter usage for the loaded primary chat key."""
 
     def get_description(self):
         return (
-            "Fetch current API usage and remaining quota from the provider "
-            "(z3ki.dev/v2/usage) using the API key already configured in env. "
-            "Returns usage percentages, reset times, and account counts so you "
-            "can report how much budget is left."
+            "Fetch OpenRouter per-key spending from its fixed /api/v1/key endpoint "
+            "using the loaded primary OpenRouter chat key. Returns USD credit usage "
+            "for all time and the current UTC day/week/month, separate external "
+            "BYOK usage, and the key's spending cap, remaining cap and reset schedule. "
+            "Covers all callers sharing that key, not necessarily this bot alone. "
+            "Not account/workspace balance, token counts or cache ratios. "
+            "Unavailable when the primary provider is not HTTPS OpenRouter."
         )
 
-    def _url(self) -> str:
-        return (
-            os.environ.get("MAXWELL_USAGE_URL", "") or ""
-        ).strip() or "https://z3ki.dev/v2/usage"
-
-    def _api_key(self) -> str:
-        return (
-            os.environ.get("OLLAMA_API_KEY", "")
-            or os.environ.get("OPENAI_COMPAT_API_KEY", "")
-            or ""
-        ).strip()
+    def summarize(self, data: dict) -> str:
+        lines = [
+            "OpenRouter primary-key usage (USD):",
+            "Windows: current UTC day, week (Monday–Sunday), and month.",
+        ]
+        fields = (
+            ("usage", "OpenRouter credits used — all time"),
+            ("usage_daily", "OpenRouter credits used — day"),
+            ("usage_weekly", "OpenRouter credits used — week"),
+            ("usage_monthly", "OpenRouter credits used — month"),
+            ("byok_usage", "External BYOK usage — all time"),
+            ("byok_usage_daily", "External BYOK usage — day"),
+            ("byok_usage_weekly", "External BYOK usage — week"),
+            ("byok_usage_monthly", "External BYOK usage — month"),
+            ("limit", "Key spending cap"),
+            ("limit_remaining", "Key remaining cap"),
+        )
+        for field, label in fields:
+            value = data.get(field)
+            rendered = "unknown"
+            if type(value) in (int, float) and -float("inf") < value < float("inf"):
+                rendered = f"${value:.6f}".rstrip("0").rstrip(".")
+            elif field in ("limit", "limit_remaining") and field in data and value is None:
+                rendered = "no key cap"
+            lines.append(f"{label}: {rendered}")
+        reset = data.get("limit_reset", "unknown")
+        if reset not in ("daily", "weekly", "monthly", None):
+            reset = "unknown"
+        lines.append(f"Key cap reset: {'none' if reset is None else reset}")
+        lines.append("Scheduled resets occur at 00:00 UTC; weeks start Monday.")
+        byok = data.get("include_byok_in_limit")
+        included = "yes" if byok is True else "no" if byok is False else "unknown"
+        lines.append(f"External BYOK counts toward key cap: {included}")
+        lines.append(
+            "External BYOK usage is separate from OpenRouter credit usage. "
+            "Scope: all callers sharing the loaded primary key, not necessarily bot-only. "
+            "This is not an account/workspace balance or a guarantee requests can run; "
+            "token counts and cache ratios are not provided."
+        )
+        return "\n".join(lines)
 
     async def execute(self, message: Message, **kwargs) -> str:
-        url = self._url()
-        key = self._api_key()
-        if not key:
-            return "Error: no API key configured (OLLAMA_API_KEY or OPENAI_COMPAT_API_KEY)."
-        session = await _get_shared_session()
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Accept": "application/json",
-        }
+        provider = getattr(self.bot, "ai_provider", None)
         try:
+            base = urlparse(getattr(provider, "base_url", ""))
+            if not (
+                base.scheme == "https"
+                and base.hostname == "openrouter.ai"
+                and base.port in (None, 443)
+                and base.username is None
+                and base.password is None
+                and not base.query
+                and not base.fragment
+            ):
+                return (
+                    "Error: usage unavailable for this primary provider; "
+                    "only a loaded HTTPS OpenRouter primary is supported."
+                )
+            key = getattr(provider, "api_key", "").strip()
+            if not key:
+                return "Error: usage unavailable; the loaded OpenRouter primary has no API key."
+            session = await _get_shared_session()
             async with session.get(
-                url,
-                headers=headers,
+                "https://openrouter.ai/api/v1/key",
+                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=30),
+                allow_redirects=False,
             ) as resp:
-                body = await resp.text()
-                if resp.status != 200:
-                    return f"Error: usage endpoint returned HTTP {resp.status}: {body[:400]}"
-        except asyncio.TimeoutError:
-            return "Error: usage endpoint timed out."
-        except Exception as exc:
-            return f"Error: could not reach usage endpoint: {exc}"
-
-        # Condense to a concise summary the model can read at a glance, with
-        # the raw payload appended (truncated) only if the shape is unfamiliar.
-        try:
-            data = json.loads(body)
-        except ValueError:
-            return f"API usage from {url}:\n{body[:4000]}"
-
-        lines: list[str] = [f"API usage from {url}:"]
-        accounts = data.get("accounts")
-        if accounts is not None:
-            lines.append(f"Accounts: {accounts}")
-        combined = data.get("combined") or {}
-        if isinstance(combined, dict):
-            for family, limits in combined.items():
-                if not isinstance(limits, dict):
-                    continue
-                parts: list[str] = []
-                for window in ("5h", "weekly"):
-                    info = limits.get(window)
-                    if not isinstance(info, dict):
-                        continue
-                    pct = info.get("remaining_pct")
-                    reset = str(info.get("reset_time", ""))[:16]
-                    name = info.get("display_name", window)
-                    if pct is not None:
-                        parts.append(f"{window}: {pct:.1f}% left (resets {reset})")
-                    else:
-                        parts.append(f"{window}: {name} (resets {reset})")
-                if parts:
-                    lines.append(f"- {family}: " + " · ".join(parts))
-        # Antigravity pooled accounts: summarize rate-limited models WITHOUT leaking emails.
-        # Previously the raw payload included per_account[].email and rate_limited[].email
-        # which the LLM then echoed into the channel, exposing owner addresses.
-        # We now redact emails and only show counts / anonymized summaries.
-        rate_limited = data.get("rate_limited")
-        # Filter to *active* limits only — antigravity-manager keeps stale entries for ~1m after expiry
-        # and marks weekly 0% as rate_limited even when 5h is 100% (not actually blocked for 5h). That was
-        # the "one acc always marked as rate limited" false positive (zequielwolf weekly 0% but 5h 100%).
-        active_limited = []
-        stale_count = 0
-        if isinstance(rate_limited, list) and rate_limited:
-            now_ts = int(time.time())
-            for entry in rate_limited:
-                if not isinstance(entry, dict):
-                    continue
-                until = entry.get("until")
-                # until is epoch seconds; if in the past it's stale, ignore
-                try:
-                    until_int = int(until) if until is not None else 0
-                except (ValueError, TypeError):
-                    until_int = 0
-                if until_int and until_int < now_ts - 5:
-                    stale_count += 1
-                    continue
-                active_limited.append(entry)
-        if active_limited:
-            from collections import Counter
-
-            models = Counter()
-            for entry in active_limited:
-                m = str(entry.get("model") or entry.get("reason") or "unknown")
-                models[m] += 1
-            summary = ", ".join(
-                f"{model} x{cnt}" if cnt > 1 else model for model, cnt in models.items()
-            )
-            lines.append(
-                f"Rate-limited models (pooled, {len(active_limited)} active): {summary}"
-            )
-            lines.append(
-                "Note: single-model QuotaExhausted on one pooled account is NOT global exhaustion — other accounts still serve."
-            )
-            if stale_count:
-                lines.append(
-                    f"({stale_count} stale/expired rate-limit entries ignored)"
-                )
-        elif isinstance(rate_limited, list) and rate_limited:
-            # All entries were stale/weekly-only — not actually rate limited for current window
-            if stale_count:
-                lines.append(
-                    f"Rate-limited: none (currently) — {stale_count} stale entry expired, pooled quota still available"
-                )
+                status = resp.status
+                if status == 200:
+                    payload = json.loads(await resp.text())
+            if status != 200:
+                result = f"Error: OpenRouter key usage returned HTTP {status}; no usage data available."
+            elif not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
+                result = "Error: OpenRouter key usage returned an unsupported response; no usage data available."
             else:
-                lines.append("Rate-limited: none")
-        else:
-            lines.append("Rate-limited: none")
-        # Per-account remainings are useful but must not expose emails. Anonymize to Account 1..N.
-        per_account = data.get("per_account")
-        if isinstance(per_account, list) and per_account:
-            lines.append(
-                f"Per-account pools: {len(per_account)} accounts (emails redacted)"
-            )
-            # Optionally show anonymized quota spread without emails
-            for idx, acct in enumerate(per_account[:5], start=1):
-                if not isinstance(acct, dict):
-                    continue
-                tier = acct.get("tier", "")
-                live = acct.get("live_limited") or []
-                lim_str = f" live_limited={live}" if live else ""
-                # Show only remaining %s anonymized
-                rem = acct.get("remaining") or {}
-                parts = []
-                if isinstance(rem, dict):
-                    for k, v in list(rem.items())[:2]:
-                        if isinstance(v, dict) and "remaining_pct" in v:
-                            parts.append(f"{k}:{v['remaining_pct']:.0f}%")
-                extra = " " + " ".join(parts) if parts else ""
-                lines.append(f"  - Account {idx} ({tier}){lim_str}{extra}")
-            if len(per_account) > 5:
-                lines.append(f"  … +{len(per_account) - 5} more")
-
-        # Build a sanitized copy for the raw payload fallback — strip every email field recursively
-        def _sanitize(obj):
-            if isinstance(obj, dict):
-                out = {}
-                for k, v in obj.items():
-                    if k.lower() == "email":
-                        out[k] = f"redacted_{hash(str(v)) % 10000:04d}@redacted.local"
-                    else:
-                        out[k] = _sanitize(v)
-                return out
-            if isinstance(obj, list):
-                return [_sanitize(x) for x in obj]
-            return obj
-
-        sanitized = _sanitize(data)
-        rendered = json.dumps(sanitized, indent=2, ensure_ascii=False)
-        if len(rendered) > 2500:
-            rendered = rendered[:2500] + "\n… [truncated, emails redacted]"
-        lines.append("\nSanitized payload (emails redacted):" + rendered)
-        return "\n".join(lines)
+                result = self.summarize(payload["data"])
+        except asyncio.TimeoutError:
+            result = "Error: OpenRouter key usage timed out; no usage data available."
+        except Exception:
+            result = "Error: OpenRouter key usage could not be read; no usage data available."
+        return result
 
 
 class ManagePluginTool(Tool):

@@ -87,9 +87,17 @@ OLLAMA_EXTRA_HEADERS={}
 
 Keep the existing OpenRouter key in `OLLAMA_API_KEY`. Provider selection is a **body** field, not a header. Availability and account-level restrictions still apply; `only` does not override them. See [OpenRouter provider routing](https://openrouter.ai/docs/guides/routing/provider-selection). The base slug `deepinfra` allows its variants; use `deepinfra/turbo` to target that endpoint specifically. `:nitro` prioritizes throughput among eligible endpoints; it is not itself a provider pin.
 
-To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. This is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level and leaves the model/provider default unchanged. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+To request an explicit reasoning effort, add it to the same object, for example `OLLAMA_EXTRA_BODY='{"provider":{"only":["deepinfra"]},"reasoning":{"effort":"high"}}'`. For other models this is opt-in: `OLLAMA_DISABLE_REASONING=false` alone sends no effort level. DeepSeek V4.1 Flash is explicitly parameterized as described below. Explicit per-call disabling (including auxiliary calls) takes precedence over custom reasoning fields. Supported effort levels depend on the selected model/provider; see [OpenRouter reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
 
-For actual custom headers, for example `OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://your-domain.example","X-Title":"Curie"}'`. The configured API key takes precedence over any case variant of `Authorization`.
+For OpenRouter app attribution, set HTTP **headers**, not body fields:
+
+```ini
+OLLAMA_EXTRA_HEADERS='{"HTTP-Referer":"https://council.zombiedawn.net/","X-OpenRouter-Title":"Dame Curie: Always Teasing"}'
+```
+
+`HTTP-Referer` is the app's URL/unique identifier; `X-OpenRouter-Title` sets its display name. OpenRouter still accepts `X-Title`, but the title alone does not create an app entry. Attribution opts the app into public rankings/analytics; see [OpenRouter app attribution](https://openrouter.ai/docs/app-attribution). Use your own app URL/title for another identity.
+
+Merge these into any existing `OLLAMA_EXTRA_HEADERS` object; leave `OLLAMA_EXTRA_BODY`, routing, model and credentials unchanged. The configured API key takes precedence over any case variant of `Authorization`. For the current Curie deployment, edit private `/srv/maxwell/curie/config/bot.env`, not the development checkout `.env`, then coordinate a bot/API `restart` through the [instance operator](SCREEN_WORKFLOW.md#stop-start-restart). The deployed image already supports these options; no image rebuild is needed.
 
 Scope and precedence:
 
@@ -98,19 +106,53 @@ Scope and precedence:
 - Each request gets its own copy of the extra body, preserving configured routing through retries without sharing mutable nested state. Existing retry/streaming/telemetry behavior remains authoritative.
 - Headers can contain credentials: keep them in private instance configuration, never source control or public files. Clear endpoint-specific options when changing the main endpoint.
 
-## Independent HD image configuration
+## DeepSeek V4.1 Flash reasoning controls
 
-`hd_image` uses only `GEMINI_IMAGE_BASE_URL`, `GEMINI_IMAGE_API_KEY`, and `GEMINI_IMAGE_MODEL`. It never inherits `OLLAMA_*` chat configuration, credentials, routing options or model. A blank dedicated base URL returns a configuration error before fetching input images or making any generation request. A blank dedicated key sends no Authorization header, allowing explicitly configured keyless gateways. Merely adding a paid chat key must not enable paid HD image generation.
+Primary Discord commands use the configured prefix (`!` here). Anyone can report; existing bot administrators can change settings:
+
+| Command | Effect |
+| --- | --- |
+| `!reasoning` | Report requested/effective primary reasoning and exact wire fields |
+| `!reasoning low` / `high` / `max` | Persist the chosen hosted tier; apply to subsequent primary requests without restart |
+| `!reasoning off` | Explicitly disable reasoning on the verified hosted routes |
+| `!effort` | Report the exact integer or named tier currently selected |
+| `!effort 1` through `!effort 100` | On OpenRouter, persist and send that exact integer; no rounding or conversion to a named tier |
+
+Root explicitly authorized full numeric passthrough on OpenRouter, even if the advertised API schema rejects it. The V4.1-specific [reference encoder](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/encoding/README.md) supports integer 1–100; `low`, `high`, and `max` are aliases for reference values 50, 75, and 100, not an independent second effort axis. `!effort 37` stores JSON integer37 and sends `reasoning: {"enabled": true, "effort": 37}`. `!effort 50/75/100` also sends integers—not strings. Named `!reasoning low/high/max` commands retain their existing string-tier behavior; both commands update the same primary setting. Invalid/out-of-range input is refused without changing settings. A provider rejection is retained with its complete received body and request metadata for `!error`; it never causes silent tier substitution. Do not claim OpenRouter honors the numeric value merely because local tests pass. Direct DeepSeek API numeric-command behavior is unchanged: only reference presets50/75/100 map to named tiers there. Numeric commands are deployed in `maxwell-app:c010a37`; see [STATUS.md](STATUS.md) for acceptance and current runtime evidence.
+
+For OpenRouter's `deepseek/deepseek-v4.1-flash`, every request explicitly includes `reasoning: {"enabled": true, "effort": "high"}` by default; off sends `{"enabled": false, "effort": "none"}`. Official DeepSeek `deepseek-flash` (including the documented transitional Flash aliases) instead receives `thinking: {"type": "enabled"}` and `reasoning_effort: "high"`; off explicitly sends `disabled`/`none`. A persisted `deepseek_reasoning` control overrides the configured primary baseline. Explicit per-call disable/enable overrides retain precedence, including auxiliary calls. Fallback/dedicated clients do not inherit the primary command override; matching DeepSeek calls still receive explicit parameters. Other models are unchanged.
+
+No dashboard UI was added. Commands report actual loaded primary configuration; environment changes still require the normal operator restart. Preserve custom routing and attribution when changing the baseline.
+
+## Independent normal and HD image configuration
+
+The two image profiles never inherit `OLLAMA_*` chat credentials/model/routing or one another's key. Normal `IMAGE_GEN_PROTOCOL=pollinations` retains the keyless legacy generator; `images` explicitly selects native `/images/generations`. HD `GEMINI_IMAGE_PROTOCOL=chat_completions` retains the existing Gemini-compatible adapter; `images` selects native generation and JSON `/images/edits` with `images[].image_url` references. Native responses use `data[0].b64_json`. Existing names are retained for compatibility; a GPT image model belongs on the native protocol, not the chat-completions route.
+
+Curie's intended local-proxy profiles (set both dedicated keys privately, not in source):
 
 ```ini
-GEMINI_IMAGE_BASE_URL=
+IMAGE_GEN_PROTOCOL=images
+IMAGE_GEN_BASE_URL=http://192.168.241.2:8317/v1
+IMAGE_GEN_API_KEY=
+IMAGE_GEN_MODEL=gpt-image-2.5-flare
+IMAGE_GEN_QUALITY=low
+IMAGE_GEN_TIMEOUT=300
+
+GEMINI_IMAGE_PROTOCOL=images
+GEMINI_IMAGE_BASE_URL=http://192.168.241.2:8317/v1
 GEMINI_IMAGE_API_KEY=
-GEMINI_IMAGE_MODEL=gemini-3.1-flash-image
+GEMINI_IMAGE_MODEL=gpt-image-2.5-sunburst
+GEMINI_IMAGE_QUALITY=max
+GEMINI_IMAGE_TIMEOUT=600
 ```
 
-Set the base/key/model for the image provider you deliberately choose. The current adapter expects an OpenAI-compatible `/chat/completions` endpoint returning base64 `data:image` URIs in `message.content` (text or image-url parts) or `message.images[].image_url.url`; it does **not** implement native GPT Images `/images/generations` or `/images/edits`. Each tool invocation submits generation once: empty/unrecognized responses, timeouts and server errors do not trigger a second potentially billable request. This is not a cross-invocation deduplication policy. A compatible gateway is required for other image backends. The separate Pollinations `image_generator` is unchanged.
+Flare/low expresses the speed-oriented request and Sunburst/max the maximum-quality request supported by [OpenAI's documented model family](https://developers.openai.com/api/docs/guides/image-prompting). **The current local proxy does not demonstrate that distinction:** both live probes returned `quality=low`, roughly 1.57 megapixels and similar latency, and the updated local toolkit's broader measurements report ignored quality/size/format/count settings and no observable difference among 2.5 aliases. No actual slower/higher-quality execution, chosen canvas, or transparent output is promised. These fields are still sent explicitly; changing Curie's labels cannot unlock a capability the gateway ignores.
 
-Both tools remain registered under `ENABLE_IMAGE_GEN`; dashboard Runtime controls → Tools can disable `hd_image` independently. The no-inheritance behavior requires the updated application image, not only an environment edit. See [STATUS.md](STATUS.md) for deployed versus source-only state.
+A blank dedicated base rejects requests before image fetching/generation. A blank key permits deliberately keyless gateways; it does not borrow chat auth. Native generation submits exactly one POST with redirects disabled. Timeout, HTTP failure, unrecognized/empty result or decode failure never triggers another generation or silent provider fallback. Native HD references preserve original bytes; only the legacy chat adapter uses `GEMINI_IMAGE_MAX_INPUT_EDGE` shrinking. Existing Discord delivery, permanent image persistence and same-turn preview suppression remain intact.
+
+The configured proxy address is private, not host loopback inside a container. Host port8317 remains bound only to127.0.0.1. The rootful proxy's extra internal bridge `maxwell-curie-cpa` uses `192.168.241.0/29` and fixed proxy address192.168.241.2, avoiding Curie's independent rootless172.17 routes. It exposes no Docker socket to Curie. After **recreating** `cli-proxy-api` (an ordinary restart retains attachment), reattach the existing private network using `sudo docker network connect --ip 192.168.241.2 maxwell-curie-cpa cli-proxy-api` and verify reachability/authentication before image use. Do not publish the proxy publicly or disable rootless host-loopback isolation.
+
+Both tools remain under `ENABLE_IMAGE_GEN` and independently disableable runtime tool controls. Native support requires the updated image; see [STATUS.md](STATUS.md) for source versus deployed evidence.
 
 ## Provider retries
 
