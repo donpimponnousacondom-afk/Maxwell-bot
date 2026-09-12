@@ -1,6 +1,6 @@
 # Dame Curie — shared Screen and container operations
 
-Read [STATUS.md](STATUS.md) for verified runtime state and [DOCKER.md](DOCKER.md) for the isolation boundary. Root authorized the host-native → private-rootless cutover. The existing `152732.dame_curie` session/window 0 is retained; no display was detached and no replacement session was created.
+Read [STATUS.md](STATUS.md) for verified runtime state and [DOCKER.md](DOCKER.md) for the isolation boundary. Root authorized the host-native → private-rootless cutover. The original `152732.dame_curie` session was retained during rollout, but later disappeared. At root's request, `1292921.dame_curie` was launched with the filtered log follower in window0; no other Screen session/display was displaced.
 
 ## Current process ownership
 
@@ -8,7 +8,7 @@ Read [STATUS.md](STATUS.md) for verified runtime state and [DOCKER.md](DOCKER.md
 - The source-only operational checkout is `/opt/maxwell`. The development checkout remains `/home/codexy/Dame_Curie/Maxwell-bot`; do not run its legacy `./run.sh` alongside Compose.
 - Screen runs the startup command and then follows Compose logs under the existing advisory `/tmp/dame-curie-maxwell.lock`. The bot itself runs in its rootless container, not as a host Python child of Screen.
 - The lock discourages the old wrapped launch but is not a universal supervisor. Direct host Python execution bypasses it. Never delete the lock file or launch a second copy of these credentials/state.
-- Rootless Docker uses its per-user systemd unit and lingering. Container restart policy, not Screen, owns recovery. Documentation-only changes do not require a reconnect.
+- Rootless Docker uses its per-user systemd unit and lingering. Container restart policy, not Screen, owns recovery. Root authorizes routine development restarts after commits or explicitly requested pushes, even for documentation-only changes, to refresh checkout-at-boot. Rebuild/select a new image for application changes; documentation-only changes can restart the existing image.
 
 The launched Screen command is:
 
