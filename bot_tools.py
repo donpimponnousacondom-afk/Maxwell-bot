@@ -1296,8 +1296,7 @@ def _persist_public_image(
 ) -> tuple[str | None, str | None]:
     """Best-effort write of image bytes to the public _images dir.
 
-    Returns (local_path, public_url) or (None, None) on failure. Callers
-    must keep working without a permanent link if the save fails.
+    Returns (local_path, public_url) or (None, None) on failure.
     """
     try:
         img_dir, pub_base = _public_image_target(bot)
@@ -1320,24 +1319,30 @@ class ImageGeneratorTool(Tool):
         return (
             "Generate an AI image using the configured normal profile — the DEFAULT image tool, text-to-image only. "
             "It CANNOT take an input image: to edit/modify/restyle an existing image, use hd_image. "
-            "Params: prompt (required). Posts the image to chat with a CDN URL you can reuse in sites."
+            "Params: prompt (required), auto_send (optional bool, default false). "
+            "By default generates and saves a local/public image WITHOUT posting it. "
+            "Present it using send_file(path=..., caption=...) or a normal image-preview link. "
+            "Set auto_send=true only to post the image immediately; __IMAGE_SENT__ means it is already sent, "
+            "so do not resend its URL or add commentary unless another task needs a response."
         )
 
     async def execute(
-        self, message: Message, prompt: str | None = None, **kwargs
+        self, message: Message, prompt: str | None = None, auto_send: bool = False, **kwargs
     ) -> str:
         if not prompt:
             return "Error: prompt parameter is required"
         protocol = getattr(self.bot.config, "IMAGE_GEN_PROTOCOL", "pollinations")
         if protocol == "images":
-            result = await self._native_generate(message, prompt)
+            result = await self._native_generate(message, prompt, auto_send=auto_send)
         elif protocol == "pollinations":
-            result = await self._pollinations_generate(message, prompt)
+            result = await self._pollinations_generate(message, prompt, auto_send=auto_send)
         else:
             result = "Error: unsupported IMAGE_GEN_PROTOCOL; use pollinations or images"
         return result
 
-    async def _native_generate(self, message: Message, prompt: str) -> str:
+    async def _native_generate(
+        self, message: Message, prompt: str, auto_send: bool = False,
+    ) -> str:
         cfg = self.bot.config
         base = (getattr(cfg, "IMAGE_GEN_BASE_URL", "") or "").strip().rstrip("/")
         if not base:
@@ -1356,26 +1361,32 @@ class ImageGeneratorTool(Tool):
         if error:
             return error
         return await self._deliver_generated_image(
-            message, prompt, image_bytes, prefix="image", ext=ext
+            message, prompt, image_bytes, prefix="image", ext=ext, auto_send=auto_send,
         )
 
     async def _deliver_generated_image(
         self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str,
-        ext: str = "png",
+        ext: str = "png", auto_send: bool = False,
     ) -> str:
         local_path, perm_url = _persist_public_image(
             self.bot, image_bytes, prefix=prefix, ext=f".{ext}"
         )
-        file = File(BytesIO(image_bytes), filename=f"generated_image.{ext}")
-        sent_msg = None
-        self._signal_streaming(message)
-        try:
-            sent_msg = await message.channel.send(file=file)
-        except discord.Forbidden:
-            logger.warning(
-                f"Cannot send image in {message.channel.id} — missing permissions"
+        if not auto_send and not local_path:
+            return (
+                "Error: image generated, but saving the local/public copy failed. NOT sent. "
+                "Generation was not retried; do not automatically repeat image generation."
             )
-            return "Error: Cannot send image — missing permissions"
+        sent_msg = None
+        if auto_send:
+            file = File(BytesIO(image_bytes), filename=f"generated_image.{ext}")
+            self._signal_streaming(message)
+            try:
+                sent_msg = await message.channel.send(file=file)
+            except discord.Forbidden:
+                logger.warning(
+                    f"Cannot send image in {message.channel.id} — missing permissions"
+                )
+                return "Error: Cannot send image — missing permissions"
         cdn_url = None
         if sent_msg and sent_msg.attachments:
             cdn_url = sent_msg.attachments[0].url
@@ -1387,7 +1398,10 @@ class ImageGeneratorTool(Tool):
                 "is_tool": True,
             },
         )
-        result = f"Image sent to chat: {prompt[:100]}"
+        result = (
+            f"__IMAGE_SENT__ Image sent to chat: {prompt[:100]}"
+            if auto_send else f"Image generated, NOT sent: {prompt[:100]}"
+        )
         if cdn_url:
             result += f"\nImage URL: {cdn_url}"
         if perm_url:
@@ -1401,14 +1415,17 @@ class ImageGeneratorTool(Tool):
                 f'(pass to create_site as images=[{{"path": "{local_path}"}}] '
                 "to bundle it into a site)"
             )
-        result += "\nLook at the image you just posted. If it looks good, mention the URL or use it for the site. "
         result += (
-            "If it looks bad, call image_generator again with an improved prompt. "
+            "\nAlready sent; do not resend the image or its URL. No commentary needed unless another task requires it."
+            if auto_send else
+            f'\nPresent using send_file(path="{local_path}", caption="...") or a normal image-preview link. '
+            "A saved path is not delivery. Use the local/public image reference for sites or other tools."
         )
-        result += "If you were generating this for a site, call create_site NOW (in your next response) with the URL embedded in the body — do not call create_site before image_generator returns this URL."
         return result
 
-    async def _pollinations_generate(self, message: Message, prompt: str) -> str:
+    async def _pollinations_generate(
+        self, message: Message, prompt: str, auto_send: bool = False,
+    ) -> str:
         # Model comes solely from config — which reads POLLINATIONS_MODEL from
         # .env (config default applies only when unset). No hardcoded fallback
         # here so we never silently shift models across code edits.
@@ -1476,7 +1493,7 @@ class ImageGeneratorTool(Tool):
             "Pollinations image generated successfully, size: %s bytes", len(raw)
         )
         return await self._deliver_generated_image(
-            message, prompt, raw, prefix="pollinations"
+            message, prompt, raw, prefix="pollinations", auto_send=auto_send,
         )
 
 
@@ -1617,7 +1634,10 @@ class HDImageGeneratorTool(Tool):
             "Params: prompt (required — for an edit, describe the change, not the whole scene); "
             "image (optional — an http(s) URL, a local path, or a list of up to 4 of them, to edit "
             "or use as reference). If image is omitted and the user attached images to the message, "
-            "those are used automatically. Returns a Discord CDN URL plus a permanent URL for sites."
+            "those are used automatically. auto_send (optional bool, default false) saves a local/public image "
+            "WITHOUT posting it; present using send_file(path=..., caption=...) or a normal image-preview link. "
+            "Set auto_send=true only to post immediately; __IMAGE_SENT__ means already sent, "
+            "so do not resend its URL or add commentary unless another task needs a response."
         )
 
     def _endpoint(self) -> tuple[str, str, str]:
@@ -1743,6 +1763,7 @@ class HDImageGeneratorTool(Tool):
         message: Message,
         prompt: str | None = None,
         image: str | list | None = None,
+        auto_send: bool = False,
         **kwargs,
     ) -> str:
         if not prompt:
@@ -1821,34 +1842,37 @@ class HDImageGeneratorTool(Tool):
             )
         if error:
             return error
-        return await self._deliver_generated_image(message, prompt, image_bytes, ext, loaded)
+        return await self._deliver_generated_image(
+            message, prompt, image_bytes, ext, loaded, auto_send=auto_send,
+        )
 
     async def _deliver_generated_image(
         self, message: Message, prompt: str, image_bytes: bytes, ext: str, loaded: int,
+        auto_send: bool = False,
     ) -> str:
-        file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")
-        sent_msg = None
-        # Step aside for the live progress message — the HD image is
-        # the user-visible result; the "running hd_image" status is
-        # redundant the moment the upload starts.
-        self._signal_streaming(message)
-        try:
-            sent_msg = await message.channel.send(file=file)
-        except discord.Forbidden:
-            logger.warning(
-                f"Cannot send HD image in {message.channel.id} — missing permissions"
-            )
-            return "Error: Cannot send HD image — missing permissions"
-
-        # Grab the Discord CDN URL from the attachment
-        cdn_url = None
-        if sent_msg and sent_msg.attachments:
-            cdn_url = sent_msg.attachments[0].url
-
-        # Persist a permanent public copy (Discord CDN URLs expire ~24h).
         local_path, perm_url = _persist_public_image(
             self.bot, image_bytes, ext=f".{ext}", prefix="hd"
         )
+        if not auto_send and not local_path:
+            return (
+                "Error: HD image generated, but saving the local/public copy failed. NOT sent. "
+                "Generation was not retried; do not automatically repeat image generation."
+            )
+        sent_msg = None
+        if auto_send:
+            file = File(BytesIO(image_bytes), filename=f"hd_generated_image.{ext}")
+            self._signal_streaming(message)
+            try:
+                sent_msg = await message.channel.send(file=file)
+            except discord.Forbidden:
+                logger.warning(
+                    f"Cannot send HD image in {message.channel.id} — missing permissions"
+                )
+                return "Error: Cannot send HD image — missing permissions"
+
+        cdn_url = None
+        if sent_msg and sent_msg.attachments:
+            cdn_url = sent_msg.attachments[0].url
 
         verb = "Edited" if loaded else "Generated"
         await self.bot.memory.add_to_channel_memory(
@@ -1859,7 +1883,10 @@ class HDImageGeneratorTool(Tool):
                 "is_tool": True,
             },
         )
-        result = f"HD image {verb.lower()} successfully: {prompt[:100]}"
+        result = (
+            f"__IMAGE_SENT__ HD image {verb.lower()} successfully, sent to chat: {prompt[:100]}"
+            if auto_send else f"HD image generated, NOT sent: {prompt[:100]}"
+        )
         if loaded:
             result += f" (from {loaded} input image{'s' if loaded > 1 else ''})"
         if cdn_url:
@@ -1875,6 +1902,12 @@ class HDImageGeneratorTool(Tool):
                 f'(pass to create_site as images=[{{"path": "{local_path}"}}] '
                 "to bundle it into a site)"
             )
+        result += (
+            "\nAlready sent; do not resend the image or its URL. No commentary needed unless another task requires it."
+            if auto_send else
+            f'\nPresent using send_file(path="{local_path}", caption="...") or a normal image-preview link. '
+            "A saved path is not delivery. Use the local/public image reference for sites or other tools."
+        )
         return result
 
 
@@ -7233,7 +7266,10 @@ class SendFileTool(Tool):
             "Create or send a file attachment. Params: filename + content "
             "(inline), or path (existing file / container path). "
             "encoding=text|base64 (prefer base64 for code/HTML). "
-            "A path is not delivery — this tool attaches the file."
+            "caption (optional) is posted with the attachment, not as a separate message "
+            "(max 2000 characters on Discord). "
+            "A path is not delivery — this tool attaches the file. "
+            "__CAPTION_SENT__ means the caption is already posted; do not repeat it."
         )
 
     async def execute(
@@ -7243,8 +7279,11 @@ class SendFileTool(Tool):
         content: str | None = None,
         encoding: str = "text",
         path: str | None = None,
+        caption: str = "",
         **kwargs,
     ) -> str:
+        if len(caption) > 2000:
+            return "Error: caption is too long (max 2000 characters); shorten it to keep one attachment message"
         if path:
             try:
                 resolved_input = self._resolve_send_file_path(path)
@@ -7267,7 +7306,7 @@ class SendFileTool(Tool):
             except (OSError, ValueError, RuntimeError, asyncio.TimeoutError) as e:
                 return f"Error reading file from disk: {e}"
             safe_name = _safe_attachment_filename(filename or target.name, default="file")
-            return await self._send_blob(message, blob, safe_name)
+            return await self._send_blob(message, blob, safe_name, caption=caption)
 
         # Inline-content mode (original behavior).
         if not filename or not str(filename).strip():
@@ -7290,7 +7329,7 @@ class SendFileTool(Tool):
         except Exception as e:
             return f"Error: could not decode file content: {e}"
 
-        return await self._send_blob(message, blob, safe_name)
+        return await self._send_blob(message, blob, safe_name, caption=caption)
 
     def _allowed_send_file_bases(self) -> list[str]:
         # Do NOT allow the full data/ tree (admins.json, cookies, traces, etc.).
@@ -7354,15 +7393,18 @@ class SendFileTool(Tool):
                     continue
         return None, "not in an allowed host directory or not found"
 
-    async def _send_blob(self, message: Message, blob: bytes, safe_name: str) -> str:
+    async def _send_blob(
+        self, message: Message, blob: bytes, safe_name: str, caption: str = "",
+    ) -> str:
         if len(blob) > self.MAX_SIZE:
             return f"Error: file is too large (max {self.MAX_SIZE // 1024 // 1024} MB)"
 
         file = File(BytesIO(blob), filename=safe_name)
+        caption_kwargs = {"content": caption} if caption else {}
         sent = None
         try:
             try:
-                sent = await message.reply(file=file)
+                sent = await message.reply(file=file, **caption_kwargs)
             except (discord.NotFound, discord.HTTPException) as exc:
                 code = getattr(exc, "code", None)
                 parent_gone = isinstance(exc, discord.NotFound) or code in {
@@ -7373,7 +7415,7 @@ class SendFileTool(Tool):
                     raise
                 if not parent_gone:
                     raise
-                sent = await message.channel.send(file=file)
+                sent = await message.channel.send(file=file, **caption_kwargs)
         except discord.Forbidden:
             return "Error: no permission to send files here"
         except discord.HTTPException as e:
@@ -7391,6 +7433,8 @@ class SendFileTool(Tool):
         result = f"__FILE_SENT__ Sent file: {safe_name} ({len(blob)} bytes)"
         if file_url:
             result += f"\nFile URL: {file_url}"
+        if caption:
+            result += "\n__CAPTION_SENT__"
         return result
 
 
@@ -9694,12 +9738,18 @@ class SendMediaTool(Tool):
     def get_description(self):
         return (
             "Send an image/video URL as a Discord attachment. "
-            "Params: url (required, direct link to media file)."
+            "Params: url (required, direct link to media file), caption (optional, posted with the attachment, "
+            "not as a separate message; max 2000 characters on Discord). "
+            "__CAPTION_SENT__ means the caption is already posted; do not repeat it."
         )
 
-    async def execute(self, message: Message, url: str | None = None, **kwargs) -> str:
+    async def execute(
+        self, message: Message, url: str | None = None, caption: str = "", **kwargs,
+    ) -> str:
         if not url:
             return "Error: url is required"
+        if len(caption) > 2000:
+            return "Error: caption is too long (max 2000 characters); shorten it to keep one attachment message"
 
         if not _is_safe_url(url):
             return "Error: Cannot fetch from private/internal URLs"
@@ -9741,9 +9791,10 @@ class SendMediaTool(Tool):
             filename = os.path.splitext(filename)[0] + ".bin"
 
         file = File(BytesIO(media_bytes), filename=filename)
+        caption_kwargs = {"content": caption} if caption else {}
         sent = None
         try:
-            sent = await message.reply(file=file)
+            sent = await message.reply(file=file, **caption_kwargs)
         except discord.Forbidden:
             return "Error: no permission to send files here"
         except discord.HTTPException as e:
@@ -9759,6 +9810,8 @@ class SendMediaTool(Tool):
         result += f"\nSource URL: {url}"
         if cdn_url:
             result += f"\nFile URL: {cdn_url}"
+        if caption:
+            result += "\n__CAPTION_SENT__"
         return result
 
 

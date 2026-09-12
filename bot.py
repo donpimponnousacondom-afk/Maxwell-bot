@@ -39,7 +39,6 @@ from response_observability import (
     record_delivery,
     send_command_response,
     send_measured,
-    suppress_delivered_image_previews,
     update_footer_control,
 )
 
@@ -1831,6 +1830,8 @@ def _sanitize_visible_reply(text: str, *, scrub_repeats: bool = True) -> str:
         "__MEDIA_SENT__",
         "__FILE_SENT__",
         "__MESSAGE_SENT__",
+        "__IMAGE_SENT__",
+        "__CAPTION_SENT__",
         "__REASONING_RECORDED__",
     ):
         response = response.replace(marker, "")
@@ -2615,6 +2616,16 @@ def _plugin_result_needs_followup(result: str) -> bool:
     return bool(head) and tool_schemas_returns_result(head)
 
 
+def image_or_caption_delivered(result: str) -> bool:
+    return result.startswith((
+        "Tool image_generator: __IMAGE_SENT__",
+        "Tool hd_image: __IMAGE_SENT__",
+    )) or (
+        result.startswith(("Tool send_file: __FILE_SENT__", "Tool send_media: __MEDIA_SENT__"))
+        and "\n__CAPTION_SENT__" in result
+    )
+
+
 def _tool_results_need_followup(tool_results: list[str]) -> bool:
     # First pass: does the batch contain anything that needs a model turn
     # (a follow-up tool result, or an error)? If yes, we ALWAYS loop back,
@@ -2627,6 +2638,8 @@ def _tool_results_need_followup(tool_results: list[str]) -> bool:
         # (prevents false positives like "Error handling in Python" search results)
         if result.startswith(("Error:", "Error ")) or "\nError:" in result:
             return True
+        if image_or_caption_delivered(result):
+            continue
         if any(result.startswith(f"Tool {name}:") for name in FOLLOWUP_TOOL_NAMES):
             has_followup_signal = True
         elif _plugin_result_needs_followup(result):
@@ -2689,9 +2702,9 @@ def _should_skip_plaintext_after_send(
     followed by the actual answer.
     """
     last = last_tool_results or []
-    if any("__MESSAGE_SENT__" in tr for tr in last):
+    if any("__MESSAGE_SENT__" in tr or image_or_caption_delivered(tr) for tr in last):
         return True
-    if any("__MESSAGE_SENT__" in tr for tr in all_tool_results) and not (
+    if any("__MESSAGE_SENT__" in tr or image_or_caption_delivered(tr) for tr in all_tool_results) and not (
         followup_turn_ran and (response or "").strip()
     ):
         return True
@@ -14769,11 +14782,7 @@ class MaxwellBot(commands.Bot):
                 response, send_stickers = self._extract_stickers_from_text(
                     response, message.guild
                 )
-                delivery_response = (
-                    suppress_delivered_image_previews(response, all_tool_results)
-                    if platform == "discord" else response
-                )
-                _, chunks = prepare_delivery(self, delivery_response, response_metrics, self._split_response)
+                _, chunks = prepare_delivery(self, response, response_metrics, self._split_response)
                 if not chunks and send_stickers:
                     chunks = [""]
                 # Fast-tool fix: try to transition the live progress message

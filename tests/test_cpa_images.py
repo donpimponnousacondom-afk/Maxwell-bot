@@ -13,7 +13,6 @@ from bot_tools import (
     _get_shared_session,
     close_shared_session,
 )
-from response_observability import suppress_delivered_image_previews
 
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
@@ -79,11 +78,11 @@ def native_image(request, monkeypatch):
 @pytest.mark.parametrize("model", [
     "gpt-image-2", "gpt-image-2.5", "gpt-image-2.5-flare", "gpt-image-2.5-sunburst",
 ])
-def test_native_generation_preserves_profile_delivery_and_preview(native_image, suffix, model):
+def test_native_generation_preserves_profile_and_explicit_delivery(native_image, suffix, model):
     case = native_image
     setattr(case.tool.bot.config, case.prefix + "_BASE_URL", "http://127.0.0.1:8317/v1" + suffix)
     setattr(case.tool.bot.config, case.prefix + "_MODEL", model)
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
 
     case.session.post.assert_called_once()
     args, kwargs = case.session.post.call_args
@@ -103,12 +102,12 @@ def test_native_generation_preserves_profile_delivery_and_preview(native_image, 
     case.persist.assert_called_once()
     assert case.persist.call_args.args[1] == PNG
     case.tool.bot.memory.add_to_channel_memory.assert_awaited_once()
-    expected = "HD image generated successfully:" if case.hd else "Image sent to chat:"
+    expected = "__IMAGE_SENT__ HD image generated successfully, sent to chat:" if case.hd else "__IMAGE_SENT__ Image sent to chat:"
     assert result.startswith(expected)
     assert f"Permanent URL: {PERMANENT}" in result
     assert "Local path: /synthetic/image.png" in result
-    name = "hd_image" if case.hd else "image_generator"
-    assert suppress_delivered_image_previews(CDN, [f"Tool {name}: {result}"]) == f"<{CDN}>"
+    assert f"Image URL: {CDN}" in result
+    assert "do not resend" in result
 
 
 @pytest.mark.parametrize("quality", ["low", "high", "xhigh", "max", "auto"])
@@ -116,7 +115,7 @@ def test_native_profile_settings_are_sent_without_claiming_response_quality(nati
     case = native_image
     setattr(case.tool.bot.config, case.prefix + "_QUALITY", quality)
     setattr(case.tool.bot.config, case.prefix + "_TIMEOUT", 600)
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert not result.startswith("Error")
     assert case.session.post.call_args.kwargs["json"]["quality"] == quality
     assert case.session.post.call_args.kwargs["timeout"].total == 600
@@ -131,7 +130,7 @@ def test_native_missing_base_never_uses_chat_other_image_profile_or_pollinations
         delattr(case.tool.bot.config, case.prefix + "_BASE_URL")
     else:
         setattr(case.tool.bot.config, case.prefix + "_BASE_URL", base)
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert case.prefix + "_BASE_URL" in result
     assert "chat settings are not used" in result
@@ -146,7 +145,7 @@ def test_native_keyless_endpoint_never_borrows_chat_or_other_image_key(native_im
         delattr(case.tool.bot.config, case.prefix + "_API_KEY")
     else:
         setattr(case.tool.bot.config, case.prefix + "_API_KEY", key)
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert not result.startswith("Error")
     assert case.session.post.call_args.kwargs["headers"] == {"Content-Type": "application/json"}
 
@@ -154,7 +153,7 @@ def test_native_keyless_endpoint_never_borrows_chat_or_other_image_key(native_im
 def test_unknown_image_protocol_fails_before_requests(native_image):
     case = native_image
     setattr(case.tool.bot.config, case.prefix + "_PROTOCOL", "typo")
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert case.prefix + "_PROTOCOL" in result
     case.get_session.assert_not_awaited()
@@ -170,7 +169,7 @@ def test_unknown_image_protocol_fails_before_requests(native_image):
 def test_unusable_native_response_is_not_retried_or_sent_to_chat(native_image, body):
     case = native_image
     case.session.post.return_value.text.return_value = body
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert "may have been billed" in result
     assert "not retried" in result
@@ -186,7 +185,7 @@ def test_native_http_error_is_not_retried_or_redirected(native_image, status):
     case = native_image
     case.session.post.return_value.status = status
     case.session.post.return_value.text.return_value = "private upstream detail must not escape"
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert str(status) in result
     assert "may have been billed" in result
@@ -202,7 +201,7 @@ def test_native_http_error_is_not_retried_or_redirected(native_image, status):
 def test_native_transport_failure_is_not_retried(native_image, error, stage):
     case = native_image
     getattr(case.session.post.return_value, stage).side_effect = error("private transport detail")
-    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert "may have been billed" in result
     assert "not retried" in result
@@ -216,7 +215,7 @@ def test_native_cancellation_never_retries(native_image):
     case = native_image
     case.session.post.return_value.__aenter__.side_effect = asyncio.CancelledError
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+        asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     case.session.post.assert_called_once()
     case.message.channel.send.assert_not_awaited()
 
@@ -229,7 +228,7 @@ def test_native_hd_edit_preserves_original_reference_bytes(native_image, monkeyp
     monkeypatch.setattr(case.tool, "_shrink", shrink)
     case.tool.bot.config.GEMINI_IMAGE_MODEL = "gpt-image-2.5-sunburst"
     case.tool.bot.config.GEMINI_IMAGE_QUALITY = "max"
-    result = asyncio.run(case.tool.execute(case.message, prompt="make it blue", image=image))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="make it blue", image=image))
 
     shrink.assert_not_called()
     case.session.post.assert_called_once()
@@ -240,7 +239,7 @@ def test_native_hd_edit_preserves_original_reference_bytes(native_image, monkeyp
         "images": [{"image_url": IMAGE_URI}],
         "output_format": "png", "response_format": "b64_json", "n": 1,
     }
-    assert result.startswith("HD image edited successfully:")
+    assert result.startswith("__IMAGE_SENT__ HD image edited successfully, sent to chat:")
     assert "from 1 input image" in result
     assert "Edited HD image" in case.tool.bot.memory.add_to_channel_memory.await_args.args[1]["content"]
 
@@ -253,7 +252,7 @@ def test_native_hd_auto_attachments_keep_four_reference_limit(native_image, monk
     ) for index in range(6)]
     load = AsyncMock(return_value=(PNG, ""))
     monkeypatch.setattr(case.tool, "_load_one", load)
-    result = asyncio.run(case.tool.execute(case.message, prompt="combine these"))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="combine these"))
     assert load.await_count == 4
     assert case.session.post.call_args.kwargs["json"]["images"] == [{"image_url": IMAGE_URI}] * 4
     assert "from 4 input images" in result
@@ -276,7 +275,7 @@ def test_native_hd_reference_failure_does_not_submit_generation(native_image, mo
 def test_native_hd_failed_edit_never_falls_back_to_generation(native_image):
     case = native_image
     case.session.post.return_value.text.return_value = "{}"
-    result = asyncio.run(case.tool.execute(case.message, prompt="change it", image=IMAGE_URI))
+    result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="change it", image=IMAGE_URI))
     assert result.startswith("Error:")
     assert "may have been billed" in result
     case.session.post.assert_called_once()
@@ -317,7 +316,7 @@ def test_real_native_transport_accepts_configured_loopback_endpoint(native_image
         async with server:
             port = server.sockets[0].getsockname()[1]
             setattr(case.tool.bot.config, case.prefix + "_BASE_URL", f"http://127.0.0.1:{port}/v1")
-            result = await case.tool.execute(case.message, prompt="synthetic local image")
+            result = await case.tool.execute(case.message, auto_send=True, prompt="synthetic local image")
         await close_shared_session()
         return result
 

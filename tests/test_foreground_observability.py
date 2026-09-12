@@ -296,11 +296,11 @@ def test_multichar_prefix_commands_and_help_fit_discord(command):
 
 
 @pytest.mark.parametrize("tool_name,prefix", [
-    ("image_generator", "Image sent to chat:"),
-    ("hd_image", "HD image generated successfully:"),
-    ("hd_image", "HD image edited successfully:"),
+    ("image_generator", "Image generated, NOT sent:"),
+    ("hd_image", "HD image generated, NOT sent:"),
+    ("hd_image", "HD image edited, NOT sent:"),
 ])
-def test_foreground_image_link_has_one_upload_and_preserves_metrics_and_next_turn(
+def test_foreground_deferred_image_has_one_preview_reply_and_preserves_metrics(
     foreground_bot, measured_call, tool_name, prefix
 ):
     async def scenario():
@@ -312,8 +312,7 @@ def test_foreground_image_link_has_one_upload_and_preserves_metrics_and_next_tur
         async def dispatch(message, response, *, native_tool_calls=None, **kwargs):
             results = []
             if native_tool_calls:
-                await message.channel.send(file=object())
-                results = [f"Tool {tool_name}: {prefix} synthetic\nImage URL: {url}?ex=abc&hm=123"]
+                results = [f"Tool {tool_name}: {prefix} synthetic\nPermanent URL: {url}?ex=abc&hm=123"]
             return str(response), results, []
 
         bot._dispatch_tool_calls = AsyncMock(side_effect=dispatch)
@@ -323,12 +322,11 @@ def test_foreground_image_link_has_one_upload_and_preserves_metrics_and_next_tur
             ProviderResult(text, metrics=measured_call),
         ])
         await MaxwellBot._handle_message(bot, message)
-        assert len(message.channel.sent) == 2
-        upload, final = message.channel.sent
-        assert upload.kwargs["file"] is not None
+        assert len(message.channel.sent) == 1
+        final = message.channel.sent[0]
         assert final.kwargs.get("file") is None
         assert "suppress_embeds" not in final.kwargs
-        assert final.content.startswith(text.replace(f"({url})", f"(<{url}>)"))
+        assert final.content.startswith(text)
         assert final.content.endswith(FOOTER_MARKER)
         assert bot._delivery_measurements.lookup("100", str(final.id))[1] is final_metrics
         assert bot.add_message_to_memory.call_args.args[1]["content"] == text
@@ -337,14 +335,14 @@ def test_foreground_image_link_has_one_upload_and_preserves_metrics_and_next_tur
         following.id = 8
         following.channel = message.channel
         await MaxwellBot._handle_message(bot, following)
-        assert len(message.channel.sent) == 3
+        assert len(message.channel.sent) == 2
         assert message.channel.sent[-1].content.startswith(text)
         assert f"<{url}>" not in message.channel.sent[-1].content
 
     asyncio.run(scenario())
 
 
-def test_foreground_image_preview_suppression_is_not_shared_across_channels(
+def test_foreground_image_previews_remain_enabled_across_channels(
     foreground_bot, measured_call
 ):
     async def scenario():
@@ -356,7 +354,7 @@ def test_foreground_image_preview_suppression_is_not_shared_across_channels(
         async def dispatch(message, response, *, native_tool_calls=None, **kwargs):
             results = []
             if native_tool_calls:
-                results = [f"Tool image_generator: Image sent to chat: synthetic\nImage URL: {url}?ex=abc"]
+                results = [f"Tool image_generator: Image generated, NOT sent: synthetic\nPermanent URL: {url}?ex=abc"]
                 ready.set()
                 await release.wait()
             return str(response), results, []
@@ -373,12 +371,12 @@ def test_foreground_image_preview_suppression_is_not_shared_across_channels(
             await MaxwellBot._handle_message(bot, other)
             release.set()
         assert other.channel.sent[-1].content.startswith(url + "\n")
-        assert first.channel.sent[-1].content.startswith(f"<{url}>\n")
+        assert first.channel.sent[-1].content.startswith(url + "\n")
 
     asyncio.run(scenario())
 
 
-def test_foreground_image_link_progress_edit_uses_suppressed_target(
+def test_foreground_image_link_progress_edit_preserves_preview(
     foreground_bot, measured_call, monkeypatch
 ):
     import bot as bot_module
@@ -401,7 +399,7 @@ def test_foreground_image_link_progress_edit_uses_suppressed_target(
         monkeypatch.setattr(bot_module, "_make_tool_progress", lambda message: progress)
         bot._progress_enabled = lambda guild: True
         bot._dispatch_tool_calls = AsyncMock(side_effect=[
-            ("", [f"Tool image_generator: Image sent to chat: synthetic\nImage URL: {url}?ex=abc"], []),
+            ("", [f"Tool image_generator: Image generated, NOT sent: synthetic\nPermanent URL: {url}?ex=abc"], []),
             (f"[shot]({url})", [], []),
         ])
         bot._generate_response = AsyncMock(side_effect=[
@@ -411,8 +409,37 @@ def test_foreground_image_link_progress_edit_uses_suppressed_target(
         await MaxwellBot._handle_message(bot, message)
         assert not message.channel.sent
         assert len(edited) == 1
-        assert edited[0].content.startswith(f"[shot](<{url}>)\n")
+        assert edited[0].content.startswith(f"[shot]({url})\n")
         assert edited[0].content.endswith(FOOTER_MARKER)
         assert bot._delivery_measurements.lookup("100", "900")[1] is measured_call
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("name,result,caption", [
+    ("image_generator", "__IMAGE_SENT__ Image sent", ""),
+    ("hd_image", "__IMAGE_SENT__ HD image sent", ""),
+    ("send_media", "__MEDIA_SENT__ image.png\n__CAPTION_SENT__", "My caption"),
+    ("send_file", "__FILE_SENT__ image.png\n__CAPTION_SENT__", "My caption"),
+])
+def test_foreground_delivered_image_or_caption_has_no_second_reply(
+    foreground_bot, measured_call, name, result, caption
+):
+    async def scenario():
+        bot, message = foreground_bot, Message()
+
+        async def dispatch(message, response, **kwargs):
+            await message.channel.send(caption, file=object())
+            return str(response), [f"Tool {name}: {result}"], []
+
+        bot._dispatch_tool_calls = AsyncMock(side_effect=dispatch)
+        bot._generate_response = AsyncMock(return_value=ProviderResult(
+            "Redundant commentary and image URL", tool_calls=[tool_call(name, auto_send=True)], metrics=measured_call
+        ))
+        await MaxwellBot._handle_message(bot, message)
+        assert bot._generate_response.await_count == 1
+        assert len(message.channel.sent) == 1
+        assert message.channel.sent[0].content == caption
+        assert message.channel.sent[0].kwargs["file"] is not None
 
     asyncio.run(scenario())
