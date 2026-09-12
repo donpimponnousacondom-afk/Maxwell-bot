@@ -137,9 +137,16 @@ class Instance:
         command = ["docker", "compose", "--project-name", self.project,
                    "--project-directory", str(CHECKOUT), "--env-file", "/dev/null",
                    "-f", str(CHECKOUT / "compose.yaml"), *args]
-        result = subprocess.run(command, env=self.env)
-        if result.returncode:
-            raise RuntimeError("Compose command failed")
+        if args[0] == "logs":
+            if __name__ == "__main__" and not __package__:
+                from log_filter import follow_logs
+            else:
+                from scripts.log_filter import follow_logs
+            follow_logs(command, self.env)
+        else:
+            result = subprocess.run(command, env=self.env)
+            if result.returncode:
+                raise RuntimeError("Compose command failed")
 
     def inventory(self) -> list[dict]:
         ids = self.docker("ps", "-aq").split()
