@@ -47,6 +47,8 @@ Commit every coherent verified slice. Use a specific subsystem/intent subject an
 
 Do not amend/rebase/squash root's or another agent's commits without explicit approval. Do not push without a request. Keep rollback-friendly milestones rather than one giant mixed commit.
 
+`main` is protected: deliver changes through a PR, never a direct push. This repository uses squash merges. After a PR merges, fetch `origin` and start the next branch from current `origin/main`; do not continue committing on the merged branch. If work was added there already, replay only the genuinely unmerged commits onto a fresh branch, preserving the old branch and avoiding force-pushes. Verify the PR diff excludes already-merged changes and GitHub reports no merge conflicts.
+
 ## Architecture map
 
 - `bot.py`, `providers.py`: transports, live conversation/tool orchestration and OpenAI-compatible chat.

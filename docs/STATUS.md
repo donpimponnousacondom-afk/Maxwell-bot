@@ -1,5 +1,10 @@
 # Current implementation and deployment status
 
+## PR history recovery (2026-09-12)
+
+- PR#4 was squash-merged as4a4daae; its image/logging changes are already on `main`. The old `hotfix/double_messages` branch then received the unmerged documentation commit2f57d70. Reusing that branch compares against the pre-squash merge base and reintroduces already-merged history into the PR diff.
+- `pr/development-restart-policy` starts from current `origin/main` and replays only2f57d70, plus the documented fresh-branch rule. The original branch is preserved; no force-push, direct main commit, application change or repository-setting change is needed. Future PRs must start from freshly fetched `origin/main`, not a previously squash-merged feature branch. The existing0e46084 application image still matches all application code; the development restart policy applies after publishing these docs.
+
 ## Discord image delivery choices and quiet health logs (2026-09-12)
 
 - **Deployed: `maxwell-app:0e46084`**, ID `sha256:20eb0371a189c824bd4806e6974697f44998eee822189df661a1a2fd3d2c5b6c`; bot restarted at02:38:34UTC through root's unchanged `scripts/build_for_human.sh`. Exact-image synthetic offline checks passed for saved-only generation, one explicit upload, attachment captions and terminal receipts before rollout. Fresh Discord login was confirmed, with zero current-epoch error lines; bot/API/web/Ollama are running with zero restart counts, API/web/Ollama healthy. Previous image07d65aa remains available; no state restore/migration or private setting changes were performed.
