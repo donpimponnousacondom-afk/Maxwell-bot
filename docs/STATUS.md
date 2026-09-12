@@ -1,5 +1,12 @@
 # Current implementation and deployment status
 
+## Raw-update Discord delivery repair (2026-09-12)
+
+- Confirmed the incident: a late in-flight message update at06:14:23 replaced the Discord message with a data-only `SimpleNamespace`; `send_file` then failed twice and the final plaintext reply failed at06:15:06 because `.reply()` was missing. Provider calls succeeded; this was not an image-generation or Ollama failure.
+- Raw updates now produce a `DiscordMessageSnapshot`: fresh text/media remain on the snapshot, while missing Discord attributes/methods delegate to the original delivery message. Repeated updates retain one delivery target rather than nesting delegates. If an uncached fetch fails, an available channel supplies the SDK partial-message reply target. Cached originals and existing stored content are not mutated. No per-tool exception patches, automatic regeneration, Telegram/X changes, or settings/schema migrations.
+- Six new regressions fail against the original code (candidate2f3be7a263ce) and pass with the fix. They cover cached/repeated/uncached updates and the actual raw-update → in-flight refresh → captioned attachment/plaintext delivery paths, including reply references and final metrics. Fixed candidate85fd3d8e8709 passed303 focused tests in4.635s and3450 full isolated tests in102.392s; no errors/failures/skips.
+- Root explicitly requested commit, remote push, a PR, rebuild and bot restart (not Git/data reset). This branch started clean at current main4d97b32 after PR#5 merged; previous image0e46084 is the rollback image. Actual-image acceptance and final running revision are reported in the release PR/handoff.
+
 ## PR history recovery (2026-09-12)
 
 - PR#4 was squash-merged as4a4daae; its image/logging changes are already on `main`. The old `hotfix/double_messages` branch then received the unmerged documentation commit2f57d70. Reusing that branch compares against the pre-squash merge base and reintroduces already-merged history into the PR diff.

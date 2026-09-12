@@ -7,10 +7,11 @@ import json
 from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import discord
 import pytest
 
 from bot import MaxwellBot
-from bot_tools import SendMessageTool
+from bot_tools import SendFileTool, SendMessageTool
 from provider_telemetry import CallMetrics
 from providers import ProviderResult
 from response_observability import DeliveryMeasurements, FOOTER_MARKER, RunningBuild
@@ -43,7 +44,10 @@ class Message:
         self.guild = self.channel.guild
 
     async def reply(self, content=None, **kwargs):
-        return await self.channel.send(content, **kwargs)
+        reference = discord.MessageReference(
+            message_id=int(self.id), channel_id=self.channel.id, guild_id=self.guild.id,
+        )
+        return await self.channel.send(content, reference=reference, **kwargs)
 
 
 @pytest.fixture
@@ -141,6 +145,40 @@ def foreground_bot():
     return bot
 
 
+@pytest.fixture
+def raw_update_foreground(foreground_bot):
+    bot = object.__new__(MaxwellBot)
+    bot.__dict__.update(vars(foreground_bot))
+    bot._connection = SimpleNamespace(user=foreground_bot.user)
+    bot._inflight_context = {}
+    bot._media_context = {}
+    bot._recent_users = {}
+    bot._blacklist = set()
+    bot._is_admin = lambda user_id: False
+    bot._update_recent_users = Mock()
+    bot._load_control = Mock()
+    for name in (
+        "_begin_inflight_context", "_end_inflight_context", "_apply_inflight_refresh",
+        "_wait_for_late_embeds", "_message_update_fingerprint", "_message_media_fingerprint",
+    ):
+        delattr(bot, name)
+    bot._send_with_slowmode = MethodType(MaxwellBot._send_with_slowmode, bot)
+    message = Message()
+    message.embeds = []
+    bot.get_channel = lambda channel_id: message.channel
+
+    async def build_messages(current, content, **kwargs):
+        if bot._build_messages.await_count == 1:
+            await bot.on_raw_message_edit(SimpleNamespace(
+                cached_message=message, message_id=message.id, channel_id=message.channel.id,
+                data={"content": "edited request", "embeds": [{"title": "late preview"}]},
+            ))
+        return [{"role": "user", "content": bot._message_memory_content(current)}]
+
+    bot._build_messages = AsyncMock(side_effect=build_messages)
+    return bot, message
+
+
 def configure_dispatch(bot):
     tool = SendMessageTool(bot)
 
@@ -170,6 +208,72 @@ def tool_call(name, **arguments):
         "type": "function",
         "function": {"name": name, "arguments": json.dumps(arguments)},
     }
+
+
+@pytest.mark.parametrize("delivery", ["file_caption", "plain_final", "file_then_final"])
+def test_foreground_raw_update_preserves_file_and_final_reply(
+    raw_update_foreground, measured_call, delivery
+):
+    async def scenario():
+        bot, message = raw_update_foreground
+        file_tool = SendFileTool(bot)
+        file_results = []
+        calls = []
+        if delivery != "plain_final":
+            calls.append(tool_call(
+                "send_file", filename="result.txt", content="synthetic artifact", caption="Here is the result",
+            ))
+        if delivery == "file_then_final":
+            calls.append(tool_call("web_search", query="synthetic followup"))
+        responses = [ProviderResult("Final answer", tool_calls=calls, metrics=measured_call)]
+        if delivery == "file_then_final":
+            responses.append(ProviderResult("Final answer", metrics=measured_call))
+
+        async def dispatch(current, response, *, native_tool_calls=None, **kwargs):
+            results = []
+            for call in native_tool_calls or []:
+                function = call["function"]
+                if function["name"] == "send_file":
+                    result = await file_tool.execute(current, **json.loads(function["arguments"]))
+                    file_results.append(result)
+                    results.append("Tool send_file: " + result)
+                else:
+                    assert function["name"] == "web_search"
+                    results.append("Tool web_search: synthetic result")
+            return str(response), results, []
+
+        bot._dispatch_tool_calls = AsyncMock(side_effect=dispatch)
+        bot._generate_response = AsyncMock(side_effect=responses)
+        await bot._handle_message(message)
+
+        assert bot._build_messages.await_count == 2
+        refreshed = bot._dispatch_tool_calls.call_args.args[0]
+        assert refreshed.content == "edited request"
+        assert refreshed.embeds[0].title == "late preview"
+        prompt = bot._generate_response.call_args_list[0].args[0][0]["content"]
+        assert "edited request" in prompt and "late preview" in prompt
+        assert message.content == "hello" and message.embeds == []
+        assert bot._generate_response.await_count == len(responses)
+        assert len(message.channel.sent) == (2 if delivery == "file_then_final" else 1)
+        for sent in message.channel.sent:
+            reference = sent.kwargs["reference"].to_message_reference_dict()
+            assert str(reference["message_id"]) == str(message.id)
+            assert str(reference["channel_id"]) == str(message.channel.id)
+        if delivery != "plain_final":
+            assert file_results[0].startswith("__FILE_SENT__")
+            assert "__CAPTION_SENT__" in file_results[0]
+            attachment = message.channel.sent[0]
+            assert attachment.content == "Here is the result"
+            assert attachment.kwargs["file"].filename == "result.txt"
+            assert attachment.kwargs["file"].fp.getvalue() == b"synthetic artifact"
+        if delivery != "file_caption":
+            final = message.channel.sent[-1]
+            assert final.kwargs.get("file") is None
+            assert final.content.startswith("Final answer\n")
+            assert final.content.endswith(FOOTER_MARKER)
+            assert bot._delivery_measurements.lookup("100", str(final.id))[1] is measured_call
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("mode", ["plain", "terminal", "followup", "empty_followup"])
