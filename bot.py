@@ -2826,6 +2826,11 @@ def _prepare_tool_params(name: str, params: dict | None) -> dict:
     return out
 
 
+class DiscordMessageSnapshot(SimpleNamespace):
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__.get("_delivery_message"), name)
+
+
 class MaxwellBot(commands.Bot):
     """AI-powered Discord bot."""
 
@@ -6140,7 +6145,15 @@ class MaxwellBot(commands.Bot):
             stickers = self._raw_update_namespace(data.get("stickers") or [])
         else:
             stickers = list(getattr(previous, "stickers", None) or [])
-        return SimpleNamespace(
+        delivery_message = previous
+        if isinstance(previous, DiscordMessageSnapshot):
+            delivery_message = previous._delivery_message
+        if delivery_message is None:
+            partial = getattr(channel, "get_partial_message", None)
+            if callable(partial) and message_id:
+                delivery_message = partial(int(message_id))
+        return DiscordMessageSnapshot(
+            _delivery_message=delivery_message,
             id=message_id,
             channel=channel
             or SimpleNamespace(id=channel_id, guild=guild, name="unknown"),
