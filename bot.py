@@ -336,6 +336,7 @@ from error_reporting import (  # noqa: E402
     capture_incident,
     configure_incident_store,
     incident_context,
+    redact_sensitive_text,
 )
 from operator_commands import (  # noqa: E402
     PRIVATE_ERROR_REPORT_MARKER,
@@ -15162,7 +15163,8 @@ class MaxwellBot(commands.Bot):
                     logger.info(
                         "Tool %s finished: %s",
                         name,
-                        result_text[:200].replace("\n", " "),
+                        (redact_sensitive_text(result_text) if name in {"image_generator", "hd_image"}
+                         else result_text)[:200].replace("\n", " "),
                     )
                     if result_text.startswith(("Error", "Error:")):
                         self._tool_breaker.record_failure(name)

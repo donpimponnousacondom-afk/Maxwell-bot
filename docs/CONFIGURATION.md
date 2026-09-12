@@ -154,6 +154,14 @@ The configured proxy address is private, not host loopback inside a container. H
 
 Both tools remain under `ENABLE_IMAGE_GEN` and independently disableable runtime tool controls. Native support requires the updated image; see [STATUS.md](STATUS.md) for source versus deployed evidence.
 
+### Image request console logs
+
+Both `image_generator` and `hd_image` emit `Image request start` and `Image request done` INFO records as single-line JSON. A shared `request_id` pairs concurrent calls. Start records show the actual requested model ID, sanitized API endpoint, protocol, generation/edit operation, quality, input-image count, delivery flag, timeout, and **the exact outgoing prompt**. JSON escaping preserves newlines/Unicode without paraphrasing or clipping native/chat prompts. Pollinations keeps its existing 1,500-character request limit: `prompt` is what was sent, and `requested_prompt` retains the original when it differs; seed/dimensions are also logged. These fields identify the request sent to the configured gateway, not proof of which upstream model an alias ultimately resolves to.
+
+Done records report elapsed request/decode milliseconds, HTTP status (null when no response arrived), outcome, output byte count/format, exception type and private incident ID. Outcomes distinguish connection failure, HTTP rejection, non-JSON data, image decoding failure, timeout and cancellation; successful generation is not proof of Discord delivery. No request retries or delivery behavior are added.
+
+Root explicitly requested complete prompt visibility in the operator console. Treat these logs as private conversation data. Known raw/URL-encoded credentials and authentication material are redacted; endpoint userinfo/query/fragment, edit-image data and response bodies are not emitted. Existing image-tool result summaries are redacted before their 200-character console limit; model-facing results remain unchanged. Full received failure diagnostics stay in the existing admin-only incident history, correlated by `image_request_id`.
+
 ## Provider retries
 
 `OLLAMA_RETRY_ATTEMPTS` defaults to **5 total attempts** (range 1–10), not five retries. Explicit environment values override this default. Transient failures wait **10, 20, 30, 40 seconds** before attempts 2–5; the delay is linear and also applies when switching endpoints. Deterministic request rejection/failover and corrected-payload retries do not use this backoff, but still consume the fixed attempt budget.
