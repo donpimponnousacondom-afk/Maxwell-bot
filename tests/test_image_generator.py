@@ -59,7 +59,8 @@ def test_execute_always_uses_pollinations(monkeypatch):
         calls.append("nvidia")
         raise AssertionError("NVIDIA must never be called (route removed)")
 
-    async def pollinations_ok(self, message, prompt):
+    async def pollinations_ok(self, message, prompt, auto_send=False):
+        assert auto_send is True
         calls.append("pollinations")
         return "Image sent to chat: a red fox"
 
@@ -69,7 +70,7 @@ def test_execute_always_uses_pollinations(monkeypatch):
     )
     monkeypatch.setattr(ImageGeneratorTool, "_pollinations_generate", pollinations_ok)
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
     assert calls == ["pollinations"]
     assert result.startswith("Image sent to chat")
 
@@ -80,13 +81,14 @@ def test_execute_does_not_require_nvidia_key(monkeypatch):
     message = _Message()
     calls = []
 
-    async def pollinations_ok(self, message, prompt):
+    async def pollinations_ok(self, message, prompt, auto_send=False):
+        assert auto_send is True
         calls.append("pollinations")
         return "Image sent to chat: a cat"
 
     monkeypatch.setattr(ImageGeneratorTool, "_pollinations_generate", pollinations_ok)
 
-    result = asyncio.run(tool.execute(message, prompt="a cat"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a cat"))
     assert calls == ["pollinations"]
     assert "Image sent to chat" in result
 
@@ -126,7 +128,7 @@ def test_pollinations_posts_image_bytes(monkeypatch):
         lambda *_a, **_k: ("/tmp/x.png", "https://example.com/x.png"),
     )
 
-    result = asyncio.run(tool._pollinations_generate(message, "a red fox"))
+    result = asyncio.run(tool._pollinations_generate(message, "a red fox", auto_send=True))
     assert message.channel.files
     assert "Image sent to chat" in result
     assert "https://cdn.discordapp.com/gen.png" in result

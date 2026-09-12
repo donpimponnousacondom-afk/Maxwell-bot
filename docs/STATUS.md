@@ -1,5 +1,13 @@
 # Current implementation and deployment status
 
+## Image delivery choices — scoped change under acceptance
+
+- Root requested restoring normal Discord image previews, not replacing images with unexpanded links. Removed the same-turn image-preview suppression filter. The previous fix deliberately kept clickable URLs while hiding their second preview; it did not prevent the image tool's immediate upload plus a later model response.
+- `image_generator` and `hd_image` now default to `auto_send=false`: generate/persist and return explicit NOT-sent status plus usable local/public references; Curie then presents the image with commentary or a normal preview link. `auto_send=true` uploads once and records explicit sent status, ending an image-only request without another model reply. Mixed result-producing tools/errors still receive their follow-up. No silent regeneration after persistence failure.
+- `send_file` and `send_media` accept an optional Discord caption in the same attachment message; successful caption delivery suppresses redundant same-generation plaintext. Existing uncaptioned behavior and stored context are retained. Native/HD/Pollinations provider settings, CPU limits, footer/version and private error/forward/effort behavior remain unchanged.
+- **Telegram and Twitter/X are legacy/proposed integrations only, unused and unsupported; they will not be extended.** Existing code/data remain in place. New Telegram work was reverted; no Telegram/X features or tests were added. This boundary is also recorded in `AGENTS.md`.
+- Image candidatef31f659e774a passed487 focused isolated tests in3.864s, covering actual foreground messages, all four generator provider branches, no-repeat auto delivery, captions and file fallbacks, previews, footer/incident/follow-up regressions. No paid image generation or test Discord message was used. Root also requested console-only coalescing of successful Ollama health checks; raw Docker logs and health-check cadence must remain intact. Combined build/restart is authorized after focused acceptance.
+
 ## Current handoff — footer confirmed, version live and ready for root (2026-09-11)
 
 - **Current image: `maxwell-app:a0340a9`**, ID `sha256:42e482348bc268f08cb22aa4c5d42405b99421f1e315b45cc4d8af13c43351e1`; root launched it at06:40:51UTC. Root's committed CPU changes and branch `feat/footer_and_version_exposing` are preserved; `scripts/build_for_human.sh` is root's untracked work and was not changed. No further rebuild or restart was needed for this handoff.

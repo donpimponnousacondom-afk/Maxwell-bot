@@ -48,7 +48,18 @@ def _num(desc: str = "") -> dict[str, Any]:
 # parameter schemas only — descriptions are attached from tool.get_description()
 TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
     "image_generator": _obj(
-        {"prompt": _str("Image generation prompt")},
+        {
+            "prompt": _str("Image generation prompt"),
+            "auto_send": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Default false: generate and save only; present with send_file(path=..., caption=...) "
+                    "or a normal image-preview link. True: upload once immediately; __IMAGE_SENT__ "
+                    "means already sent, do not resend its URL or add commentary."
+                ),
+            },
+        },
         ["prompt"],
     ),
     "hd_image": _obj(
@@ -65,6 +76,15 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
                 "scratch; images attached to the user's message are used "
                 "automatically."
             ),
+            "auto_send": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Default false: generate and save only; present with send_file(path=..., caption=...) "
+                    "or a normal image-preview link. True: upload once immediately; __IMAGE_SENT__ "
+                    "means already sent, do not resend its URL or add commentary."
+                ),
+            },
         },
         ["prompt"],
     ),
@@ -555,6 +575,10 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
             "content": _str("File contents (text or base64)"),
             "encoding": _str("text or base64"),
             "path": _str("Optional existing on-disk path instead of content"),
+            "caption": _str(
+                "Optional text posted in the same message as the attachment, not separately "
+                "(max 2000 characters on Discord)"
+            ),
         }
     ),
     "shell": _obj(
@@ -611,7 +635,13 @@ TOOL_PARAMETERS: dict[str, dict[str, Any]] = {
     ),
     "send_meme": _obj({"subreddit": _str("Optional subreddit name (e.g. me_irl)")}),
     "send_media": _obj(
-        {"url": _str("Direct media URL to attach")},
+        {
+            "url": _str("Direct media URL to attach"),
+            "caption": _str(
+                "Optional text posted in the same message as the attachment, not separately "
+                "(max 2000 characters on Discord)"
+            ),
+        },
         ["url"],
     ),
     "tts": _obj(
@@ -955,7 +985,10 @@ _CONTRACT_SILENT = " [returns nothing]"
 def result_contract(name: str) -> str:
     """The one-line result contract appended to `name`'s description."""
     if returns_result(name):
-        return _CONTRACT_RESULT
+        return (
+            " [returns saved image by default; auto_send=true + __IMAGE_SENT__ means already delivered, no repeat]"
+            if name in {"image_generator", "hd_image"} else _CONTRACT_RESULT
+        )
     if name in TURN_ENDING_TOOL_NAMES:
         return _CONTRACT_ENDING
     return _CONTRACT_SILENT

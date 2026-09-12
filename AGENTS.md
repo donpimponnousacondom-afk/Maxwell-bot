@@ -27,6 +27,10 @@ Keep the existing `dame_curie` Screen session available; do not detach root, des
 - Coordinate file ownership with parallel agents. One coordinating agent owns infrastructure, runtime lifecycle and final commits.
 - Do not open public ports or weaken authentication to make the dashboard appear healthy. Bind the dashboard to loopback unless an existing approved authenticated reverse proxy is configured.
 
+## Legacy integrations
+
+Telegram and Twitter/X are retained only as legacy/proposed integrations. Root does not use them; they are unsupported and must not be extended or included in new feature work. Leave their existing code and stored data alone unless root explicitly requests removal or renewed support. Current delivery work targets Discord only.
+
 ## Python and tests
 
 New deployment images and development validation use Python 3.14.4. The pre-cutover host `.venv` was Python 3.13.5; old Ruff/mypy targets are historical tooling settings, not a reason to downgrade valid 3.14 code.

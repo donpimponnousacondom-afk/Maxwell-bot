@@ -66,7 +66,7 @@ def test_chat_openrouter_settings_cannot_enable_hd_image(hd_image, monkeypatch, 
     load_image = AsyncMock(return_value=(b"image", ""))
     monkeypatch.setattr(tool, "_load_one", load_image)
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox", image=image))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox", image=image))
 
     assert result == (
         "Error: HD image generation is not configured "
@@ -87,9 +87,9 @@ def test_hd_image_uses_explicit_endpoint_and_key(hd_image, suffix, model):
     tool.bot.config.GEMINI_IMAGE_API_KEY = "synthetic-image-key"
     tool.bot.config.GEMINI_IMAGE_MODEL = model
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
-    assert result.startswith("HD image generated successfully")
+    assert result.startswith("__IMAGE_SENT__ HD image generated successfully")
     session.post.assert_called_once()
     args, kwargs = session.post.call_args
     assert args == ("https://images.example.invalid/v1/chat/completions",)
@@ -111,9 +111,9 @@ def test_explicit_keyless_image_endpoint_never_borrows_chat_key(hd_image, key_pr
     if not key_present:
         del tool.bot.config.GEMINI_IMAGE_API_KEY
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
-    assert result.startswith("HD image generated successfully")
+    assert result.startswith("__IMAGE_SENT__ HD image generated successfully")
     session.post.assert_called_once()
     args, kwargs = session.post.call_args
     assert args == ("http://127.0.0.1:1234/v1/chat/completions",)
@@ -145,10 +145,10 @@ def test_supported_image_responses_generate_and_upload_once(hd_image, response_m
         {"choices": [{"message": response_message, "finish_reason": "stop"}]}
     )
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
     session.post.assert_called_once()
-    assert result.startswith("HD image generated successfully")
+    assert result.startswith("__IMAGE_SENT__ HD image generated successfully")
     message.channel.send.assert_awaited_once()
     assert message.channel.send.await_args.kwargs["file"].fp.getvalue() == b"image"
     tool.bot.memory.add_to_channel_memory.assert_awaited_once()
@@ -177,7 +177,7 @@ def test_unusable_response_does_not_repeat_billable_generation(
     monkeypatch.setattr(tool, "_shrink", lambda raw: (raw, "image/png"))
 
     result = asyncio.run(
-        tool.execute(message, prompt="a red fox", image=IMAGE_URI if editing else None)
+        tool.execute(message, auto_send=True, prompt="a red fox", image=IMAGE_URI if editing else None)
     )
 
     session.post.assert_called_once()
@@ -198,7 +198,7 @@ def test_http_error_does_not_repeat_billable_generation(hd_image, status):
     session.post.return_value.status = status
     session.post.return_value.text.return_value = "upstream unavailable"
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
@@ -214,7 +214,7 @@ def test_transport_failure_does_not_repeat_billable_generation(hd_image, error, 
     tool.bot.config.GEMINI_IMAGE_BASE_URL = "https://images.example.invalid/v1"
     getattr(session.post.return_value, stage).side_effect = error("response lost")
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
@@ -228,7 +228,7 @@ def test_non_json_response_does_not_repeat_billable_generation(hd_image):
     tool.bot.config.GEMINI_IMAGE_BASE_URL = "https://images.example.invalid/v1"
     session.post.return_value.text.return_value = "<html>upstream response lost</html>"
 
-    result = asyncio.run(tool.execute(message, prompt="a red fox"))
+    result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
