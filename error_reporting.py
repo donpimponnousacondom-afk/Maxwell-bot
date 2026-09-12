@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
+from urllib.parse import quote
 from uuid import uuid4
 
 PUBLIC_ERROR_TEXT = "I waited, waited and I am losing things like tears in the rain 🕊️"
@@ -106,6 +107,13 @@ def _redact(text: str) -> str:
     text = _SECRET_FIELD.sub(lambda match: match[1] + _REDACTED, text)
     text = _SECRET_QUERY.sub(lambda match: match[1] + _REDACTED, text)
     return _URL_CREDENTIALS.sub(lambda match: match[1] + _REDACTED + "@", text)
+
+
+def redact_sensitive_text(text: str) -> str:
+    text = _redact(text)
+    for secret in _secrets:
+        text = text.replace(quote(secret, safe=""), _REDACTED)
+    return text
 
 
 def _exception_chain(exception: BaseException | None) -> list[BaseException]:

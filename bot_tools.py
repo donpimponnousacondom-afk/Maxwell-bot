@@ -37,7 +37,7 @@ import uuid
 import discord
 from discord import Activity, File, Message, Status
 from tools import Tool
-from error_reporting import PUBLIC_ERROR_TEXT, capture_incident, register_secrets
+from error_reporting import PUBLIC_ERROR_TEXT, capture_incident, redact_sensitive_text, register_secrets
 from response_observability import FOOTER_MARKER, clean_message_content, discord_message_excerpt, prepare_delivery, record_delivery, strip_footer
 from captcha_solver import CaptchaSolveError
 from control_defaults import parse_bool
@@ -1312,6 +1312,31 @@ def _persist_public_image(
         return None, None
 
 
+class ImageRequestLog:
+    def __init__(self, **fields):
+        self.started = time.perf_counter()
+        endpoint = urlparse(fields["endpoint"])
+        fields["endpoint"] = endpoint._replace(
+            netloc=endpoint.netloc.rsplit("@", 1)[-1], query="", fragment="",
+        ).geturl()
+        fields["request_id"] = uuid.uuid4().hex
+        self.context = {key: value for key, value in fields.items() if key not in {"prompt", "requested_prompt"}}
+        self.emit("start", fields)
+
+    @staticmethod
+    def emit(event: str, fields: dict[str, object]) -> None:
+        safe = {
+            key: redact_sensitive_text(value) if isinstance(value, str) else value
+            for key, value in fields.items()
+        }
+        logger.info("Image request %s %s", event, json.dumps(safe, ensure_ascii=False))
+
+    def finish(self, **fields) -> None:
+        self.emit("done", self.context | fields | {
+            "elapsed_ms": round((time.perf_counter() - self.started) * 1000, 1),
+        })
+
+
 class ImageGeneratorTool(Tool):
     """Image generation using the configured fast image provider."""
 
@@ -1357,6 +1382,7 @@ class ImageGeneratorTool(Tool):
             prompt,
             quality=getattr(cfg, "IMAGE_GEN_QUALITY", "low"),
             timeout_s=int(getattr(cfg, "IMAGE_GEN_TIMEOUT", 300)),
+            tool_name="image_generator", auto_send=auto_send,
         )
         if error:
             return error
@@ -1437,61 +1463,67 @@ class ImageGeneratorTool(Tool):
             f"?width=1024&height=1024&nologo=true&model={quote(model, safe='')}"
             f"&seed={seed}"
         )
-        session = await _get_shared_session()
+        observation = ImageRequestLog(
+            tool="image_generator", protocol="pollinations", operation="generations",
+            endpoint="https://image.pollinations.ai/prompt/", model=model,
+            prompt=prompt[:1500], input_images=0, auto_send=auto_send, timeout_s=90,
+            width=1024, height=1024, seed=seed,
+            **({"requested_prompt": prompt} if len(prompt) > 1500 else {}),
+        )
+        context = {"endpoint": observation.context["endpoint"], "model": model,
+                   "image_request_id": observation.context["request_id"]}
+        status, outcome, error_type = None, "error", None
+        raw, error = b"", ""
         try:
+            session = await _get_shared_session()
             async with session.get(
                 url,
                 headers={"User-Agent": _IMAGE_FETCH_UA, "Accept": "image/*"},
                 timeout=aiohttp.ClientTimeout(total=90),
                 allow_redirects=True,
             ) as response:
+                status = response.status
+                context["status"] = str(status)
                 if response.status != 200:
+                    outcome = "http_error"
                     body = await response.text()
-                    failure = tool_failure(
+                    error = tool_failure(
                         "tool.image_generator", f"Error generating image: Pollinations returned {response.status}.",
-                        details=body, context={"status": str(response.status)},
+                        details=body, context=context,
                     )
-                    logger.error(
-                        "Pollinations image error: %s - %s",
-                        response.status,
-                        body[:300],
-                        extra={"incident_id": failure.incident_id},
+                else:
+                    ctype = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    raw = await _read_response_limited(response, 12 * 1024 * 1024)
+            if not error:
+                looks_like_image = bool(raw and (
+                    raw.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF")) or ctype.startswith("image/")
+                ))
+                if looks_like_image:
+                    outcome = "success"
+                else:
+                    outcome = "decode_error"
+                    error = tool_failure(
+                        "tool.image_generator", "Error: Pollinations did not return an image.",
+                        details=repr(raw), context=context | {"content_type": ctype},
                     )
-                    return failure
-                ctype = (
-                    (response.headers.get("Content-Type") or "")
-                    .split(";")[0]
-                    .strip()
-                    .lower()
-                )
-                raw = await _read_response_limited(response, 12 * 1024 * 1024)
         except asyncio.TimeoutError as exc:
-            return tool_failure("tool.image_generator", "Error: Pollinations image generation timed out.", exception=exc)
-        except Exception as e:
-            logger.warning("Pollinations image error: %s", e)
-            return tool_failure("tool.image_generator", f"Error generating image: {e}", exception=e)
-        looks_like_image = bool(
-            raw
-            and (
-                raw.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
-                or ctype.startswith("image/")
+            outcome, error_type = "timeout", type(exc).__name__
+            error = tool_failure("tool.image_generator", "Error: Pollinations image generation timed out.", exception=exc, context=context)
+        except Exception as exc:
+            outcome = "connection_error" if isinstance(exc, aiohttp.ClientConnectionError) else "error"
+            error_type = type(exc).__name__
+            error = tool_failure("tool.image_generator", f"Error generating image: {exc}", exception=exc, context=context)
+        finally:
+            if isinstance(sys.exception(), asyncio.CancelledError):
+                outcome, error_type = "cancelled", "CancelledError"
+            observation.finish(
+                status=status, outcome=outcome, error_type=error_type,
+                image_bytes=len(raw) if outcome == "success" else 0,
+                format=_sniff_image_mime(raw).removeprefix("image/") if outcome == "success" else None,
+                incident_id=getattr(error, "incident_id", None),
             )
-        )
-        if not looks_like_image:
-            failure = tool_failure(
-                "tool.image_generator", "Error: Pollinations did not return an image.",
-                details=repr(raw), context={"content_type": ctype},
-            )
-            logger.error(
-                "Pollinations returned non-image payload (%s, %s bytes)",
-                ctype,
-                len(raw or b""),
-                extra={"incident_id": failure.incident_id},
-            )
-            return failure
-        logger.info(
-            "Pollinations image generated successfully, size: %s bytes", len(raw)
-        )
+        if error:
+            return error
         return await self._deliver_generated_image(
             message, prompt, raw, prefix="pollinations", auto_send=auto_send,
         )
@@ -1548,6 +1580,7 @@ def _decode_image_response(data: dict, *, native: bool) -> tuple[bytes, str]:
 
 async def _image_generation_request(
     api_url: str, api_key: str, payload: dict, *, timeout_s: int, native: bool,
+    tool_name: str = "hd_image", auto_send: bool = False,
 ) -> tuple[bytes, str, str]:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -1561,8 +1594,20 @@ async def _image_generation_request(
     body = ""
     context = {"endpoint": api_url, "model": str(payload.get("model", ""))}
     register_secrets([api_key])
-    session = await _get_shared_session()
+    parts = [] if native else payload["messages"][0]["content"]
+    input_images = len(payload.get("images", [])) if native else sum(part.get("type") == "image_url" for part in parts)
+    observation = ImageRequestLog(
+        tool=tool_name, protocol="images" if native else "chat_completions",
+        operation="edits" if input_images else "generations", endpoint=api_url,
+        model=context["model"], prompt=payload.get("prompt", "") if native else "".join(
+            part["text"] for part in parts if part.get("type") == "text"
+        ), quality=payload.get("quality"), input_images=input_images,
+        auto_send=auto_send, timeout_s=timeout_s,
+    )
+    context["image_request_id"] = observation.context["request_id"]
+    status, outcome, error_type, stage = None, "error", None, "request"
     try:
+        session = await _get_shared_session()
         async with session.post(
             api_url,
             json=payload,
@@ -1570,32 +1615,52 @@ async def _image_generation_request(
             timeout=aiohttp.ClientTimeout(total=timeout_s),
             allow_redirects=False,
         ) as response:
-            context["status"] = str(response.status)
+            status = response.status
+            context["status"] = str(status)
             body = await response.text()
             if response.status != 200:
+                outcome = "http_error"
                 error = f"Error: {label} API returned status {response.status}"
                 if "quota" in body.lower():
                     error += f"; the image model ({payload['model']}) has no quota right now."
-                return b"", ext, tool_failure(
+                error = tool_failure(
                     "tool.image_request", error + no_retry, details=body, context=context,
                 )
+                return b"", ext, error
             try:
                 data = json.loads(body)
             except json.JSONDecodeError as exc:
-                return b"", ext, tool_failure(
+                outcome, error_type = "non_json", type(exc).__name__
+                error = tool_failure(
                     "tool.image_request", f"Error: {label} endpoint returned a non-JSON response" + no_retry,
                     exception=exc, details=body, context=context,
                 )
+                return b"", ext, error
+        stage = "decode"
         image_bytes, ext = _decode_image_response(data, native=native)
+        outcome = "success"
     except asyncio.TimeoutError as exc:
+        outcome, error_type = "timeout", type(exc).__name__
         error = tool_failure(
             "tool.image_request", f"Error: {label} generation timed out after {timeout_s}s" + no_retry,
             exception=exc, details=body, context=context,
         )
     except Exception as exc:
+        outcome = "connection_error" if isinstance(exc, aiohttp.ClientConnectionError) else (
+            "decode_error" if stage == "decode" else "error"
+        )
+        error_type = type(exc).__name__
         error = tool_failure(
             "tool.image_request", f"Error: {label} request failed or returned unsupported image data." + no_retry,
             exception=exc, details=body, context=context,
+        )
+    finally:
+        if isinstance(sys.exception(), asyncio.CancelledError):
+            outcome, error_type = "cancelled", "CancelledError"
+        observation.finish(
+            status=status, outcome=outcome, error_type=error_type,
+            image_bytes=len(image_bytes), format=ext if image_bytes else None,
+            incident_id=getattr(error, "incident_id", None),
         )
     return image_bytes, ext, error
 
@@ -1603,6 +1668,7 @@ async def _image_generation_request(
 async def _native_image_request(
     base: str, api_key: str, model: str, prompt: str, *, quality: str,
     timeout_s: int, images: tuple[str, ...] | list[str] = (),
+    tool_name: str = "image_generator", auto_send: bool = False,
 ) -> tuple[bytes, str, str]:
     base = base.removesuffix("/images/generations").removesuffix("/images/edits")
     action = "edits" if images else "generations"
@@ -1614,6 +1680,7 @@ async def _native_image_request(
         payload["images"] = [{"image_url": image} for image in images]
     return await _image_generation_request(
         f"{base}/images/{action}", api_key, payload, timeout_s=timeout_s, native=True,
+        tool_name=tool_name, auto_send=auto_send,
     )
 
 
@@ -1811,7 +1878,7 @@ class HDImageGeneratorTool(Tool):
         for ref in refs:
             raw, err = await self._load_one(ref)
             if raw is None:
-                logger.warning(f"hd_image input rejected: {err}")
+                logger.warning("hd_image input rejected: %s", redact_sensitive_text(err))
                 return f"Error: {err}"
             shrunk, mime = (
                 (raw, _sniff_image_mime(raw))
@@ -1834,11 +1901,13 @@ class HDImageGeneratorTool(Tool):
                 quality=getattr(self.bot.config, "GEMINI_IMAGE_QUALITY", "high"),
                 timeout_s=timeout_s,
                 images=[part["image_url"]["url"] for part in parts[1:]],
+                tool_name="hd_image", auto_send=auto_send,
             )
         else:
             payload = {"model": model, "messages": [{"role": "user", "content": parts}]}
             image_bytes, ext, error = await _image_generation_request(
                 api_url, api_key, payload, timeout_s=timeout_s, native=False,
+                tool_name="hd_image", auto_send=auto_send,
             )
         if error:
             return error
