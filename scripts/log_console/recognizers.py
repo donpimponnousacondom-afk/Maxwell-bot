@@ -45,6 +45,7 @@ class Recognition:
     scope: str
     details: dict[str, JSONValue] = field(default_factory=dict)
     detail_prefix: str | None = None
+    parse_error: str | None = None
 
 
 type EnvelopeRecognizer = Callable[[str], Envelope | None]
@@ -77,12 +78,12 @@ def image_request(envelope: Envelope, service: str | None) -> Recognition | None
         return None
     try:
         details = json.loads(match["payload"])
-    except json.JSONDecodeError:
-        return None
+    except (ValueError, RecursionError) as error:
+        return Recognition("image.request.unparsed", "tool", parse_error=type(error).__name__)
     return Recognition(
         f"image.request.{match['phase']}", "tool", details,
         f"Image request {match['phase']} ",
-    ) if isinstance(details, dict) else None
+    ) if isinstance(details, dict) else Recognition("image.request.unparsed", "tool", parse_error="ExpectedObject")
 
 
 ENVELOPES: tuple[EnvelopeRecognizer, ...] = (python_log, gin_log, go_log, basic_log)

@@ -109,7 +109,8 @@ def test_docker_timestamp_remains_distinct_from_producer_and_observation():
 def test_malformed_or_wrong_shape_image_record_falls_back_without_dropping_text(payload):
     line = "bot-1 | Image request start " + payload + "\n"
     event = EventParser().parse(line, observed_at=OBSERVED)
-    assert event.kind == "text" and event.details == {}
+    assert event.kind == "image.request.unparsed" and event.details == {}
+    assert event.parse_error is not None
     assert event.source_line == line.rstrip("\n")
 
 
