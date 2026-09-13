@@ -6,6 +6,7 @@ import sys
 from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from time import monotonic
 from typing import TextIO
 
@@ -62,12 +63,20 @@ def coalesce_logs(lines: Iterable[str], output: TextIO, *, clock: Callable[[], f
         output.flush()
 
 
-def follow_logs(command: list[str], env: dict[str, str]) -> None:
+def follow_logs(command: list[str], env: dict[str, str], *, output_format: str = "plain") -> None:
+    stream: Callable[[Iterable[str], TextIO], None] = coalesce_logs
+    if output_format == "jsonl":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        try:
+            from scripts.log_console.jsonl import write_jsonl
+        finally:
+            sys.path.pop(0)
+        stream = write_jsonl
     with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True, encoding="utf-8",
                           errors="surrogateescape", start_new_session=True) as process:
         try:
-            coalesce_logs(process.stdout, sys.stdout)
+            stream(process.stdout, sys.stdout)
             returncode = process.wait()
         except KeyboardInterrupt:
             returncode = 0

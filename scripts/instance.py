@@ -133,7 +133,7 @@ class Instance:
             raise RuntimeError(f"Docker {args[0]} failed or wrote diagnostics; inspect the private engine directly")
         return result.stdout
 
-    def compose(self, *args: str) -> None:
+    def compose(self, *args: str, log_format: str = "plain") -> None:
         command = ["docker", "compose", "--project-name", self.project,
                    "--project-directory", str(CHECKOUT), "--env-file", "/dev/null",
                    "-f", str(CHECKOUT / "compose.yaml"), *args]
@@ -142,7 +142,7 @@ class Instance:
                 from log_filter import follow_logs
             else:
                 from scripts.log_filter import follow_logs
-            follow_logs(command, self.env)
+            follow_logs(command, self.env, output_format=log_format)
         else:
             result = subprocess.run(command, env=self.env)
             if result.returncode:
@@ -210,7 +210,7 @@ def quiesce(instance: Instance, running: list[dict]) -> list[dict]:
     return containers
 
 
-def lifecycle(instance: Instance, action: str) -> None:
+def lifecycle(instance: Instance, action: str, *, log_format: str = "plain") -> None:
     if action in {"stop", "down"}:
         containers = quiesce(instance, [])
         if action == "down":
@@ -226,7 +226,7 @@ def lifecycle(instance: Instance, action: str) -> None:
         elif action in {"up", "start"}:
             instance.compose("up", "-d", "--wait", "--wait-timeout", "300")
         else:
-            instance.compose("logs", "--follow", "--tail", "100")
+            instance.compose("logs", "--follow", "--tail", "100", log_format=log_format)
 
 
 def archive_outside(path: Path, instance: Instance) -> Path:
@@ -324,13 +324,17 @@ def main() -> None:
     parser.add_argument("instance")
     parser.add_argument("action", choices=("up", "start", "stop", "restart", "logs", "down", "backup", "restore"))
     parser.add_argument("archive", nargs="?", type=Path)
+    parser.add_argument("--format", dest="log_format", choices=("plain", "jsonl"),
+                        help="logs only: legacy coalesced plain text or redacted JSONL (every received line)")
     args = parser.parse_args()
+    if args.log_format is not None and args.action != "logs":
+        parser.error("--format is only available for logs")
     if (args.action in {"backup", "restore"}) != (args.archive is not None):
         parser.error("backup/restore require an archive path; other commands do not")
     account = service_account(args.instance)
     instance = Instance(args.instance, account)
     if args.action == "logs":
-        lifecycle(instance, args.action)
+        lifecycle(instance, args.action, log_format=args.log_format or "plain")
         return
     lock_path = instance.path / ".operations.lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
