@@ -400,3 +400,30 @@ def test_site_guards_work_on_slotted_discord_messages(bot):
     out = run(EditSiteTool(bot).execute(msg, name="slot", action="read"))
     assert "_site_idle_reads" not in out
     assert "<h1>hi</h1>" in out
+
+
+def test_site_guards_ignore_recycled_message_identity(monkeypatch):
+    import bot_tools
+
+    message = SimpleNamespace()
+    monkeypatch.setitem(bot_tools._SITE_TURN_STATE, id(message), {
+        "idle": 99, "test_counts": {"https://example/test": 99},
+        "read_cache": {"a"}, "_obj": object(),
+    })
+    assert bot_tools.site_read_loop_guard(message, key="a", label="a", action="read") is None
+    assert bot_tools.site_test_repeat_guard(message, "https://example/test") is None
+    assert bot_tools._SITE_TURN_STATE[id(message)]["_obj"] is message
+    assert bot_tools.site_read_loop_guard(message, key="a", label="a", action="read") is not None
+
+
+def test_site_guard_owner_retention_stays_bounded(monkeypatch):
+    import bot_tools
+
+    monkeypatch.setattr(bot_tools, "_SITE_TURN_STATE", {})
+    monkeypatch.setattr(bot_tools, "_SITE_TURN_STATE_MAX", 2)
+    messages = [SimpleNamespace() for _ in range(3)]
+    for message in messages:
+        assert bot_tools.site_read_loop_guard(message, key="a", label="a", action="read") is None
+    assert set(bot_tools._SITE_TURN_STATE) == {id(message) for message in messages[1:]}
+    for message in messages[1:]:
+        assert bot_tools._SITE_TURN_STATE[id(message)]["_obj"] is message

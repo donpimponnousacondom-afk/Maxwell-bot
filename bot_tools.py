@@ -4773,13 +4773,16 @@ def _site_turn_state(message: Any) -> dict[str, Any] | None:
         return None
     key = id(message)
     state = _SITE_TURN_STATE.get(key)
+    if state is not None and state.get("_obj") is not message:
+        _SITE_TURN_STATE.pop(key)
+        state = None
     if state is None:
         while len(_SITE_TURN_STATE) >= _SITE_TURN_STATE_MAX:
             oldest = next(iter(_SITE_TURN_STATE), None)
             if oldest is None:
                 break
             _SITE_TURN_STATE.pop(oldest, None)
-        state = {"idle": 0, "test_counts": {}, "read_cache": set()}
+        state = {"idle": 0, "test_counts": {}, "read_cache": set(), "_obj": message}
         _SITE_TURN_STATE[key] = state
     return state
 
