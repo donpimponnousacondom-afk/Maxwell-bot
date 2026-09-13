@@ -67,9 +67,11 @@ def image_delivery(request, monkeypatch, tmp_path):
 def test_default_image_generation_persists_without_delivery(image_delivery, arguments):
     case = image_delivery
     result = asyncio.run(case.tool.execute(case.message, prompt="a red fox", **arguments))
-    paths = list(case.site.glob("_images/*"))
+    paths = list(case.site.glob("_images/*.png"))
     assert len(paths) == 1
     assert paths[0].read_bytes() == PNG
+    assert paths[0].with_suffix(".txt").read_bytes() == b"a red fox"
+    assert set(case.site.glob("_images/*")) == {paths[0], paths[0].with_suffix(".txt")}
     assert "generated, NOT sent" in result
     assert f"Local path: {paths[0]}" in result
     assert f"Permanent URL: https://images.example.invalid/bot/_images/{paths[0].name}" in result
@@ -92,9 +94,11 @@ def test_auto_send_uploads_exactly_once_with_terminal_marker(image_delivery):
     assert "do not resend the image or its URL" in result
     assert "No commentary needed" in result
     assert f"Image URL: {CDN}" in result
-    paths = list(case.site.glob("_images/*"))
+    paths = list(case.site.glob("_images/*.png"))
     assert len(paths) == 1
     assert paths[0].read_bytes() == PNG
+    assert paths[0].with_suffix(".txt").read_bytes() == b"a red fox"
+    assert set(case.site.glob("_images/*")) == {paths[0], paths[0].with_suffix(".txt")}
     case.message.channel.send.assert_awaited_once()
     assert case.message.channel.send.await_args.kwargs["file"].fp.getvalue() == PNG
     case.message.reply.assert_not_awaited()
@@ -140,7 +144,11 @@ def test_upload_failure_has_no_success_marker_and_keeps_generated_file(image_del
     result = asyncio.run(case.tool.execute(case.message, prompt="a red fox", auto_send=True))
     assert result.startswith("Error:")
     assert "__IMAGE_SENT__" not in result
-    assert len(list(case.site.glob("_images/*"))) == 1
+    paths = list(case.site.glob("_images/*.png"))
+    assert len(paths) == 1
+    assert paths[0].read_bytes() == PNG
+    assert paths[0].with_suffix(".txt").read_bytes() == b"a red fox"
+    assert set(case.site.glob("_images/*")) == {paths[0], paths[0].with_suffix(".txt")}
     case.message.channel.send.assert_awaited_once()
     assert case.session.get.call_count + case.session.post.call_count == 1
 
@@ -148,7 +156,8 @@ def test_upload_failure_has_no_success_marker_and_keeps_generated_file(image_del
 def test_generated_path_can_be_presented_once_with_caption(image_delivery):
     case = image_delivery
     asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
-    path = next(case.site.glob("_images/*"))
+    path = next(case.site.glob("_images/*.png"))
+    assert path.with_suffix(".txt").read_bytes() == b"a red fox"
     result = asyncio.run(SendFileTool(case.tool.bot).execute(
         case.message, path=str(path), caption="Here is your fox.",
     ))

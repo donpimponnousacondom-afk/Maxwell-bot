@@ -512,6 +512,7 @@ class Config:
     MAXWELL_PUBLIC_BASE_URL = os.getenv(
         "MAXWELL_PUBLIC_BASE_URL", "https://maxwell.example.com"
     )
+    MAXWELL_SITE_PUBLIC_BASE_URL = os.getenv("MAXWELL_SITE_PUBLIC_BASE_URL", "").strip()
     MAXWELL_API_HOST = os.getenv("MAXWELL_API_HOST", "127.0.0.1")
     MAXWELL_API_PORT = _int_env("MAXWELL_API_PORT", 8765, min_value=1, max_value=65535)
     MAXWELL_CORS_ORIGIN = os.getenv(
