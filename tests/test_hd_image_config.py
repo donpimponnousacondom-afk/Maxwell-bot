@@ -183,7 +183,7 @@ def test_unusable_response_does_not_repeat_billable_generation(
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
     assert result.startswith("Error:")
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     assert "not retried" in result
     assert "do not automatically repeat" in result
     assert "reword" not in result.lower()
@@ -191,19 +191,24 @@ def test_unusable_response_does_not_repeat_billable_generation(
     assert "image_generator" not in result
 
 
-@pytest.mark.parametrize("status", [429, 500, 502, 503])
-def test_http_error_does_not_repeat_billable_generation(hd_image, status):
+@pytest.mark.parametrize("status", [400, 429, 500, 502, 503])
+@pytest.mark.parametrize("body", [
+    "upstream unavailable",
+    '{"error":{"message":"Safety rejection; request ID synthetic-hd-id.","type":"image_generation_user_error","code":"moderation_blocked"}}',
+])
+def test_http_error_does_not_repeat_billable_generation(hd_image, status, body):
     tool, message, session, _ = hd_image
     tool.bot.config.GEMINI_IMAGE_BASE_URL = "https://images.example.invalid/v1"
     session.post.return_value.status = status
-    session.post.return_value.text.return_value = "upstream unavailable"
+    session.post.return_value.text.return_value = body
 
     result = asyncio.run(tool.execute(message, auto_send=True, prompt="a red fox"))
 
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
     assert f"API returned status {status}" in result
-    assert "may have been billed" in result
+    assert body in result
+    assert "may have been billed" not in result
     assert "not retried" in result
 
 
@@ -219,7 +224,7 @@ def test_transport_failure_does_not_repeat_billable_generation(hd_image, error, 
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
     assert result.startswith("Error")
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     assert "not retried" in result
 
 
@@ -233,5 +238,5 @@ def test_non_json_response_does_not_repeat_billable_generation(hd_image):
     session.post.assert_called_once()
     message.channel.send.assert_not_awaited()
     assert "non-JSON response" in result
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     assert "not retried" in result

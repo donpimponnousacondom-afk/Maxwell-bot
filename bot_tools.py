@@ -1586,7 +1586,7 @@ async def _image_generation_request(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     no_retry = (
-        " The request may have been billed. It was not retried; "
+        " It was not retried; "
         "do not automatically repeat image generation."
     )
     label = "image" if native else "HD image"
@@ -1620,9 +1620,7 @@ async def _image_generation_request(
             body = await response.text()
             if response.status != 200:
                 outcome = "http_error"
-                error = f"Error: {label} API returned status {response.status}"
-                if "quota" in body.lower():
-                    error += f"; the image model ({payload['model']}) has no quota right now."
+                error = f"Error: {label} API returned status {response.status}: {redact_sensitive_text(body)}"
                 error = tool_failure(
                     "tool.image_request", error + no_retry, details=body, context=context,
                 )

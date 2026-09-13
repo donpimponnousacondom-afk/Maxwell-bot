@@ -1,5 +1,11 @@
 # Current implementation and deployment status
 
+## Image rejection detail — urgent surgical hotfix (2026-09-13)
+
+- Root reported a real HTTP400 moderation rejection whose useful upstream body reached private incident details but not the model-facing tool result. The shared image request function now includes the complete upstream response text, with existing credential redaction, in that result. Removed speculative billing wording and the substring-based quota diagnosis; the actual HTTP status, upstream message/type/code/request ID and moderation details remain visible.
+- This changes error text only: no request, redirect, retry, generation, image delivery, provider or moderation behavior changes. Existing private incident capture and generic automatic public-error notices remain intact. Candidate2a4174ed8ea4 passed303 focused native/HD/chat/error-reporting tests in2.456s and3691 full isolated tests in128.215s. The earlier full run exposed three legacy assertions requiring the removed billing sentence; those expectations were corrected, with full-body and credential-redaction assertions retained. Actual image and rollout acceptance remain the next gate.
+- Root manually merged PR#8 asf7904eb. This hotfix starts separately from that current main; uncommitted publisher/site-URL/prompt-sidecar work is preserved and paused, not included. The current running application remains4c1bebd until this hotfix is validated and deployed.
+
 ## Upstream audit and modular console work (2026-09-13)
 
 - **Current application release: `maxwell-app:4c1bebd`**, image ID `sha256:a228c654e1b68982ace10a790663b15c7bce44c179e9f36806625a530dc8e800`. Application rollout acceptance at2026-09-13T04:08:25.94268288Z confirmed a fresh Discord login, zero current-epoch ERROR/CRITICAL lines and healthy API/web/Ollama; the bot itself has no container healthcheck. The exact committed source passed3680 isolated tests in128.954s. Its actual image passed the synthetic offline prompt/model/endpoint/redaction/success/failure smoke before the unchanged human build script selected it; the selected image ID exactly matches that tested artifact. Image6ea4ec8 remains the rollback image.
