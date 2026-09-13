@@ -26,6 +26,21 @@ def test_one_bot_and_api_share_whole_private_state():
         assert "replicas" not in service.get("deploy", {})
 
 
+def test_core_services_use_the_host_timezone_file_without_a_fixed_offset():
+    services = deployment()["services"]
+    assert set(services) == {"bot", "api", "ollama", "ollama-pull", "web"}
+    for service in services.values():
+        mounts = {item["target"]: item for item in service["volumes"]}
+        assert mounts["/etc/maxwell-localtime"] == {
+            "type": "bind", "source": "/etc/localtime",
+            "target": "/etc/maxwell-localtime", "read_only": True,
+            "bind": {"create_host_path": False},
+        }
+        assert service["environment"]["TZ"] == ":/etc/maxwell-localtime"
+        assert "/etc/localtime" not in mounts
+        assert all(not path.startswith("/usr/share/zoneinfo/") for path in mounts)
+
+
 def test_private_socket_and_no_host_privilege():
     for service in deployment()["services"].values():
         assert service["read_only"] is True
@@ -57,11 +72,12 @@ def test_only_bot_receives_private_live_git_socket_directory():
     assert set(services["api"]["environment"]).issubset(services["bot"]["environment"])
 
 
-def test_web_only_mounts_public_sites_and_binds_loopback():
+def test_web_only_mounts_public_sites_and_host_timezone_and_binds_loopback():
     web = deployment()["services"]["web"]
-    assert len(web["volumes"]) == 1
-    assert web["volumes"][0]["source"] == "${INSTANCE_DIR}/sites"
-    assert web["volumes"][0]["read_only"] is True
+    mounts = {item["target"]: item for item in web["volumes"]}
+    assert set(mounts) == {"/srv/sites", "/etc/maxwell-localtime"}
+    assert mounts["/srv/sites"]["source"] == "${INSTANCE_DIR}/sites"
+    assert mounts["/srv/sites"]["read_only"] is True
     assert web["ports"][0].startswith("127.0.0.1:")
     caddy = (ROOT / "docker/Caddyfile").read_text()
     assert "reverse_proxy api:8765" in caddy
@@ -172,6 +188,7 @@ def test_ollama_is_private_and_has_persistent_per_project_models():
             "KEY" not in key and "TOKEN" not in key for key in service["environment"]
         )
         assert service["volumes"] == [
+            deployment()["x-host-timezone"],
             {"type": "volume", "source": "ollama-models", "target": "/root/.ollama"}
         ]
 
