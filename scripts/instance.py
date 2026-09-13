@@ -64,7 +64,7 @@ def parse_settings(text: str) -> dict[str, str]:
     return values
 
 
-def service_account(instance: str):
+def service_account(instance: str, *, for_logs: bool = False):
     """Select the fixed service identity, dropping host root before any I/O."""
     if not SLUG.fullmatch(instance):
         raise ValueError("instance must be a lowercase slug of 1-30 characters")
@@ -72,11 +72,17 @@ def service_account(instance: str):
     if account.pw_uid == 0:
         raise ValueError("service account cannot be root")
     if os.geteuid() == 0:
+        terminal_settings = []
+        if for_logs:
+            if "TERM" in os.environ:
+                terminal_settings.append(f"TERM={os.environ['TERM']}")
+            if "NO_COLOR" in os.environ:
+                terminal_settings.append("NO_COLOR=1")
         os.execv("/usr/sbin/runuser", [
             "runuser", "-u", account.pw_name, "--", "/usr/bin/env", "-i",
             f"HOME={account.pw_dir}", "PATH=/usr/local/bin:/usr/bin:/bin",
-            f"XDG_RUNTIME_DIR=/run/user/{account.pw_uid}",
-            sys.executable, str(Path(__file__).resolve()), *sys.argv[1:],
+            f"XDG_RUNTIME_DIR=/run/user/{account.pw_uid}", *terminal_settings,
+            sys.executable, *(("-B",) if for_logs else ()), str(Path(__file__).resolve()), *sys.argv[1:],
         ])
     if os.geteuid() != account.pw_uid:
         raise ValueError("run as host root or the instance's own service user")
@@ -133,7 +139,7 @@ class Instance:
             raise RuntimeError(f"Docker {args[0]} failed or wrote diagnostics; inspect the private engine directly")
         return result.stdout
 
-    def compose(self, *args: str, log_format: str = "plain") -> None:
+    def compose(self, *args: str, log_format: str = "auto") -> None:
         command = ["docker", "compose", "--project-name", self.project,
                    "--project-directory", str(CHECKOUT), "--env-file", "/dev/null",
                    "-f", str(CHECKOUT / "compose.yaml"), *args]
@@ -210,7 +216,7 @@ def quiesce(instance: Instance, running: list[dict]) -> list[dict]:
     return containers
 
 
-def lifecycle(instance: Instance, action: str, *, log_format: str = "plain") -> None:
+def lifecycle(instance: Instance, action: str, *, log_format: str = "auto") -> None:
     if action in {"stop", "down"}:
         containers = quiesce(instance, [])
         if action == "down":
@@ -324,17 +330,21 @@ def main() -> None:
     parser.add_argument("instance")
     parser.add_argument("action", choices=("up", "start", "stop", "restart", "logs", "down", "backup", "restore"))
     parser.add_argument("archive", nargs="?", type=Path)
-    parser.add_argument("--format", dest="log_format", choices=("plain", "jsonl"),
-                        help="logs only: legacy coalesced plain text or redacted JSONL (every received line)")
+    parser.add_argument("--format", dest="log_format", choices=("auto", "console", "plain", "jsonl"),
+                        help="logs only: auto/console use a capable input+output TTY, otherwise legacy plain; jsonl emits every received line")
     args = parser.parse_args()
     if args.log_format is not None and args.action != "logs":
         parser.error("--format is only available for logs")
     if (args.action in {"backup", "restore"}) != (args.archive is not None):
         parser.error("backup/restore require an archive path; other commands do not")
-    account = service_account(args.instance)
+    if args.action == "logs":
+        sys.dont_write_bytecode = True
+        account = service_account(args.instance, for_logs=True)
+    else:
+        account = service_account(args.instance)
     instance = Instance(args.instance, account)
     if args.action == "logs":
-        lifecycle(instance, args.action, log_format=args.log_format or "plain")
+        lifecycle(instance, args.action, log_format=args.log_format or "auto")
         return
     lock_path = instance.path / ".operations.lock"
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)

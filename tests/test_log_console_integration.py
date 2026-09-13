@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -24,6 +25,7 @@ def test_jsonl_cli_follows_logs_without_lock_or_container_mutation(monkeypatch):
     monkeypatch.setattr(instance, "service_account", Mock(return_value=account))
     monkeypatch.setattr(instance, "Instance", Mock(return_value=app))
     monkeypatch.setattr(instance.sys, "argv", ["instance.py", "fixture", "logs", "--format", "jsonl"])
+    monkeypatch.setattr(instance.sys, "dont_write_bytecode", sys.dont_write_bytecode)
     monkeypatch.setattr(instance.os, "open", Mock(side_effect=AssertionError("logs do not acquire operation lock")))
     monkeypatch.setattr(log_filter, "follow_logs", follower)
     instance.main()
@@ -95,3 +97,60 @@ def test_script_mode_jsonl_needs_only_stdlib_and_inert_redactor(tmp_path):
     assert result.stderr == ""
     record = json.loads(result.stdout)
     assert record["message"] == "synthetic recovery fixture" and record["timestamp_origin"] == "observed"
+
+
+@pytest.mark.parametrize("no_color", [None, "", "private-value-must-not-be-forwarded"])
+@pytest.mark.parametrize("for_logs", [False, True], ids=["recovery", "logs"])
+def test_root_reexec_preserves_only_logs_terminal_settings_and_no_bytecode(monkeypatch, no_color, for_logs):
+    account = SimpleNamespace(pw_uid=1003, pw_name="maxwell-fixture", pw_dir="/synthetic/home")
+    environment = {"TERM": "screen-256color", "PYTHONPATH": "/synthetic/forbidden-imports", "API_KEY": "synthetic-secret"}
+    if no_color is not None:
+        environment["NO_COLOR"] = no_color
+    monkeypatch.setattr(instance.os, "environ", environment)
+    monkeypatch.setattr(instance.os, "geteuid", Mock(return_value=0))
+    monkeypatch.setattr(instance.pwd, "getpwnam", Mock(return_value=account))
+    arguments = ["instance.py", "--format", "auto", "fixture", "logs"] if for_logs else ["instance.py", "fixture", "backup", "/synthetic/archive.tar"]
+    monkeypatch.setattr(instance.sys, "argv", arguments)
+    execute = Mock(side_effect=SystemExit(0))
+    monkeypatch.setattr(instance.os, "execv", execute)
+    with pytest.raises(SystemExit):
+        instance.service_account("fixture", for_logs=for_logs)
+    path, argv = execute.call_args.args
+    assert path == "/usr/sbin/runuser"
+    expected = ["runuser", "-u", "maxwell-fixture", "--", "/usr/bin/env", "-i",
+                "HOME=/synthetic/home", "PATH=/usr/local/bin:/usr/bin:/bin", "XDG_RUNTIME_DIR=/run/user/1003"]
+    if for_logs:
+        expected.append("TERM=screen-256color")
+        if no_color is not None:
+            expected.append("NO_COLOR=1")
+    expected.extend([sys.executable, *(("-B",) if for_logs else ()), str(Path(instance.__file__).resolve()), *arguments[1:]])
+    assert argv == expected
+    assert all("synthetic-secret" not in item and "forbidden-imports" not in item for item in argv)
+    assert "private-value-must-not-be-forwarded" not in argv
+
+
+@pytest.mark.parametrize("arguments,format", [
+    (["fixture", "logs"], "auto"), (["--format", "console", "fixture", "logs"], "console"),
+    (["fixture", "logs", "--format", "plain"], "plain"),
+])
+def test_logs_main_passes_parsed_terminal_intent_even_with_options_before_action(monkeypatch, arguments, format):
+    account, app = object(), object()
+    account_lookup, lifecycle = Mock(return_value=account), Mock()
+    monkeypatch.setattr(instance.sys, "argv", ["instance.py", *arguments])
+    monkeypatch.setattr(instance.sys, "dont_write_bytecode", False)
+    monkeypatch.setattr(instance, "service_account", account_lookup)
+    monkeypatch.setattr(instance, "Instance", Mock(return_value=app))
+    monkeypatch.setattr(instance, "lifecycle", lifecycle)
+    instance.main()
+    account_lookup.assert_called_once_with("fixture", for_logs=True)
+    lifecycle.assert_called_once_with(app, "logs", log_format=format)
+    assert sys.dont_write_bytecode
+
+
+@pytest.mark.parametrize("format", ["auto", "console", "plain"])
+@pytest.mark.parametrize("input_tty,output_tty", [(False, False), (True, False), (False, True)])
+def test_noninteractive_stream_selection_never_enables_console(monkeypatch, format, input_tty, output_tty):
+    monkeypatch.setattr(log_filter.sys, "stdin", Mock(isatty=Mock(return_value=input_tty)))
+    monkeypatch.setattr(log_filter.sys, "stdout", Mock(isatty=Mock(return_value=output_tty)))
+    stream, interactive = log_filter.select_stream(format, lambda: False)
+    assert stream is log_filter.coalesce_logs and not interactive

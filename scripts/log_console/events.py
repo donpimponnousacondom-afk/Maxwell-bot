@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from .recognizers import COMPOSE, DOCKER_TIME, ENVELOPES, RECOGNIZERS, Envelope, EnvelopeRecognizer, EventRecognizer, Recognition
 from .safety import EvidenceRedactor, JSONValue, SGR, safe_fallback, safe_fields
+from .scopes import metadata_scope
 
 
 TIMEZONE = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
@@ -56,7 +57,7 @@ class LogEvent:
 class EventParser:
     def __init__(
         self, *, envelopes: tuple[EnvelopeRecognizer, ...] = ENVELOPES,
-        recognizers: tuple[EventRecognizer, ...] = RECOGNIZERS,
+        recognizers: tuple[EventRecognizer, ...] = (*RECOGNIZERS, metadata_scope),
     ) -> None:
         self.envelopes = envelopes
         self.recognizers = recognizers
@@ -94,6 +95,9 @@ class EventParser:
             envelope = next((found for recognize in self.envelopes if (found := recognize(body))), None)
         envelope = envelope or Envelope(body)
         recognized, message, details, parse_error = self.content(envelope, service)
+        scope = recognized.scope if recognized else "service"
+        if metadata_scope(envelope, service).scope in LIVE_COLLAPSED_SCOPES:
+            scope = "subagent"
         source_line = text[:len(text) - len(envelope.message)] + message if envelope.message else text
         timestamp = envelope.source_timestamp or docker_timestamp or observed
         origin = "producer" if envelope.source_timestamp else ("docker" if docker_timestamp else "observed")
@@ -102,7 +106,7 @@ class EventParser:
             source_timestamp=envelope.source_timestamp, source_timezone=timezone_fact(envelope.source_timestamp),
             docker_timestamp=docker_timestamp, observed_at=observed,
             service=service, logger=envelope.logger, level=envelope.level,
-            scope=recognized.scope if recognized else "service",
+            scope=scope,
             kind=recognized.kind if recognized else "text", message=message,
             details=details, source_line=source_line, parse_error=parse_error,
         )
