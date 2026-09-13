@@ -14725,6 +14725,16 @@ class MaxwellBot(commands.Bot):
                 response,
                 scrub_repeats=bool(self._control.get("scrub_repetitions", True)),
             )
+            if not response and any(
+                result.startswith(("Tool create_site:", "Tool edit_site:", "Tool site_server:", "Tool site_test:"))
+                for result in all_tool_results
+            ):
+                response = "I stopped before completing the site task. The changes are not verified as working."
+                for result in reversed(all_tool_results):
+                    created = re.match(r"Tool create_site: Site created: (https?://\S+)", result)
+                    if created:
+                        response += f"\nUnverified site: {created[1]}"
+                        break
             # Safety net: if the user asked for a site/page/website and the
             # model replied with raw HTML/JS in chat instead of calling
             # create_site, auto-route the HTML to create_site so the user

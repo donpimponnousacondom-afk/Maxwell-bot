@@ -4827,36 +4827,13 @@ def format_site_file_read(rel: str, text: str, *, start_line: int = 1) -> str:
 def site_read_loop_guard(
     message: Any, *, key: str, label: str, action: str
 ) -> str | None:
-    """Refuse duplicate/idle site reads that hang the turn. None = proceed."""
+    """Reset site test state after edits without blocking source reads."""
     act = str(action or "").strip().lower()
     state = _site_turn_state(message)
-    if act in SITE_MUTATING_ACTIONS:
-        if state is not None:
-            state["idle"] = 0
-            state["test_counts"] = {}
-            state["read_cache"] = set()
-        return None
-    if act not in SITE_FILE_READ_ACTIONS or state is None:
-        return None
-    idle = int(state.get("idle", 0) or 0) + 1
-    state["idle"] = idle
-    cache = state.setdefault("read_cache", set())
-    if idle >= SITE_IDLE_READ_LIMIT:
-        cache.add(key)
-        return (
-            "STOP. You have re-read site files repeatedly this turn without "
-            "changing anything. The source is already in this turn. Call "
-            "action=write or action=replace with a real change, or site_test "
-            f"once, then send_message with the URL. {SITE_READ_LOOP_MARKER}"
-        )
-    if key in cache:
-        return (
-            f"Already returned {label} this turn — it is in an earlier tool "
-            "result. Use action=replace or action=write to change it, or "
-            "start_line= to window a different slice. Re-reading the same "
-            "file will not print it again."
-        )
-    cache.add(key)
+    if act in SITE_MUTATING_ACTIONS and state is not None:
+        state["idle"] = 0
+        state["test_counts"] = {}
+        state["read_cache"] = set()
     return None
 
 
@@ -5521,7 +5498,12 @@ class CreateSiteTool(Tool):
                     f"Error: site slug '{slug}' could not be committed "
                     "(owner/quota changed concurrently). Try again."
                 )
-            result = f"Site created: {self.base_url}/{slug}/"
+            site_base = self.base_url
+            if wants_backend:
+                site_base = getattr(self.bot.config, "MAXWELL_PUBLIC_BASE_URL", "https://maxwell.example.com").rstrip("/") + "/bot"
+            result = f"Site created: {site_base}/{slug}/"
+            if wants_backend and site_base != self.base_url:
+                result += "\nThe remote mirror serves files only; use this local URL for backend functionality."
             if len(written) > 1:
                 result += f"\nFiles: {', '.join(written)}"
             if wants_backend:
@@ -5735,6 +5717,8 @@ class EditSiteTool(_SiteOwnedTool):
             getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
             or self.base_url
         )
+        if entry.get("backend") or entry.get("server"):
+            public_base = self.base_url
         url = f"{public_base}/{slug}/"
 
         if act in {"list", "ls", "files", "status"}:
@@ -5947,6 +5931,8 @@ class SiteServerTool(_SiteOwnedTool):
             "Run and edit a real backend server for one of your sites — your own "
             "Python, routes, database, and secrets, in a sandboxed container at "
             "/bot/<name>/api/... "
+            "This backend runs locally, not on the remote static mirror. "
+            "Use the local site URL for interactive pages; inside Docker use http://web:8080/bot/<name>/. "
             "Use this when the site needs server-side logic: accounts, WebSockets, "
             "a hidden API key, anything a static page cannot enforce. "
             "Keep working on a live backend with these actions instead of recreating it: "
@@ -6454,6 +6440,7 @@ class ListSitesTool(Tool):
             "MAXWELL_PUBLIC_BASE_URL",
             "https://maxwell.z3ki.dev",
         ).rstrip("/") + "/bot"
+        local_base_url = base_url
         base_url = (
             getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
             or base_url
@@ -6488,7 +6475,7 @@ class ListSitesTool(Tool):
                 unverified.append(slug)
             tail = f" [{', '.join(marks)}]" if marks else ""
             lines.append(
-                f"  • {slug} — {base_url}/{slug}/ — '{title}' "
+                f"  • {slug} — {local_base_url if data.get('backend') or data.get('server') else base_url}/{slug}/ — '{title}' "
                 f"({site_expiry_label(data, control)}){owner_label}{tail}"
             )
         header = (
