@@ -129,7 +129,7 @@ def _float_env(name: str, default: float, minimum: float, maximum: float) -> flo
 # LLM reply can start. A short cooldown also prevents the three searches in a
 # single prompt from retrying the same unavailable/slow endpoint.
 RAG_QUERY_TIMEOUT_SECONDS = _float_env(
-    "MAXWELL_RAG_QUERY_TIMEOUT_SECONDS", 1.5, 0.25, 10.0
+    "MAXWELL_RAG_QUERY_TIMEOUT_SECONDS", 30.0, 0.25, 180.0
 )
 RAG_QUERY_FAILURE_COOLDOWN_SECONDS = _float_env(
     "MAXWELL_RAG_QUERY_FAILURE_COOLDOWN_SECONDS", 15.0, 1.0, 120.0

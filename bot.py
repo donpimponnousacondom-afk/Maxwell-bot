@@ -14510,9 +14510,8 @@ class MaxwellBot(commands.Bot):
                     site_loop_strikes += 1
                     if site_loop_strikes >= 2:
                         logger.info(
-                            "site read-loop breaker; stopping tool iterations"
+                            "site read-loop breaker; finalizing without tools"
                         )
-                        break
                 # An ack-only turn ("on it…") loops back exactly once, so the
                 # promised work runs. Without this guard a model that keeps
                 # acknowledging would ping-pong until max_iters.
@@ -14539,8 +14538,27 @@ class MaxwellBot(commands.Bot):
                 # whole rounds so an assistant turn is never separated from
                 # the role=tool messages holding its tool_call_ids.
                 conversation_tail = trim_tool_tail(conversation_tail)
+                finish_site_turn = any(
+                    result.startswith(("Tool create_site:", "Tool edit_site:", "Tool site_server:", "Tool site_test:"))
+                    for result in all_tool_results
+                ) and (
+                    _iteration + 1 >= max_iters or site_loop_strikes >= 2
+                    or time.monotonic() > tool_deadline
+                )
+                final_instruction = [{
+                    "role": "user",
+                    "content": (
+                        "Tool execution for this site task has ended. Reply directly in plain text now; "
+                        "do not call tools or promise more work. Include the configured remote public "
+                        "site URL from the tool results. Report what actually completed, what was tested "
+                        "locally, and what remains unverified or broken. Do not claim remote APIs work "
+                        "merely because local tests passed. Sites created this turn:\n"
+                        + "\n".join(result.splitlines()[0] for result in all_tool_results
+                                    if result.startswith("Tool create_site: Site created:"))
+                    ),
+                }] if finish_site_turn else []
                 result_messages = MaxwellBot._apply_prompt_budget(
-                    self, [dict(m) for m in messages] + list(conversation_tail)
+                    self, [dict(m) for m in messages] + list(conversation_tail) + final_instruction
                 )
                 await self._acquire_ai_slot(
                     timeout=ai_timeout, priority="user", key=channel_id
@@ -14602,10 +14620,10 @@ class MaxwellBot(commands.Bot):
                             media=all_tool_media,
                             timeout=ai_timeout,
                             max_tokens=max_out_tokens,
-                            tools=provider_tools,
+                            tools=[] if finish_site_turn else provider_tools,
                             on_tool_call_name=_on_followup_tool_call_name,
                             on_token=_on_followup_token,
-                            custom_tool_calls=custom_tool_calls,
+                            custom_tool_calls=False if finish_site_turn else custom_tool_calls,
                         )
                     except Exception:
                         # Ensure followup progress is cleaned up on error
@@ -14618,8 +14636,8 @@ class MaxwellBot(commands.Bot):
                     usage = self._usage_from(followup)
                     if usage:
                         self._token_tracker.record(usage)
-                    pending_native = self._native_calls_from(followup)
-                    if not pending_native:
+                    pending_native = None if finish_site_turn else self._native_calls_from(followup)
+                    if not pending_native and not finish_site_turn:
                         pending_native, followup = self._recover_text_tool_calls(
                             followup
                         )
@@ -14639,6 +14657,8 @@ class MaxwellBot(commands.Bot):
                         response = followup or ""
                         followup_turn_ran = True
                     else:
+                        break
+                    if finish_site_turn:
                         break
                 finally:
                     await self._release_ai_slot()

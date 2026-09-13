@@ -5403,9 +5403,12 @@ class CreateSiteTool(Tool):
                                 f"Site image URL failed: {src_url} ({err or 'unknown'})"
                             )
                         continue
-                    if not src_path or not any(
+                    shell_source = str(src_path).startswith(("/home/maxwell/", "home/maxwell/")) or (
+                        bool(src_path) and Path(os.path.abspath(src_path)).is_relative_to(_shell_workspace())
+                    )
+                    if not src_path or (not shell_source and not any(
                         _is_path_allowed(src_path, b) for b in allowed_bases
-                    ):
+                    )):
                         missing_images.append(src_path or "(empty path)")
                         logger.warning(f"Site image blocked or not found: {src_path}")
                         continue
@@ -5428,11 +5431,24 @@ class CreateSiteTool(Tool):
                         )
                         continue
                     try:
-                        shutil.copy2(src_path, dest)
+                        if shell_source:
+                            shell_tool = self.bot.tools.get("shell")
+                            if shell_tool is None or not self.bot.config.ENABLE_SHELL:
+                                raise ValueError("shell file export requires a registered enabled shell tool")
+                            relative = str(src_path)
+                            if not relative.startswith(("/home/maxwell/", "home/maxwell/")):
+                                relative = str(Path(os.path.abspath(src_path)).relative_to(_shell_workspace()))
+                            async with shell_tool._lifecycle_lock:
+                                await shell_tool._verify_export_container()
+                                blob = await asyncio.to_thread(_read_shell_export, relative, SendFileTool.MAX_SIZE)
+                            await asyncio.to_thread(Path(dest).write_bytes, blob)
+                        else:
+                            shutil.copy2(src_path, dest)
                         public_url = f"{self.base_url}/{slug}/images/{filename}"
                         image_urls.append(public_url)
                         logger.info(f"Copied site image {src_path} -> {dest}")
                     except Exception as e:
+                        missing_images.append(f"{src_path} ({e})")
                         logger.warning(f"Failed to copy image {src_path}: {e}")
 
             # The page is served exactly as written. CSP belongs to the host
@@ -5498,12 +5514,9 @@ class CreateSiteTool(Tool):
                     f"Error: site slug '{slug}' could not be committed "
                     "(owner/quota changed concurrently). Try again."
                 )
-            site_base = self.base_url
-            if wants_backend:
-                site_base = getattr(self.bot.config, "MAXWELL_PUBLIC_BASE_URL", "https://maxwell.example.com").rstrip("/") + "/bot"
-            result = f"Site created: {site_base}/{slug}/"
-            if wants_backend and site_base != self.base_url:
-                result += "\nThe remote mirror serves files only; use this local URL for backend functionality."
+            result = f"Site created: {self.base_url}/{slug}/"
+            if wants_backend and getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip():
+                result += "\nPublish this remote URL to the user. HTML, CSS, JavaScript and images are mirrored. Python/FastAPI and the KV API run on the local instance, not the remote host; the API guide below applies to local testing only."
             if len(written) > 1:
                 result += f"\nFiles: {', '.join(written)}"
             if wants_backend:
@@ -5531,7 +5544,7 @@ class CreateSiteTool(Tool):
                 )
             if missing_images:
                 result += (
-                    f"\nWARNING: {len(missing_images)} image(s) NOT found on disk and skipped: "
+                    f"\nWARNING: {len(missing_images)} image(s) could not be imported and were skipped: "
                     + ", ".join(missing_images)
                 )
             result += _site_graph_note(self.bot, slug)
@@ -5717,8 +5730,6 @@ class EditSiteTool(_SiteOwnedTool):
             getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
             or self.base_url
         )
-        if entry.get("backend") or entry.get("server"):
-            public_base = self.base_url
         url = f"{public_base}/{slug}/"
 
         if act in {"list", "ls", "files", "status"}:
@@ -5932,7 +5943,7 @@ class SiteServerTool(_SiteOwnedTool):
             "Python, routes, database, and secrets, in a sandboxed container at "
             "/bot/<name>/api/... "
             "This backend runs locally, not on the remote static mirror. "
-            "Use the local site URL for interactive pages; inside Docker use http://web:8080/bot/<name>/. "
+            "Test locally inside Docker at http://web:8080/bot/<name>/; deliver the configured remote public site URL to the user, noting any local-only API dependency. "
             "Use this when the site needs server-side logic: accounts, WebSockets, "
             "a hidden API key, anything a static page cannot enforce. "
             "Keep working on a live backend with these actions instead of recreating it: "
@@ -6440,7 +6451,6 @@ class ListSitesTool(Tool):
             "MAXWELL_PUBLIC_BASE_URL",
             "https://maxwell.z3ki.dev",
         ).rstrip("/") + "/bot"
-        local_base_url = base_url
         base_url = (
             getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
             or base_url
@@ -6475,7 +6485,7 @@ class ListSitesTool(Tool):
                 unverified.append(slug)
             tail = f" [{', '.join(marks)}]" if marks else ""
             lines.append(
-                f"  • {slug} — {local_base_url if data.get('backend') or data.get('server') else base_url}/{slug}/ — '{title}' "
+                f"  • {slug} — {base_url}/{slug}/ — '{title}' "
                 f"({site_expiry_label(data, control)}){owner_label}{tail}"
             )
         header = (
