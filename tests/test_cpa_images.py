@@ -171,7 +171,7 @@ def test_unusable_native_response_is_not_retried_or_sent_to_chat(native_image, b
     case.session.post.return_value.text.return_value = body
     result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     assert "not retried" in result
     assert "do not automatically repeat" in result
     case.session.post.assert_called_once()
@@ -184,15 +184,39 @@ def test_unusable_native_response_is_not_retried_or_sent_to_chat(native_image, b
 def test_native_http_error_is_not_retried_or_redirected(native_image, status):
     case = native_image
     case.session.post.return_value.status = status
-    case.session.post.return_value.text.return_value = "private upstream detail must not escape"
+    case.session.post.return_value.text.return_value = "upstream rejection; diagnostic_key=synthetic-native-key"
     result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
     assert str(status) in result
-    assert "may have been billed" in result
-    assert "private upstream" not in result
+    assert "may have been billed" not in result
+    assert "upstream rejection" in result
+    assert "synthetic-native-key" not in result
     case.session.post.assert_called_once()
     assert case.session.post.call_args.kwargs["allow_redirects"] is False
     case.session.get.assert_not_called()
+    case.message.channel.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("body", [
+    json.dumps({"error": {
+        "message": "Your request was rejected by the safety system. Request ID synthetic-moderation-id.",
+        "type": "image_generation_user_error", "param": None, "code": "moderation_blocked",
+        "moderation_details": {"moderation_stage": "output", "categories": ["other"]},
+    }}, indent=2),
+    "This rejection mentions quota but does not say the model has none.",
+])
+def test_native_rejection_returns_exact_upstream_reason_without_diagnosis(native_image, body):
+    case = native_image
+    case.session.post.return_value.status = 400
+    case.session.post.return_value.text.return_value = body
+    result = asyncio.run(case.tool.execute(case.message, prompt="a red fox"))
+    assert body in result
+    assert "status 400" in result
+    assert "may have been billed" not in result
+    assert "has no quota right now" not in result
+    assert "not retried" in result
+    case.session.post.assert_called_once()
+    case.persist.assert_not_called()
     case.message.channel.send.assert_not_awaited()
 
 
@@ -203,7 +227,7 @@ def test_native_transport_failure_is_not_retried(native_image, error, stage):
     getattr(case.session.post.return_value, stage).side_effect = error("private transport detail")
     result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="a red fox"))
     assert result.startswith("Error:")
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     assert "not retried" in result
     assert "private transport" not in result
     case.session.post.assert_called_once()
@@ -277,7 +301,7 @@ def test_native_hd_failed_edit_never_falls_back_to_generation(native_image):
     case.session.post.return_value.text.return_value = "{}"
     result = asyncio.run(case.tool.execute(case.message, auto_send=True, prompt="change it", image=IMAGE_URI))
     assert result.startswith("Error:")
-    assert "may have been billed" in result
+    assert "may have been billed" not in result
     case.session.post.assert_called_once()
     assert case.session.post.call_args.args == ("http://127.0.0.1:8317/v1/images/edits",)
     case.message.channel.send.assert_not_awaited()

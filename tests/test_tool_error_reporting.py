@@ -122,7 +122,10 @@ def test_image_failures_capture_full_response_body(incidents, monkeypatch, statu
     ))
     assert (blob, ext) == (b"", "png")
     assert isinstance(result, ToolFailure)
-    assert "The request may have been billed." in result
+    assert "may have been billed" not in result
+    assert "not retried" in result
+    if status != 200:
+        assert body in result
     incident = incidents.get(0)
     assert body in incident.details
     assert incident.context["status"] == str(status)
@@ -131,13 +134,15 @@ def test_image_failures_capture_full_response_body(incidents, monkeypatch, statu
         assert "_image_generation_request" in incident.traceback
 
 
-def test_image_credentials_redacted_without_changing_result(incidents, monkeypatch):
+def test_image_credentials_redacted_in_result_and_private_record(incidents, monkeypatch):
     secret = "synthetic-image-key"
     image_session(monkeypatch, Response(503, "raw key " + secret + " BODY-END"))
     _, _, result = asyncio.run(bot_tools._image_generation_request(
         "https://images.invalid/generate", secret, {"model": "synthetic"}, timeout_s=1, native=True,
     ))
     assert result.startswith("Error: image API returned status 503")
+    assert secret not in result
+    assert "raw key [REDACTED] BODY-END" in result
     assert secret not in incidents.get(0).format_report()
     assert "raw key [REDACTED] BODY-END" in incidents.get(0).details
 
