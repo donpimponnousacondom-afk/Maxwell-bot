@@ -1292,7 +1292,7 @@ def _public_image_target(bot) -> tuple[str, str]:
 
 
 def _persist_public_image(
-    bot, image_bytes: bytes, ext: str = ".png", prefix: str = "img"
+    bot, image_bytes: bytes, ext: str = ".png", prefix: str = "img", *, submitted_prompt: str,
 ) -> tuple[str | None, str | None]:
     """Best-effort write of image bytes to the public _images dir.
 
@@ -1306,10 +1306,29 @@ def _persist_public_image(
         with open(path, "wb") as f:
             f.write(image_bytes)
         logger.info(f"Persisted public image {path}")
-        return path, f"{pub_base}/{name}"
     except Exception as e:
         logger.warning(f"Failed to persist public image: {e}")
         return None, None
+    temporary_path = None
+    try:
+        prompt_bytes = redact_sensitive_text(submitted_prompt).encode("utf-8")
+        prompt_path = Path(path).with_suffix(".txt")
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=img_dir, prefix=f".{prompt_path.stem}.", suffix=".txt.tmp", delete=False,
+        ) as sidecar:
+            temporary_path = Path(sidecar.name)
+            sidecar.write(prompt_bytes)
+        os.replace(temporary_path, prompt_path)
+        temporary_path = None
+    except (OSError, UnicodeError) as error:
+        logger.warning("Image prompt sidecar write failed (%s)", type(error).__name__)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError as error:
+                logger.warning("Image prompt sidecar cleanup failed (%s)", type(error).__name__)
+    return path, f"{pub_base}/{name}"
 
 
 class ImageRequestLog:
@@ -1387,15 +1406,16 @@ class ImageGeneratorTool(Tool):
         if error:
             return error
         return await self._deliver_generated_image(
-            message, prompt, image_bytes, prefix="image", ext=ext, auto_send=auto_send,
+            message, prompt, image_bytes, prefix="image", submitted_prompt=prompt,
+            ext=ext, auto_send=auto_send,
         )
 
     async def _deliver_generated_image(
-        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str,
+        self, message: Message, prompt: str, image_bytes: bytes, *, prefix: str, submitted_prompt: str,
         ext: str = "png", auto_send: bool = False,
     ) -> str:
         local_path, perm_url = _persist_public_image(
-            self.bot, image_bytes, prefix=prefix, ext=f".{ext}"
+            self.bot, image_bytes, prefix=prefix, ext=f".{ext}", submitted_prompt=submitted_prompt,
         )
         if not auto_send and not local_path:
             return (
@@ -1525,7 +1545,7 @@ class ImageGeneratorTool(Tool):
         if error:
             return error
         return await self._deliver_generated_image(
-            message, prompt, raw, prefix="pollinations", auto_send=auto_send,
+            message, prompt, raw, prefix="pollinations", submitted_prompt=prompt[:1500], auto_send=auto_send,
         )
 
 
@@ -1918,7 +1938,7 @@ class HDImageGeneratorTool(Tool):
         auto_send: bool = False,
     ) -> str:
         local_path, perm_url = _persist_public_image(
-            self.bot, image_bytes, ext=f".{ext}", prefix="hd"
+            self.bot, image_bytes, ext=f".{ext}", prefix="hd", submitted_prompt=prompt,
         )
         if not auto_send and not local_path:
             return (
@@ -5273,6 +5293,10 @@ class CreateSiteTool(Tool):
             ).rstrip("/")
             + "/bot"
         )
+        self.base_url = (
+            getattr(bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+            or self.base_url
+        )
 
     def _control(self) -> dict:
         return (
@@ -5759,7 +5783,11 @@ class EditSiteTool(_SiteOwnedTool):
         act = str(action or "list").strip().lower()
         if act in SITE_MUTATING_ACTIONS:
             site_read_loop_guard(message, key="", label="", action=act)
-        url = f"{self.base_url}/{slug}/"
+        public_base = (
+            getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+            or self.base_url
+        )
+        url = f"{public_base}/{slug}/"
 
         if act in {"list", "ls", "files", "status"}:
             tree = _site_tree(site_dir)
@@ -5776,7 +5804,7 @@ class EditSiteTool(_SiteOwnedTool):
                 server_files = site_server.list_code(self.bot.config.DATA_DIR, slug)
                 names = ", ".join(rel for rel, _ in server_files) or "no source"
                 out += (
-                    f"\nPython backend: on at {url}api/ ({names}). "
+                    f"\nPython backend: on at {self.base_url}/{slug}/api/ ({names}). "
                     "Edit it with site_server (list/read/write/replace), not this tool."
                 )
             out += _site_graph_note(self.bot, slug, refresh=False)
@@ -6471,7 +6499,11 @@ class ListSitesTool(Tool):
             self.bot.config,
             "MAXWELL_PUBLIC_BASE_URL",
             "https://maxwell.z3ki.dev",
-        ).rstrip("/")
+        ).rstrip("/") + "/bot"
+        base_url = (
+            getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+            or base_url
+        )
         lines = []
         unverified: list[str] = []
         broken: list[str] = []
@@ -6502,7 +6534,7 @@ class ListSitesTool(Tool):
                 unverified.append(slug)
             tail = f" [{', '.join(marks)}]" if marks else ""
             lines.append(
-                f"  • {slug} — {base_url}/bot/{slug}/ — '{title}' "
+                f"  • {slug} — {base_url}/{slug}/ — '{title}' "
                 f"({site_expiry_label(data, control)}){owner_label}{tail}"
             )
         header = (
