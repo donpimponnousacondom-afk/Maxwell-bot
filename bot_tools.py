@@ -8,7 +8,6 @@ sent directly to their target.
 
 import contextlib
 import html
-import ipaddress
 import json
 import logging
 import os
@@ -394,49 +393,11 @@ def _fish_reference_id(voice: str | None = None) -> str:
     return os.environ.get("TTS_FISH_REFERENCE_ID", FISH_REFERENCE_DEFAULT).strip()
 
 
-def _is_safe_ip(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    # Unwrap IPv4-mapped IPv6 (::ffff:127.0.0.1) so loopback/private checks apply.
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
-
-
-class _SafeResolver:
-    """Resolver that blocks private/internal addresses at request time."""
-
-    def __init__(self):
-        self._resolver = aiohttp.resolver.DefaultResolver()
-
-    async def resolve(
-        self, host, port=0, family: socket.AddressFamily = socket.AF_UNSPEC
-    ):
-        results = await self._resolver.resolve(host, port, family)
-        for item in results:
-            if not _is_safe_ip(item["host"]):
-                raise OSError(f"blocked unsafe resolved address for {host}")
-        return results
-
-    async def close(self):
-        await self._resolver.close()
-
-
 async def _get_shared_session() -> aiohttp.ClientSession:
     global _SHARED_SESSION
     async with _SESSION_LOCK:
         if _SHARED_SESSION is None or _SHARED_SESSION.closed:
             connector = aiohttp.TCPConnector(
-                resolver=cast(Any, _SafeResolver()),
                 limit=30,
                 limit_per_host=5,
                 force_close=True,
@@ -452,7 +413,6 @@ async def _recreate_shared_session():
             with contextlib.suppress(Exception):
                 await _SHARED_SESSION.close()
         connector = aiohttp.TCPConnector(
-            resolver=cast(Any, _SafeResolver()),
             limit=30,
             limit_per_host=5,
             force_close=True,
@@ -492,22 +452,10 @@ async def _read_response_limited(
 
 
 def _is_safe_url(url: str) -> bool:
-    """Block SSRF: no private/loopback/link-local/localhost IPs."""
+    """Accept HTTP(S) URLs with a hostname, including private networks."""
     try:
         parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-        # Block localhost names
-        if hostname.lower() in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            return False
-        try:
-            ipaddress.ip_address(hostname)
-        except ValueError:
-            return True
-        return _is_safe_ip(hostname)
+        return parsed.scheme in ("http", "https") and bool(parsed.hostname)
     except Exception:
         return False
 
@@ -4590,7 +4538,7 @@ class ChangeAvatarTool(Tool):
             return "Error: url is required"
 
         if not _is_safe_url(url):
-            return "Error: Cannot fetch from private/internal URLs"
+            return "Error: URL must use HTTP(S) and include a hostname"
 
         # Local cooldown fully removed — was previously env-driven
         # (AVATAR_COOLDOWN_SECONDS, default 0). Discord's own API rate limit
@@ -6278,10 +6226,16 @@ class SiteTestTool(_SiteOwnedTool):
         slug, entry, site_dir, err = self._resolve(message, name)
         if err:
             return err
+        site_base = (
+            "http://web:8080/bot"
+            if os.environ.get("MAXWELL_CONTAINER_MODE", "").lower() == "true"
+            else self.base_url
+        )
         try:
             target = site_test.page_url(self.base_url, slug, path or url)
         except ValueError as e:
             return f"Error: {e}. path must be a page on this site."
+        target = site_base + target[len(self.base_url):]
         blocked = site_test_repeat_guard(message, f"{slug}:{target}")
         if blocked:
             return blocked
@@ -6317,7 +6271,7 @@ class SiteTestTool(_SiteOwnedTool):
 
         backend_bits: list[str] = []
         if entry.get("server"):
-            api_url = f"{self.base_url}/{slug}/api/"
+            api_url = f"{site_base}/{slug}/api/"
             api_status, _, api_err = await site_test.http_get(api_url)
             if api_err:
                 backend_bits.append(f"Python API {api_url} unreachable: {api_err}")
@@ -8537,10 +8491,9 @@ async def _fetch_public_url(
     max_bytes: int,
     timeout: float = 30.0,
 ) -> tuple[str, str, bytes]:
-    """GET a public URL, following a few SSRF-checked redirects.
+    """GET an HTTP(S) URL, following a few redirects.
 
-    Each hop is re-checked with `_is_safe_url`. The shared session's
-    `_SafeResolver` also refuses DNS that lands on private/link-local IPs.
+    Each hop must remain an HTTP(S) URL with a hostname.
     Returns `(final_url, content_type, body)`. Raises ValueError with a
     user-facing message on refusal, HTTP errors, or timeout.
     """
@@ -8549,7 +8502,7 @@ async def _fetch_public_url(
         session = await _get_shared_session()
         for _hop in range(_MAX_FETCH_REDIRECTS + 1):
             if not _is_safe_url(current):
-                raise ValueError("Cannot fetch from private/internal URLs")
+                raise ValueError("URL must use HTTP(S) and include a hostname")
             async with session.get(
                 current,
                 timeout=aiohttp.ClientTimeout(total=timeout),
@@ -8581,8 +8534,6 @@ async def _fetch_public_url(
         raise ValueError(f"timed out fetching {url}") from e
     except Exception as e:
         msg = str(e)
-        if "blocked unsafe" in msg.lower():
-            raise ValueError("Cannot fetch from private/internal URLs") from e
         capture_incident("tool.fetch_url", msg, exception=e, context={"url": current})
         raise ValueError(msg) from e
 
@@ -8595,9 +8546,10 @@ class FetchUrlTool(Tool):
 
     def get_description(self):
         return (
-            "Fetch a public http(s) URL and return readable text (HTML, JSON, "
+            "Fetch an http(s) URL and return readable text (HTML, JSON, "
             "plain). Use after web_search when a snippet is thin, or whenever "
-            "they gave a specific page to read. Not for private/internal URLs. "
+            "they gave a specific page to read. Local/private URLs are allowed. "
+            "In Docker, your generated sites use http://web:8080/bot/<slug>/. "
             "Images and GIFs (including Tenor/Giphy pages): see_image. "
             "Direct videos: see_video. Audio/video bytes are media, not text. "
             "YouTube: youtube. Params: url (required), max_length (optional, "
@@ -8615,7 +8567,7 @@ class FetchUrlTool(Tool):
             return "Error: url is required"
 
         if not _is_safe_url(url):
-            return "Error: Cannot fetch from private/internal URLs"
+            return "Error: URL must use HTTP(S) and include a hostname"
 
         # Direct images and GIF-host pages: attach pixels, don't decode binary
         # as text. fetch_url used to return mojibake and the model still
@@ -8831,7 +8783,7 @@ class SeeImageTool(Tool):
         if not url:
             return "Error: url is required"
         if not _is_safe_url(url):
-            return "Error: Cannot fetch from private/internal URLs"
+            return "Error: URL must use HTTP(S) and include a hostname"
         control = getattr(self.bot, "_control", None) or {}
         if not parse_bool(control.get("process_images"), True):
             return "Error: image processing is disabled"
@@ -8974,7 +8926,7 @@ class SeeVideoTool(Tool):
         if not url:
             return "Error: url is required"
         if not _is_safe_url(url):
-            return "Error: Cannot fetch from private/internal URLs"
+            return "Error: URL must use HTTP(S) and include a hostname"
         # The transcript/frame extractor handles YouTube URLs and has access
         # to yt-dlp/cookies; generic ffmpeg fetching must never steal them.
         try:
@@ -9854,7 +9806,7 @@ class SendMediaTool(Tool):
             return "Error: caption is too long (max 2000 characters); shorten it to keep one attachment message"
 
         if not _is_safe_url(url):
-            return "Error: Cannot fetch from private/internal URLs"
+            return "Error: URL must use HTTP(S) and include a hostname"
 
         try:
             session = await _get_shared_session()
