@@ -16,6 +16,7 @@ class ConsoleState:
     enabled_scopes: set[str] = field(default_factory=lambda: set(SCOPE_KEYS.values()))
     verbosity: int = 1
     folded: bool = True
+    show_ollama: bool = False
     tool_depth: int = 2
     provider_depth: int = 2
     view: str = "live"
@@ -25,10 +26,11 @@ class ConsoleState:
 
     def visible(self, event: LogEvent) -> bool:
         scope = event.scope if event.scope in SCOPE_KEYS.values() else "system"
-        return scope in self.enabled_scopes and LEVEL_VALUE.get(event.level or "INFO", 1) >= self.verbosity
+        return (self.show_ollama or not (event.service or "").startswith("ollama")) and scope in self.enabled_scopes and LEVEL_VALUE.get(event.level or "INFO", 1) >= self.verbosity
 
     def choices(self, history: EventHistory) -> tuple[HistoryEntry, ...]:
-        return history.recent(errors_only=self.list_view == "errors")
+        return tuple(entry for entry in history.recent(errors_only=self.list_view == "errors")
+                     if self.list_view == "errors" or self.show_ollama or not (entry.first.service or "").startswith("ollama"))
 
     def key(self, key: str, history: EventHistory) -> bool:
         if key in {"q", "\x03"}:
@@ -37,6 +39,8 @@ class ConsoleState:
             self.enabled_scopes.symmetric_difference_update({SCOPE_KEYS[key]})
         elif key in {"+", "-"}:
             self.verbosity = max(0, min(len(LEVELS) - 1, self.verbosity + (-1 if key == "+" else 1)))
+        elif key == "o":
+            self.show_ollama = not self.show_ollama
         elif key == "f":
             self.folded = not self.folded
         elif key in {"T", "P"}:

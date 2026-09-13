@@ -2,6 +2,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from .controls import LEVELS, VERBOSITY_NOTE, ConsoleState
 from .events import LogEvent
@@ -26,8 +27,11 @@ def timestamp_text(event: LogEvent) -> str:
 
 
 def compact_timestamp(event: LogEvent) -> str:
-    clock = re.match(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?", event.timestamp.split("T", 1)[-1])
-    shown = clock[0] if clock else event.timestamp
+    timestamp = event.timestamp
+    if event.timestamp_origin != "producer" or event.source_timezone != "unspecified":
+        timestamp = datetime.fromisoformat(timestamp).astimezone().isoformat()
+    clock = re.match(r"\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?", timestamp.split("T", 1)[-1])
+    shown = clock[0] if clock else timestamp
     origin = "P?" if event.timestamp_origin == "producer" and event.source_timezone == "unspecified" else {
         "producer": "P", "docker": "D", "observed": "O",
     }[event.timestamp_origin]
@@ -132,7 +136,8 @@ def help_text() -> str:
         "s/b/p/d/t/c/w/a toggle system/bot/provider/discord/tool/context/web/subagent scopes.",
         "T/P cycle tool/provider depth: 0 summary, 1 metadata, 2 full. f folds/unfolds live details.",
         VERBOSITY_NOTE,
-        "r recent 20; e retained errors; [/ ] older/newer selection; Enter inspect selected entry.",
+        "r recent 20; e retained errors; Up/Down or [/] older/newer selection; Enter inspect selected entry.",
+        "o toggles Ollama (hidden by default in live/recent; retained errors remain available with e).",
         "n/N next/previous evidence/help page; Esc returns live. History lists ignore live filters.",
         "i LOCAL console state only (no runtime probe). 0 resets local controls. ? help.",
         "q or Ctrl-C stops ONLY this follower, never the containerized bot.",
@@ -163,7 +168,7 @@ def render_frame(history: EventHistory, state: ConsoleState, width: int, height:
     body_height = max(1, height - 3)
     title = f"Curie logs | {state.view} | {LEVELS[state.verbosity]} | {'folded' if state.folded else 'expanded'} | T={state.tool_depth} P={state.provider_depth}"
     scope_line = "Scopes " + " ".join(f"{key}{'+' if scope in state.enabled_scopes else '-'}" for key, scope in SCOPE_KEYS.items())
-    scope_line += " | Time: P=src P?=TZ? D=Docker O=observed"
+    scope_line += f" | o Ollama{'+' if state.show_ollama else '-'} | Time: local; P=src P?=TZ? D=Docker O=observed"
     if state.view == "live":
         body = live_lines(history, state, width, body_height, hidden, dict(notes))
     elif state.view in {"recent", "errors"}:
@@ -171,7 +176,7 @@ def render_frame(history: EventHistory, state: ConsoleState, width: int, height:
         index = next((i for i, entry in enumerate(choices) if entry.sequence == state.selected), 0)
         start = max(0, index - min(20, body_height) + 1)
         body = [heading(entry, width, selected=entry.sequence == state.selected)
-                for entry in choices[start:start + min(20, body_height)]]
+                for entry in reversed(choices[start:start + min(20, body_height)])]
     else:
         entry = history.entries.get(state.selected)
         texts = {"help": help_text, "inspector": lambda: inspector_text(history, state, color)}
@@ -182,7 +187,7 @@ def render_frame(history: EventHistory, state: ConsoleState, width: int, height:
         body = [PaintLine(row) for row in page.rows]
         if state.view == "evidence" and entry:
             scope_line = timestamp_text(entry.first)
-    footer = "r/e history | Enter inspect | n/N page | Esc live | ? help | q follower only"
+    footer = "Up/Down scroll | o Ollama | r/e history | Enter inspect | n/N page | Esc live | ? help | q follower only"
     second = PaintLine(fit(scope_line, width), len(fit(scope_line, width)) if state.view == "evidence" and state.selected in history.entries else 0)
     return ([PaintLine(fit(title, width)), second] + body
             + [PaintLine("")] * max(0, body_height - len(body)) + [PaintLine(fit(footer, width))])[:height]
