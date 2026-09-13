@@ -7,6 +7,7 @@ This is `dame_curie`, a Maxwell side project. Preserve Maxwell code, path, API a
 - [Current implementation and deployment status](docs/STATUS.md) is the single current-state ledger. Update it after every material implementation or acceptance milestone.
 - [Rootless per-identity deployment](docs/DOCKER.md) is the target architecture and operating reference, not proof of deployment.
 - [Shared Screen workflow](docs/SCREEN_WORKFLOW.md) documents current rootless lifecycle/log-following and rollback controls. Ctrl-c in Screen stops the log follower, not the containerized bot.
+- For a read-only incident investigation, load the repository skill `curie-readonly-debug` from `.agents/skills/curie-readonly-debug/SKILL.md`. It maps private raw logs, normalized evidence, request/incident IDs and source entry points, and requires a sanitized evidence handoff without repairs, restarts, provider probes or state changes. It is guidance, not a privilege sandbox; separate diagnostic and implementation assignments.
 - Historical audit/changelog content is preserved in Git at `96b4803:AGENTS.md`. It is evidence of past observations, not current authority. In particular arbitrary shell `docker cp` exports were removed in `6fa80e8`; do not report them as an outstanding current defect.
 
 ## Active authorization
