@@ -1,6 +1,16 @@
-# NEXT ROUND: FINISH THIS ITERATION, PUSH THE BRANCH, OPEN THE PR
+# v1.0 FREEZE — ACCEPTED BASELINE, ARCHITECTURE REWRITE IS SEPARATE
 
-**LOCAL COMMITS EXIST. THIS BRANCH HAS NOT BEEN PUSHED AND HAS NO PR. DO NOT LOSE OR REWRITE THIS HISTORY.**
+**Root explicitly accepted this state and authorized committing everything, opening and merging its PR, and tagging the merged commit `v1.0` (2026-09-14). The release is an as-is checkpoint, not a claim that the site architecture or deferred coverage is complete.**
+
+- This freeze includes the already-applied Ollama resource setting (12 CPUs / 6GiB), all local hotfixes, this backlog, and the report at [`reports/curie-workflow-wording-2026-09-13.html`](reports/curie-workflow-wording-2026-09-13.html).
+- Root will redesign site creation/tool architecture with another agent. Do not start that rewrite here, repair known wording as part of tagging, or hold this freeze for the deferred tests/docs below.
+- Keep new reports inside their project workspace. The previous `.dsh/reports/` placement was an agent choice, not a harness requirement; `AGENTS.md` now makes project ownership explicit.
+- Preserve the published HTML report as dated evidence. Its original local-only/PR-pending statements describe the audit moment, not release status. The remote copy remains at https://redroom.zombiedawn.net/dame/workflow-audit/ .
+- After merging, use current `origin/main` for subsequent work. The one-off permission to merge this freeze does not authorize future automatic merges.
+
+## Historical pre-freeze handoff
+
+The instructions below are retained as context. This freeze authorization supersedes their earlier local-only/no-merge direction; remaining checkboxes are backlog, not release gates.
 
 ## Resume here (root's handoff, 2026-09-13)
 
