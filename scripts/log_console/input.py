@@ -51,6 +51,9 @@ class KeyBuffer:
                     if len(self.pending) > 64:
                         self.pending = ""
                     break
+                arrow = {"\x1b[A": "[", "\x1bOA": "[", "\x1b[B": "]", "\x1bOB": "]"}.get(match[0])
+                if arrow:
+                    keys.append(arrow)
                 self.pending = self.pending[match.end():]
             else:
                 keys.append(self.pending[0])

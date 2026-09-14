@@ -4827,36 +4827,13 @@ def format_site_file_read(rel: str, text: str, *, start_line: int = 1) -> str:
 def site_read_loop_guard(
     message: Any, *, key: str, label: str, action: str
 ) -> str | None:
-    """Refuse duplicate/idle site reads that hang the turn. None = proceed."""
+    """Reset site test state after edits without blocking source reads."""
     act = str(action or "").strip().lower()
     state = _site_turn_state(message)
-    if act in SITE_MUTATING_ACTIONS:
-        if state is not None:
-            state["idle"] = 0
-            state["test_counts"] = {}
-            state["read_cache"] = set()
-        return None
-    if act not in SITE_FILE_READ_ACTIONS or state is None:
-        return None
-    idle = int(state.get("idle", 0) or 0) + 1
-    state["idle"] = idle
-    cache = state.setdefault("read_cache", set())
-    if idle >= SITE_IDLE_READ_LIMIT:
-        cache.add(key)
-        return (
-            "STOP. You have re-read site files repeatedly this turn without "
-            "changing anything. The source is already in this turn. Call "
-            "action=write or action=replace with a real change, or site_test "
-            f"once, then send_message with the URL. {SITE_READ_LOOP_MARKER}"
-        )
-    if key in cache:
-        return (
-            f"Already returned {label} this turn — it is in an earlier tool "
-            "result. Use action=replace or action=write to change it, or "
-            "start_line= to window a different slice. Re-reading the same "
-            "file will not print it again."
-        )
-    cache.add(key)
+    if act in SITE_MUTATING_ACTIONS and state is not None:
+        state["idle"] = 0
+        state["test_counts"] = {}
+        state["read_cache"] = set()
     return None
 
 
@@ -5426,9 +5403,12 @@ class CreateSiteTool(Tool):
                                 f"Site image URL failed: {src_url} ({err or 'unknown'})"
                             )
                         continue
-                    if not src_path or not any(
+                    shell_source = str(src_path).startswith(("/home/maxwell/", "home/maxwell/")) or (
+                        bool(src_path) and Path(os.path.abspath(src_path)).is_relative_to(_shell_workspace())
+                    )
+                    if not src_path or (not shell_source and not any(
                         _is_path_allowed(src_path, b) for b in allowed_bases
-                    ):
+                    )):
                         missing_images.append(src_path or "(empty path)")
                         logger.warning(f"Site image blocked or not found: {src_path}")
                         continue
@@ -5451,11 +5431,24 @@ class CreateSiteTool(Tool):
                         )
                         continue
                     try:
-                        shutil.copy2(src_path, dest)
+                        if shell_source:
+                            shell_tool = self.bot.tools.get("shell")
+                            if shell_tool is None or not self.bot.config.ENABLE_SHELL:
+                                raise ValueError("shell file export requires a registered enabled shell tool")
+                            relative = str(src_path)
+                            if not relative.startswith(("/home/maxwell/", "home/maxwell/")):
+                                relative = str(Path(os.path.abspath(src_path)).relative_to(_shell_workspace()))
+                            async with shell_tool._lifecycle_lock:
+                                await shell_tool._verify_export_container()
+                                blob = await asyncio.to_thread(_read_shell_export, relative, SendFileTool.MAX_SIZE)
+                            await asyncio.to_thread(Path(dest).write_bytes, blob)
+                        else:
+                            shutil.copy2(src_path, dest)
                         public_url = f"{self.base_url}/{slug}/images/{filename}"
                         image_urls.append(public_url)
                         logger.info(f"Copied site image {src_path} -> {dest}")
                     except Exception as e:
+                        missing_images.append(f"{src_path} ({e})")
                         logger.warning(f"Failed to copy image {src_path}: {e}")
 
             # The page is served exactly as written. CSP belongs to the host
@@ -5522,6 +5515,8 @@ class CreateSiteTool(Tool):
                     "(owner/quota changed concurrently). Try again."
                 )
             result = f"Site created: {self.base_url}/{slug}/"
+            if wants_backend and getattr(self.bot.config, "MAXWELL_SITE_PUBLIC_BASE_URL", "").strip():
+                result += "\nPublish this remote URL to the user. HTML, CSS, JavaScript and images are mirrored. Python/FastAPI and the KV API run on the local instance, not the remote host; the API guide below applies to local testing only."
             if len(written) > 1:
                 result += f"\nFiles: {', '.join(written)}"
             if wants_backend:
@@ -5549,7 +5544,7 @@ class CreateSiteTool(Tool):
                 )
             if missing_images:
                 result += (
-                    f"\nWARNING: {len(missing_images)} image(s) NOT found on disk and skipped: "
+                    f"\nWARNING: {len(missing_images)} image(s) could not be imported and were skipped: "
                     + ", ".join(missing_images)
                 )
             result += _site_graph_note(self.bot, slug)
@@ -5947,6 +5942,8 @@ class SiteServerTool(_SiteOwnedTool):
             "Run and edit a real backend server for one of your sites — your own "
             "Python, routes, database, and secrets, in a sandboxed container at "
             "/bot/<name>/api/... "
+            "This backend runs locally, not on the remote static mirror. "
+            "Test locally inside Docker at http://web:8080/bot/<name>/; deliver the configured remote public site URL to the user, noting any local-only API dependency. "
             "Use this when the site needs server-side logic: accounts, WebSockets, "
             "a hidden API key, anything a static page cannot enforce. "
             "Keep working on a live backend with these actions instead of recreating it: "

@@ -9,19 +9,21 @@
 
 	redir /admin /admin/ 308
 
-	@backend path /api/* /data/* /bot/*/api /bot/*/api/*
-	handle @backend {
-		reverse_proxy api:8765
-	}
+	route {
+		@backend path_regexp backend ^/(api/|data/|bot/[^/]+/api(/|$))
+		handle @backend {
+			reverse_proxy api:8765
+		}
 
-	handle_path /bot/* {
-		root * /srv/sites
-		file_server
-	}
+		handle_path /bot/* {
+			root * /srv/sites
+			file_server
+		}
 
-	handle {
-		root * /srv/web
-		header X-Frame-Options DENY
-		file_server
+		handle {
+			root * /srv/web
+			header X-Frame-Options DENY
+			file_server
+		}
 	}
 }
